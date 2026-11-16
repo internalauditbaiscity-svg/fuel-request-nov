@@ -1,0 +1,255 @@
+{
+  "entities": {
+    "AdminRecord": {
+      "title": "AdminRecord",
+      "description": "Elevated administrator registry record",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "email": { "type": "string", "format": "email", "maxLength": 254 },
+        "grantedAt": { "type": "string", "format": "date-time", "maxLength": 64 }
+      },
+      "required": ["uid", "email", "grantedAt"]
+    },
+    "UserAccount": {
+      "title": "UserAccount",
+      "description": "Departmental user profile, credentials, and role-based access configuration",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "username": { "type": "string", "minLength": 2, "maxLength": 64 },
+        "passwordHash": { "type": "string", "maxLength": 128 },
+        "email": { "type": "string", "format": "email", "maxLength": 254 },
+        "displayName": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "role": { "type": "string", "enum": ["admin", "approver", "gso_dispenser", "department_head", "requester", "auditor"] },
+        "department": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "positionTitle": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "canEdit": { "type": "boolean" },
+        "canDelete": { "type": "boolean" },
+        "active": { "type": "boolean" },
+        "createdBy": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "createdAt": { "type": "string", "format": "date-time", "maxLength": 64 },
+        "updatedAt": { "type": "string", "format": "date-time", "maxLength": 64 }
+      },
+      "required": ["uid", "email", "displayName", "role", "department", "active", "createdBy", "createdAt", "updatedAt"]
+    },
+    "FleetVehicle": {
+      "title": "FleetVehicle",
+      "description": "LGU Bais fleet vehicle, heavy equipment, or fuel-powered tool (driver unassigned for flexibility)",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "office": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "plateNumber": { "type": "string", "minLength": 2, "maxLength": 40 },
+        "chassisNumber": { "type": "string", "minLength": 3, "maxLength": 64 },
+        "makeModel": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "yearAcquired": { "type": "integer" },
+        "equipmentClass": { "type": "string", "enum": ["light_utility", "service_pickup", "dump_truck", "heavy_equipment", "generator_tool", "emergency_rescue"] },
+        "fuelType": { "type": "string", "enum": ["gasoline", "diesel"] },
+        "efficiencyRate": { "type": "number" },
+        "efficiencyUnit": { "type": "string", "enum": ["km_per_liter", "liters_per_hour"] },
+        "maxWeeklyLiters": { "type": "number" },
+        "assignedDriver": { "type": "string", "maxLength": 120 },
+        "driverLicense": { "type": "string", "maxLength": 60 },
+        "status": { "type": "string", "enum": ["operational", "maintenance", "dispatched", "decommissioned"] },
+        "nextMaintenanceDate": { "type": "string", "maxLength": 32 },
+        "odometerKm": { "type": "number" },
+        "ownerId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "createdAt": { "type": "string", "format": "date-time", "maxLength": 64 },
+        "updatedAt": { "type": "string", "format": "date-time", "maxLength": 64 }
+      },
+      "required": ["id", "office", "plateNumber", "chassisNumber", "makeModel", "yearAcquired", "equipmentClass", "fuelType", "efficiencyRate", "efficiencyUnit", "maxWeeklyLiters", "status", "ownerId", "createdAt", "updatedAt"]
+    },
+    "FuelDepot": {
+      "title": "FuelDepot",
+      "description": "City fuel depot tank inventory for Gasoline and Diesel",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "name": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "location": { "type": "string", "minLength": 2, "maxLength": 160 },
+        "gasolineCapacityLiters": { "type": "number" },
+        "gasolineCurrentLiters": { "type": "number" },
+        "gasolinePricePerLiter": { "type": "number" },
+        "dieselCapacityLiters": { "type": "number" },
+        "dieselCurrentLiters": { "type": "number" },
+        "dieselPricePerLiter": { "type": "number" },
+        "reorderThresholdPct": { "type": "number" },
+        "lastDipVerifiedAt": { "type": "string", "maxLength": 64 },
+        "lastDipVerifiedBy": { "type": "string", "maxLength": 120 },
+        "updatedAt": { "type": "string", "format": "date-time", "maxLength": 64 }
+      },
+      "required": ["id", "name", "location", "gasolineCapacityLiters", "gasolineCurrentLiters", "gasolinePricePerLiter", "dieselCapacityLiters", "dieselCurrentLiters", "dieselPricePerLiter", "updatedAt"]
+    },
+    "WorkPlan": {
+      "title": "WorkPlan",
+      "description": "Weekly departmental work plan integrating vehicle fuel requests and hierarchical sign-offs",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "controlNumber": { "type": "string", "minLength": 4, "maxLength": 48 },
+        "department": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "projectTitle": { "type": "string", "minLength": 3, "maxLength": 200 },
+        "projectCode": { "type": "string", "minLength": 2, "maxLength": 48 },
+        "weekStart": { "type": "string", "maxLength": 20 },
+        "weekEnd": { "type": "string", "maxLength": 20 },
+        "status": { "type": "string", "enum": ["pending_approval", "approved", "partially_approved", "rejected", "completed"] },
+        "totalRequestedLiters": { "type": "number" },
+        "totalApprovedLiters": { "type": "number" },
+        "totalDispensedLiters": { "type": "number" },
+        "preparedBy": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "preparedByDesignation": { "type": "string", "maxLength": 120 },
+        "reviewedBy": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "reviewedByDesignation": { "type": "string", "maxLength": 120 },
+        "approvedBy": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "approvedByDesignation": { "type": "string", "maxLength": 120 },
+        "divisionHead": { "type": "string", "maxLength": 120 },
+        "unitLead": { "type": "string", "maxLength": 120 },
+        "sectionManager": { "type": "string", "maxLength": 120 },
+        "approverNote": { "type": "string", "maxLength": 500 },
+        "ownerId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "createdAt": { "type": "string", "format": "date-time", "maxLength": 64 },
+        "updatedAt": { "type": "string", "format": "date-time", "maxLength": 64 }
+      },
+      "required": ["id", "controlNumber", "department", "projectTitle", "projectCode", "weekStart", "weekEnd", "status", "totalRequestedLiters", "totalApprovedLiters", "totalDispensedLiters", "preparedBy", "reviewedBy", "approvedBy", "ownerId", "createdAt", "updatedAt"]
+    },
+    "TripTicket": {
+      "title": "TripTicket",
+      "description": "Individual vehicle or equipment trip ticket embedded in a weekly work plan",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "workPlanId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ticketNumber": { "type": "string", "minLength": 7, "maxLength": 48 },
+        "department": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "projectTitle": { "type": "string", "minLength": 3, "maxLength": 200 },
+        "purposeOrProject": { "type": "string", "minLength": 2, "maxLength": 200 },
+        "vehicleId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "plateNumber": { "type": "string", "minLength": 2, "maxLength": 40 },
+        "vehicleLabel": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "driverName": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "driverLicense": { "type": "string", "minLength": 2, "maxLength": 60 },
+        "fuelType": { "type": "string", "enum": ["gasoline", "diesel"] },
+        "depotId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "scheduledDate": { "type": "string", "maxLength": 20 },
+        "destination": { "type": "string", "minLength": 2, "maxLength": 180 },
+        "estimatedUsage": { "type": "number" },
+        "computedLimitLiters": { "type": "number" },
+        "requestedLiters": { "type": "number" },
+        "approvedLiters": { "type": "number" },
+        "dispensedLiters": { "type": "number" },
+        "forfeitedLiters": { "type": "number" },
+        "unitPriceAtDispense": { "type": "number" },
+        "servedOnce": { "type": "boolean" },
+        "dispensedAt": { "type": "string", "maxLength": 64 },
+        "dispensedBy": { "type": "string", "maxLength": 120 },
+        "pumpReadingPhotoDataUrl": { "type": "string", "maxLength": 400000 },
+        "pumpReadingPhotoName": { "type": "string", "maxLength": 160 },
+        "status": { "type": "string", "enum": ["pending", "approved", "reduced", "dispensed", "forfeited", "rejected"] },
+        "reductionReason": { "type": "string", "maxLength": 400 },
+        "ownerId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "createdAt": { "type": "string", "format": "date-time", "maxLength": 64 },
+        "updatedAt": { "type": "string", "format": "date-time", "maxLength": 64 }
+      },
+      "required": ["id", "workPlanId", "ticketNumber", "department", "projectTitle", "vehicleId", "plateNumber", "driverName", "fuelType", "depotId", "scheduledDate", "destination", "computedLimitLiters", "requestedLiters", "approvedLiters", "dispensedLiters", "forfeitedLiters", "servedOnce", "status", "ownerId", "createdAt", "updatedAt"]
+    },
+    "InventoryLog": {
+      "title": "InventoryLog",
+      "description": "Fuel depot delivery, dispensing deduction, or pre-fill dip adjustment with GSO verification",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "depotId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "depotName": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "fuelType": { "type": "string", "enum": ["gasoline", "diesel"] },
+        "transactionType": { "type": "string", "enum": ["delivery", "dispense", "shrinkage_adjustment", "overage_adjustment"] },
+        "litersDelta": { "type": "number" },
+        "balanceBefore": { "type": "number" },
+        "balanceAfter": { "type": "number" },
+        "physicalDipLiters": { "type": "number" },
+        "referenceNumber": { "type": "string", "minLength": 2, "maxLength": 64 },
+        "notes": { "type": "string", "maxLength": 400 },
+        "approvalStatus": { "type": "string", "enum": ["pending_gso_approval", "verified", "rejected"] },
+        "gsoApproverName": { "type": "string", "maxLength": 120 },
+        "digitalVerificationCode": { "type": "string", "maxLength": 64 },
+        "verifiedAt": { "type": "string", "maxLength": 64 },
+        "ownerId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "createdAt": { "type": "string", "format": "date-time", "maxLength": 64 }
+      },
+      "required": ["id", "depotId", "depotName", "fuelType", "transactionType", "litersDelta", "balanceBefore", "balanceAfter", "referenceNumber", "approvalStatus", "ownerId", "createdAt"]
+    },
+    "AuditLog": {
+      "title": "AuditLog",
+      "description": "Immutable security and transaction audit log entry",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "actorUid": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "actorEmail": { "type": "string", "maxLength": 254 },
+        "actorRole": { "type": "string", "maxLength": 48 },
+        "department": { "type": "string", "maxLength": 120 },
+        "action": { "type": "string", "minLength": 2, "maxLength": 80 },
+        "entityType": { "type": "string", "minLength": 2, "maxLength": 64 },
+        "entityId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "summary": { "type": "string", "minLength": 2, "maxLength": 400 },
+        "createdAt": { "type": "string", "format": "date-time", "maxLength": 64 }
+      },
+      "required": ["id", "actorUid", "actorEmail", "actorRole", "action", "entityType", "entityId", "summary", "createdAt"]
+    },
+    "UserInvite": {
+      "title": "UserInvite",
+      "description": "Admin-provisioned role assignment by normalized email key",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "email": { "type": "string", "format": "email", "maxLength": 254 },
+        "displayName": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "role": { "type": "string", "enum": ["admin", "approver", "gso_dispenser", "department_head", "requester", "auditor"] },
+        "department": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "positionTitle": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "active": { "type": "boolean" },
+        "createdBy": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "createdAt": { "type": "string", "format": "date-time", "maxLength": 64 }
+      },
+      "required": ["id", "email", "displayName", "role", "department", "active", "createdBy", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/admins/{userId}": {
+      "schema": { "$ref": "#/entities/AdminRecord" },
+      "description": "Elevated administrator access records"
+    },
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserAccount" },
+      "description": "Departmental user accounts and RBAC roles"
+    },
+    "/invites/{inviteId}": {
+      "schema": { "$ref": "#/entities/UserInvite" },
+      "description": "Admin-provisioned user role assignments awaiting first sign-in"
+    },
+    "/environments/{envId}/vehicles/{vehicleId}": {
+      "schema": { "$ref": "#/entities/FleetVehicle" },
+      "description": "Fleet registry separated by live and sandbox environments"
+    },
+    "/environments/{envId}/depots/{depotId}": {
+      "schema": { "$ref": "#/entities/FuelDepot" },
+      "description": "Fuel depot inventory tanks separated by live and sandbox environments"
+    },
+    "/environments/{envId}/workPlans/{workPlanId}": {
+      "schema": { "$ref": "#/entities/WorkPlan" },
+      "description": "Weekly departmental work plans separated by live and sandbox environments"
+    },
+    "/environments/{envId}/tripTickets/{ticketId}": {
+      "schema": { "$ref": "#/entities/TripTicket" },
+      "description": "Trip tickets embedded in work plans separated by live and sandbox environments"
+    },
+    "/environments/{envId}/inventoryLogs/{logId}": {
+      "schema": { "$ref": "#/entities/InventoryLog" },
+      "description": "Fuel depot delivery and adjustment logs separated by live and sandbox environments"
+    },
+    "/environments/{envId}/auditLogs/{logId}": {
+      "schema": { "$ref": "#/entities/AuditLog" },
+      "description": "Immutable transaction and user audit logs separated by live and sandbox environments"
+    }
+  }
+}

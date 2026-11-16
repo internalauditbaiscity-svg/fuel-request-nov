@@ -1,0 +1,6 @@
+{
+  "name": "Bais City Fuel & Fleet Command",
+  "description": "LGU Bais fuel requisition, weekly work plan approval, GSO single-dispense depot tracking, fleet registry, and daily reconciliation system.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

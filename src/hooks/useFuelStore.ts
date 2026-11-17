@@ -23,8 +23,9 @@ import {
   handleFirestoreError,
   normalizeEmailToId,
   OperationType,
-  signInWithGoogle,
+  signInWithGoogle as firebaseSignInWithGoogle,
   signOutFirebase,
+  stripUndefinedFields,
   testFirestoreConnection,
 } from '../lib/firebase';
 import {
@@ -50,8 +51,11 @@ import {
   WorkPlan,
 } from '../types/fuel';
 import {
+  authenticateLocalUserCredentials,
+  buildInvitePayloadFromUser,
   canAccessDepartmentRecord,
   computeSingleDispenseOutcome,
+  deduplicateUsersByEmail,
   evaluateTabletopApproval,
   generateNextTripTicketNumbers,
   generateNextWorkPlanNumber,
@@ -63,8 +67,12 @@ import {
   INACTIVITY_TIMEOUT_MS,
   isSessionExpired,
   MAX_TICKETS_PER_WORKPLAN,
+  mergeClaimedUserProfile,
   parsePersistedSession,
   PersistedSessionState,
+  prepareFirestoreRecordPayload,
+  reconcileCollectionRecords,
+  resolveEffectiveEnvironmentAfterGoogleAuth,
 } from '../utils/fuelEngine';
 
 interface LocalSnapshotState {
@@ -195,6 +203,14 @@ function makeId(prefix: string): string {
   return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
 }
 
+const SEED_DEPOT_TS = new Map(SEED_DEPOTS.map((d) => [d.id, d.updatedAt]));
+const SEED_VEHICLE_TS = new Map(SEED_VEHICLES.map((v) => [v.id, v.updatedAt]));
+const SEED_WORKPLAN_TS = new Map(SEED_WORK_PLANS.map((w) => [w.id, w.updatedAt]));
+const SEED_TICKET_TS = new Map(SEED_TRIP_TICKETS.map((t) => [t.id, t.updatedAt]));
+const SEED_INV_TS = new Map(SEED_INVENTORY_LOGS.map((l) => [l.id, l.createdAt]));
+const SEED_AUDIT_TS = new Map(SEED_AUDIT_LOGS.map((a) => [a.id, a.createdAt]));
+const SEED_USER_TS = new Map(SEED_USERS.map((u) => [u.uid, u.updatedAt]));
+
 function resolveInitialBootAuth(): {
   user: UserAccount | null;
   envMode: EnvironmentMode;
@@ -312,10 +328,20 @@ export function useFuelStore() {
     bootAuth.envMode === 'live' ? bootAuth.user : null
   );
   const [syncNotice, setSyncNotice] = useState<string | null>(null);
+  const [googleAuthError, setGoogleAuthError] = useState<string | null>(null);
 
+  const googleSignInInitiatedRef = useRef<boolean>(false);
+  const preserveEnvOnAuthRef = useRef<EnvironmentMode | null>(null);
+  const sandboxStateRef = useRef<LocalSnapshotState>(sandboxState);
+  const liveStateRef = useRef<LocalSnapshotState>(liveState);
+  const syncQueueRef = useRef<SyncQueueItem[]>(syncQueue);
   const activeSectionRef = useRef<string>(bootAuth.section || 'dashboard');
   const lastActivityAtRef = useRef<number>(Date.now());
   const lastActivityWriteRef = useRef<number>(Date.now());
+
+  sandboxStateRef.current = sandboxState;
+  liveStateRef.current = liveState;
+  syncQueueRef.current = syncQueue;
 
   const effectiveOnline = isOnline && !simulatedOffline;
 
@@ -336,93 +362,165 @@ export function useFuelStore() {
     };
   }, []);
 
-  // Persist sandbox state locally
+  // Persist sandbox & live state locally
   useEffect(() => {
     saveLocalState(SANDBOX_STORAGE_KEY, sandboxState);
   }, [sandboxState]);
 
   useEffect(() => {
+    saveLocalState(LIVE_CACHE_STORAGE_KEY, liveState);
+  }, [liveState]);
+
+  useEffect(() => {
     saveSyncQueue(syncQueue);
   }, [syncQueue]);
 
-  // Firebase Auth listener + Admin bootstrap
+  // Firebase Auth listener + Admin bootstrap + Invited/Different-Gmail profile resolution
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, async (user) => {
       if (user) {
-        const parsed = parsePersistedSession(
-          readPersistedSessionRaw(),
-          Date.now(),
-          INACTIVITY_TIMEOUT_MS
-        );
-        if (parsed.expired) {
-          clearPersistedSessionStorage();
-          setFirebaseUser(null);
-          setLiveUserProfile(null);
-          setAuthenticatedUser(null);
-          setSessionExpiredNotice(
-            'Your session expired after 10 minutes of inactivity. Please sign in again.'
+        const freshGoogleAttempt = googleSignInInitiatedRef.current;
+        googleSignInInitiatedRef.current = false;
+
+        if (!freshGoogleAttempt) {
+          const parsed = parsePersistedSession(
+            readPersistedSessionRaw(),
+            Date.now(),
+            INACTIVITY_TIMEOUT_MS
           );
-          await signOutFirebase().catch(() => {});
-          setAuthReady(true);
-          return;
+          if (parsed.expired) {
+            clearPersistedSessionStorage();
+            setFirebaseUser(null);
+            setLiveUserProfile(null);
+            setAuthenticatedUser(null);
+            setSessionExpiredNotice(
+              'Your session expired after 10 minutes of inactivity. Please sign in again.'
+            );
+            await signOutFirebase().catch(() => {});
+            setAuthReady(true);
+            return;
+          }
         }
       }
 
       setFirebaseUser(user);
       if (user) {
+        if (!user.email || !user.emailVerified) {
+          setGoogleAuthError(
+            'Your Google account email must be verified before accessing Live Cloud.'
+          );
+          clearPersistedSessionStorage();
+          setLiveUserProfile(null);
+          setAuthenticatedUser(null);
+          await signOutFirebase().catch(() => {});
+          setAuthReady(true);
+          return;
+        }
+
+        const authEmail = user.email.trim().toLowerCase();
+        const emailId = normalizeEmailToId(authEmail);
+        const now = new Date().toISOString();
+
         try {
           const userDocRef = doc(db, 'users', user.uid);
           const userSnap = await getDoc(userDocRef);
           let resolvedProfile: UserAccount | null = null;
+
           if (userSnap.exists()) {
-            resolvedProfile = userSnap.data() as UserAccount;
-          } else if (
-            user.email?.toLowerCase() === BOOTSTRAPPED_ADMIN_EMAIL.toLowerCase() &&
-            user.emailVerified
-          ) {
-            const now = new Date().toISOString();
+            const existingProfile = userSnap.data() as UserAccount;
+            if (!existingProfile.active) {
+              setGoogleAuthError('This user account is suspended. Contact your Administrator.');
+              clearPersistedSessionStorage();
+              setLiveUserProfile(null);
+              setAuthenticatedUser(null);
+              await signOutFirebase().catch(() => {});
+              setAuthReady(true);
+              return;
+            }
+            resolvedProfile = existingProfile;
+          } else if (authEmail === BOOTSTRAPPED_ADMIN_EMAIL.toLowerCase()) {
             await setDoc(doc(db, 'admins', user.uid), {
               uid: user.uid,
-              email: user.email,
+              email: authEmail,
               grantedAt: now,
             });
-            resolvedProfile = {
+            resolvedProfile = mergeClaimedUserProfile({
               uid: user.uid,
-              username: 'admin',
-              email: user.email,
-              displayName: user.displayName || 'Bais Internal Audit Admin',
-              role: 'admin',
-              department: 'Internal Audit Service',
-              positionTitle: 'System Administrator',
-              canEdit: true,
-              canDelete: true,
-              active: true,
-              createdBy: 'system',
-              createdAt: now,
-              updatedAt: now,
-            };
-            await setDoc(userDocRef, resolvedProfile);
-          } else if (user.email) {
-            const q = query(collection(db, 'users'), where('email', '==', user.email));
-            const snap = await getDocs(q);
-            if (!snap.empty) {
-              resolvedProfile = snap.docs[0].data() as UserAccount;
-            } else {
-              resolvedProfile = {
+              email: authEmail,
+              displayName: user.displayName,
+              isBootstrappedAdmin: true,
+              nowIso: now,
+            });
+            await setDoc(userDocRef, stripUndefinedFields(resolvedProfile as unknown as Record<string, unknown>));
+          } else {
+            let sourceRecord: Partial<UserAccount> | null = null;
+
+            if (emailId) {
+              try {
+                const inviteSnap = await getDoc(doc(db, 'invites', emailId));
+                if (inviteSnap.exists()) {
+                  sourceRecord = inviteSnap.data() as Partial<UserAccount>;
+                }
+              } catch {
+                // Continue checking legacy user records if invite doc does not exist
+              }
+
+              if (!sourceRecord) {
+                try {
+                  const legacySnap = await getDoc(doc(db, 'users', emailId));
+                  if (legacySnap.exists()) {
+                    sourceRecord = legacySnap.data() as UserAccount;
+                  }
+                } catch {
+                  // Continue to email query fallback
+                }
+              }
+            }
+
+            if (!sourceRecord) {
+              try {
+                const q = query(collection(db, 'users'), where('email', '==', authEmail));
+                const snap = await getDocs(q);
+                if (!snap.empty) {
+                  sourceRecord = snap.docs[0].data() as UserAccount;
+                }
+              } catch {
+                // Proceed to unprivileged requester self-registration
+              }
+            }
+
+            if (sourceRecord && sourceRecord.active === false) {
+              setGoogleAuthError('This user account is suspended. Contact your Administrator.');
+              clearPersistedSessionStorage();
+              setLiveUserProfile(null);
+              setAuthenticatedUser(null);
+              await signOutFirebase().catch(() => {});
+              setAuthReady(true);
+              return;
+            }
+
+            resolvedProfile = mergeClaimedUserProfile({
+              uid: user.uid,
+              email: authEmail,
+              displayName: user.displayName,
+              sourceProfile: sourceRecord,
+              nowIso: now,
+            });
+
+            await setDoc(
+              userDocRef,
+              stripUndefinedFields(resolvedProfile as unknown as Record<string, unknown>)
+            );
+
+            if (resolvedProfile.role === 'admin') {
+              await setDoc(doc(db, 'admins', user.uid), {
                 uid: user.uid,
-                email: user.email,
-                displayName: user.displayName || user.email,
-                role: 'requester',
-                department: 'City Engineering Office',
-                canEdit: false,
-                canDelete: false,
-                active: true,
-                createdBy: 'self',
-                createdAt: new Date().toISOString(),
-                updatedAt: new Date().toISOString(),
-              };
+                email: authEmail,
+                grantedAt: now,
+              });
             }
           }
+
           if (resolvedProfile) {
             const nowMs = Date.now();
             const defaultSection = getDefaultNavSection(resolvedProfile.role);
@@ -431,14 +529,46 @@ export function useFuelStore() {
             if (!activeSectionRef.current) {
               activeSectionRef.current = defaultSection;
             }
+            const explicitPreserve = preserveEnvOnAuthRef.current;
+            preserveEnvOnAuthRef.current = null;
+            const storedSession = parsePersistedSession(
+              readPersistedSessionRaw(),
+              nowMs,
+              INACTIVITY_TIMEOUT_MS
+            ).session;
+            const preservedEnv =
+              explicitPreserve ??
+              (storedSession && storedSession.uid === resolvedProfile.uid
+                ? storedSession.envMode
+                : null);
+            const resolvedEnvMode = resolveEffectiveEnvironmentAfterGoogleAuth({
+              preserveEnvMode: preservedEnv,
+              user: resolvedProfile,
+            });
+
+            setGoogleAuthError(null);
             setSessionExpiredNotice(null);
             setLiveUserProfile(resolvedProfile);
             setAuthenticatedUser(resolvedProfile);
-            setEnvMode('live');
+            setEnvMode(resolvedEnvMode);
+            const upsertProfile = (prev: LocalSnapshotState): LocalSnapshotState => {
+              const others = prev.users.filter((u) => u.uid !== resolvedProfile!.uid);
+              return { ...prev, users: [resolvedProfile!, ...others] };
+            };
+            setLiveState((prev) => {
+              const next = upsertProfile(prev);
+              saveLocalState(LIVE_CACHE_STORAGE_KEY, next);
+              return next;
+            });
+            setSandboxState((prev) => {
+              const next = upsertProfile(prev);
+              saveLocalState(SANDBOX_STORAGE_KEY, next);
+              return next;
+            });
             writeCachedAuthProfile(resolvedProfile);
             writePersistedSession({
               uid: resolvedProfile.uid,
-              envMode: 'live',
+              envMode: resolvedEnvMode,
               sandboxActiveRole: resolvedProfile.role,
               sandboxActiveDepartment: resolvedProfile.department,
               activeSection: activeSectionRef.current || defaultSection,
@@ -446,7 +576,16 @@ export function useFuelStore() {
             });
           }
         } catch (err) {
-          console.warn('Profile bootstrap check:', err);
+          console.error('Google Sign-In profile resolution failed:', err);
+          setGoogleAuthError(
+            err instanceof Error
+              ? err.message
+              : 'Unable to verify your Google account permissions in Live Cloud.'
+          );
+          clearPersistedSessionStorage();
+          setLiveUserProfile(null);
+          setAuthenticatedUser(null);
+          await signOutFirebase().catch(() => {});
         }
       } else {
         setLiveUserProfile(null);
@@ -456,91 +595,92 @@ export function useFuelStore() {
     return () => unsub();
   }, []);
 
-  // Real-time Firestore listeners when authenticated in Live mode
-  useEffect(() => {
-    if (!authReady || !firebaseUser || !liveUserProfile || envMode !== 'live') return;
-
-    const envPrefix = `environments/live`;
-    const unsubs: Array<() => void> = [];
-    const cityWide = hasCityWideAccess(liveUserProfile.role);
-
-    const attach = <T,>(
-      colName: keyof LocalSnapshotState,
-      firestoreColPath: string,
-      filterField?: string,
-      filterValue?: string
-    ) => {
-      const baseRef = collection(db, firestoreColPath);
-      const ref =
-        filterField && filterValue !== undefined
-          ? query(baseRef, where(filterField, '==', filterValue))
-          : baseRef;
-      const unsub = onSnapshot(
-        ref,
-        (snapshot) => {
-          const rows = snapshot.docs.map((d) => d.data() as T);
-          setLiveState((prev) => {
-            const next = { ...prev, [colName]: rows };
-            saveLocalState(LIVE_CACHE_STORAGE_KEY, next);
-            return next;
-          });
-        },
-        (error) => {
-          handleFirestoreError(error, OperationType.LIST, firestoreColPath);
-        }
+  const syncUserAndInviteDoc = useCallback(
+    async (user: UserAccount, actorUid: string, isCreate: boolean) => {
+      const sanitizedUser = prepareFirestoreRecordPayload(
+        user as unknown as Record<string, unknown>,
+        actorUid,
+        { isCreate, collection: 'users' }
       );
-      unsubs.push(unsub);
-    };
+      await setDoc(doc(db, 'users', user.uid), sanitizedUser, { merge: true });
+      const invitePayload = buildInvitePayloadFromUser(user, actorUid);
+      if (invitePayload && typeof invitePayload.id === 'string') {
+        await setDoc(doc(db, 'invites', invitePayload.id), invitePayload, { merge: true });
+      }
+    },
+    []
+  );
 
-    attach<FuelDepot>('depots', `${envPrefix}/depots`);
-    attach<FleetVehicle>(
-      'vehicles',
-      `${envPrefix}/vehicles`,
-      cityWide ? undefined : 'office',
-      cityWide ? undefined : liveUserProfile.department
-    );
-    attach<WorkPlan>(
-      'workPlans',
-      `${envPrefix}/workPlans`,
-      cityWide ? undefined : 'department',
-      cityWide ? undefined : liveUserProfile.department
-    );
-    attach<TripTicket>(
-      'tripTickets',
-      `${envPrefix}/tripTickets`,
-      cityWide ? undefined : 'department',
-      cityWide ? undefined : liveUserProfile.department
-    );
-    if (cityWide) {
-      attach<InventoryLog>('inventoryLogs', `${envPrefix}/inventoryLogs`);
-    }
-
-    if (liveUserProfile.role === 'admin' || firebaseUser.email === BOOTSTRAPPED_ADMIN_EMAIL) {
-      attach<AuditLog>('auditLogs', `${envPrefix}/auditLogs`);
-      attach<UserAccount>('users', 'users');
-    }
-
-    return () => {
-      unsubs.forEach((u) => u());
-    };
-  }, [authReady, firebaseUser, envMode, liveUserProfile]);
-
-  // Flush offline sync queue automatically when online & authenticated in Live mode
+  // Flush offline/unauthenticated sync queue automatically when online & authenticated
   const flushSyncQueue = useCallback(async () => {
-    if (!effectiveOnline || !firebaseUser || syncQueue.length === 0) return;
+    const currentQueue = syncQueueRef.current;
+    if (!effectiveOnline || !firebaseUser || currentQueue.length === 0) return;
 
     const remaining: SyncQueueItem[] = [];
     let syncedCount = 0;
 
-    for (const item of syncQueue) {
+    for (const item of currentQueue) {
+      const targetEnv: EnvironmentMode = item.envMode ?? 'live';
       const colPath =
-        item.collection === 'users' ? 'users' : `environments/live/${item.collection}`;
+        item.collection === 'users' ? 'users' : `environments/${targetEnv}/${item.collection}`;
       const docRef = doc(db, colPath, item.docId);
       try {
         if (item.operation === 'set' && item.payload) {
-          await setDoc(docRef, item.payload);
+          const payload = prepareFirestoreRecordPayload(item.payload, firebaseUser.uid, {
+            isCreate: true,
+            collection: item.collection,
+          });
+          await setDoc(docRef, payload);
+          if (item.collection === 'users') {
+            const invitePayload = buildInvitePayloadFromUser(
+              item.payload as unknown as UserAccount,
+              firebaseUser.uid
+            );
+            if (invitePayload && typeof invitePayload.id === 'string') {
+              await setDoc(doc(db, 'invites', invitePayload.id), invitePayload, { merge: true });
+            }
+          }
         } else if (item.operation === 'update' && item.payload) {
-          await updateDoc(docRef, item.payload);
+          const payload = prepareFirestoreRecordPayload(item.payload, firebaseUser.uid, {
+            isCreate: false,
+            collection: item.collection,
+          });
+          try {
+            await updateDoc(docRef, payload);
+          } catch (updateErr) {
+            const msg = updateErr instanceof Error ? updateErr.message : String(updateErr);
+            if (msg.includes('No document to update') || msg.includes('not-found')) {
+              const sourceState =
+                targetEnv === 'sandbox' ? sandboxStateRef.current : liveStateRef.current;
+              const list = sourceState[item.collection] as unknown as Array<
+                Record<string, unknown> & { id?: string; uid?: string }
+              >;
+              const matchKey = item.collection === 'users' ? 'uid' : 'id';
+              const fullLocal = list.find((entry) => entry[matchKey] === item.docId);
+              if (fullLocal) {
+                const fullPayload = prepareFirestoreRecordPayload(
+                  { ...fullLocal, ...item.payload },
+                  firebaseUser.uid,
+                  { isCreate: true, collection: item.collection }
+                );
+                await setDoc(docRef, fullPayload);
+              } else {
+                throw updateErr;
+              }
+            } else {
+              throw updateErr;
+            }
+          }
+          if (item.collection === 'users') {
+            const mergedUser = liveStateRef.current.users.find((u) => u.uid === item.docId) ??
+              sandboxStateRef.current.users.find((u) => u.uid === item.docId);
+            if (mergedUser) {
+              const invitePayload = buildInvitePayloadFromUser(mergedUser, firebaseUser.uid);
+              if (invitePayload && typeof invitePayload.id === 'string') {
+                await setDoc(doc(db, 'invites', invitePayload.id), invitePayload, { merge: true });
+              }
+            }
+          }
         } else if (item.operation === 'delete') {
           await deleteDoc(docRef);
         }
@@ -553,16 +693,366 @@ export function useFuelStore() {
 
     setSyncQueue(remaining);
     if (syncedCount > 0) {
-      setSyncNotice(`Synced ${syncedCount} offline record${syncedCount > 1 ? 's' : ''} to Firebase Cloud.`);
+      setSyncNotice(`Synced ${syncedCount} queued record${syncedCount > 1 ? 's' : ''} to Firebase Cloud.`);
       setTimeout(() => setSyncNotice(null), 4000);
     }
-  }, [effectiveOnline, firebaseUser, syncQueue]);
+  }, [effectiveOnline, firebaseUser]);
+
+  // Reconcile local AI Studio records (Sandbox/Live transactions + Users) with Firestore
+  const reconcileEnvironmentToCloud = useCallback(
+    async (targetEnv: EnvironmentMode, fbUser: FirebaseUser, profile: UserAccount) => {
+      if (!effectiveOnline) return 0;
+
+      const isElevatedAdmin =
+        profile.role === 'admin' ||
+        fbUser.email?.toLowerCase() === BOOTSTRAPPED_ADMIN_EMAIL.toLowerCase();
+      if (!isElevatedAdmin) return 0;
+
+      const envPrefix = `environments/${targetEnv}`;
+      const localSnapshot =
+        targetEnv === 'sandbox' ? sandboxStateRef.current : liveStateRef.current;
+
+      const [
+        depotsSnap,
+        vehiclesSnap,
+        plansSnap,
+        ticketsSnap,
+        invSnap,
+        auditSnap,
+        usersSnap,
+      ] = await Promise.all([
+        getDocs(collection(db, `${envPrefix}/depots`)),
+        getDocs(collection(db, `${envPrefix}/vehicles`)),
+        getDocs(collection(db, `${envPrefix}/workPlans`)),
+        getDocs(collection(db, `${envPrefix}/tripTickets`)),
+        getDocs(collection(db, `${envPrefix}/inventoryLogs`)),
+        getDocs(collection(db, `${envPrefix}/auditLogs`)),
+        getDocs(collection(db, 'users')),
+      ]);
+
+      const cloudDepots = depotsSnap.docs.map((d) => d.data() as FuelDepot);
+      const cloudVehicles = vehiclesSnap.docs.map((d) => d.data() as FleetVehicle);
+      const cloudPlans = plansSnap.docs.map((d) => d.data() as WorkPlan);
+      const cloudTickets = ticketsSnap.docs.map((d) => d.data() as TripTicket);
+      const cloudInv = invSnap.docs.map((d) => d.data() as InventoryLog);
+      const cloudAudit = auditSnap.docs.map((d) => d.data() as AuditLog);
+      const cloudUsers = usersSnap.docs.map((d) => d.data() as UserAccount);
+
+      const sandboxEmpty =
+        targetEnv === 'sandbox' &&
+        cloudDepots.length === 0 &&
+        cloudVehicles.length === 0 &&
+        cloudPlans.length === 0 &&
+        cloudTickets.length === 0 &&
+        cloudAudit.length === 0;
+
+      let cloudPurgeAt: string | null = null;
+      if (targetEnv === 'sandbox') {
+        for (const log of cloudAudit) {
+          if (log.action === 'SANDBOX_PURGED' && (!cloudPurgeAt || log.createdAt > cloudPurgeAt)) {
+            cloudPurgeAt = log.createdAt;
+          }
+        }
+      }
+
+      const useSeedFilter = targetEnv === 'live' || !sandboxEmpty;
+
+      const depotsRec = reconcileCollectionRecords({
+        localItems: localSnapshot.depots,
+        cloudItems: cloudDepots,
+        keyField: 'id',
+        cloudPurgeAt,
+        seedUpdatedAtByKey: useSeedFilter ? SEED_DEPOT_TS : undefined,
+      });
+      const vehiclesRec = reconcileCollectionRecords({
+        localItems: localSnapshot.vehicles,
+        cloudItems: cloudVehicles,
+        keyField: 'id',
+        cloudPurgeAt,
+        seedUpdatedAtByKey: useSeedFilter ? SEED_VEHICLE_TS : undefined,
+      });
+      const plansRec = reconcileCollectionRecords({
+        localItems: localSnapshot.workPlans,
+        cloudItems: cloudPlans,
+        keyField: 'id',
+        cloudPurgeAt,
+        seedUpdatedAtByKey: useSeedFilter ? SEED_WORKPLAN_TS : undefined,
+      });
+      const ticketsRec = reconcileCollectionRecords({
+        localItems: localSnapshot.tripTickets,
+        cloudItems: cloudTickets,
+        keyField: 'id',
+        cloudPurgeAt,
+        seedUpdatedAtByKey: useSeedFilter ? SEED_TICKET_TS : undefined,
+      });
+      const invRec = reconcileCollectionRecords({
+        localItems: localSnapshot.inventoryLogs,
+        cloudItems: cloudInv,
+        keyField: 'id',
+        cloudPurgeAt,
+        seedUpdatedAtByKey: useSeedFilter ? SEED_INV_TS : undefined,
+      });
+      const auditRec = reconcileCollectionRecords({
+        localItems: localSnapshot.auditLogs,
+        cloudItems: cloudAudit,
+        keyField: 'id',
+        cloudPurgeAt,
+        seedUpdatedAtByKey: useSeedFilter ? SEED_AUDIT_TS : undefined,
+      });
+
+      const localUsersCombined = deduplicateUsersByEmail([
+        ...localSnapshot.users,
+        ...liveStateRef.current.users,
+        ...sandboxStateRef.current.users,
+      ]);
+      const cloudEmailsSet = new Set(
+        cloudUsers.map((u) => u.email.trim().toLowerCase()).filter(Boolean)
+      );
+      const usersToConsider = localUsersCombined.filter((u) => {
+        const emailLower = u.email.trim().toLowerCase();
+        const isPlaceholder = u.uid === normalizeEmailToId(emailLower);
+        if (isPlaceholder && cloudEmailsSet.has(emailLower)) {
+          return cloudUsers.some((cu) => cu.uid === u.uid);
+        }
+        return true;
+      });
+
+      const usersSeedFilter = cloudUsers.length > 1 ? SEED_USER_TS : undefined;
+      const usersRec = reconcileCollectionRecords({
+        localItems: usersToConsider,
+        cloudItems: cloudUsers,
+        keyField: 'uid',
+        seedUpdatedAtByKey: usersSeedFilter,
+      });
+
+      let pushedCount = 0;
+
+      // 1. Sync Users & Invites first
+      for (const usr of usersRec.toCreate) {
+        try {
+          await syncUserAndInviteDoc(usr, fbUser.uid, true);
+          pushedCount += 1;
+        } catch (err) {
+          console.warn('User create sync skipped:', usr.uid, err);
+        }
+      }
+      for (const usr of usersRec.toUpdate) {
+        try {
+          const cloudExisting = cloudUsers.find((cu) => cu.uid === usr.uid);
+          const mergedUsr: UserAccount = cloudExisting
+            ? { ...usr, createdAt: cloudExisting.createdAt }
+            : usr;
+          await syncUserAndInviteDoc(mergedUsr, fbUser.uid, false);
+          pushedCount += 1;
+        } catch (err) {
+          console.warn('User update sync skipped:', usr.uid, err);
+        }
+      }
+
+      // 2. Sync Depots & Vehicles before dependent Plans, Tickets & Inventory Logs
+      const pushEnvItems = async <T extends { id: string }>(
+        colName: string,
+        items: T[],
+        isCreate: boolean
+      ) => {
+        for (const item of items) {
+          try {
+            const ref = doc(db, `${envPrefix}/${colName}`, item.id);
+            const payload = prepareFirestoreRecordPayload(
+              item as unknown as Record<string, unknown>,
+              fbUser.uid,
+              { isCreate, collection: colName }
+            );
+            if (isCreate) {
+              await setDoc(ref, payload);
+            } else {
+              await setDoc(ref, payload, { merge: true });
+            }
+            pushedCount += 1;
+          } catch (err) {
+            console.warn(`Reconcile ${envPrefix}/${colName}/${item.id} skipped:`, err);
+          }
+        }
+      };
+
+      await pushEnvItems('depots', depotsRec.toCreate, true);
+      await pushEnvItems('depots', depotsRec.toUpdate, false);
+      await pushEnvItems('vehicles', vehiclesRec.toCreate, true);
+      await pushEnvItems('vehicles', vehiclesRec.toUpdate, false);
+      await pushEnvItems('workPlans', plansRec.toCreate, true);
+      await pushEnvItems('workPlans', plansRec.toUpdate, false);
+      await pushEnvItems('tripTickets', ticketsRec.toCreate, true);
+      await pushEnvItems('tripTickets', ticketsRec.toUpdate, false);
+      await pushEnvItems('inventoryLogs', invRec.toCreate, true);
+      await pushEnvItems('inventoryLogs', invRec.toUpdate, false);
+      await pushEnvItems('auditLogs', auditRec.toCreate, true);
+
+      const mergedUsers = deduplicateUsersByEmail(usersRec.merged);
+      const nextState: LocalSnapshotState = {
+        users: mergedUsers,
+        depots: depotsRec.merged,
+        vehicles: vehiclesRec.merged,
+        workPlans: plansRec.merged,
+        tripTickets: ticketsRec.merged,
+        inventoryLogs: invRec.merged,
+        auditLogs: auditRec.merged,
+      };
+
+      if (targetEnv === 'sandbox') {
+        setSandboxState(nextState);
+        setLiveState((prev) => ({ ...prev, users: mergedUsers }));
+      } else {
+        setLiveState(nextState);
+        setSandboxState((prev) => ({ ...prev, users: mergedUsers }));
+      }
+
+      if (pushedCount > 0) {
+        setSyncNotice(
+          `Synchronized ${pushedCount} local record${pushedCount > 1 ? 's' : ''} (${targetEnv.toUpperCase()} & User Credentials) to Cloud.`
+        );
+        setTimeout(() => setSyncNotice(null), 5000);
+      }
+
+      return pushedCount;
+    },
+    [effectiveOnline, syncUserAndInviteDoc]
+  );
+
+  // Real-time Firestore listeners + initial reconciliation for BOTH Sandbox and Live modes
+  useEffect(() => {
+    if (!authReady || !firebaseUser || !liveUserProfile || !liveUserProfile.active) {
+      return;
+    }
+
+    let cancelled = false;
+    const unsubs: Array<() => void> = [];
+    const targetEnv: EnvironmentMode = envMode;
+    const envPrefix = `environments/${targetEnv}`;
+    const cityWide = hasCityWideAccess(liveUserProfile.role);
+    const isAdminUser =
+      liveUserProfile.role === 'admin' ||
+      firebaseUser.email?.toLowerCase() === BOOTSTRAPPED_ADMIN_EMAIL.toLowerCase();
+
+    const setTargetEnvState = targetEnv === 'sandbox' ? setSandboxState : setLiveState;
+
+    const startSyncAndListeners = async () => {
+      try {
+        await flushSyncQueue();
+        if (effectiveOnline && isAdminUser) {
+          await reconcileEnvironmentToCloud(targetEnv, firebaseUser, liveUserProfile);
+        }
+      } catch (err) {
+        console.warn('Initial cloud reconciliation encountered an issue:', err);
+      }
+
+      if (cancelled) return;
+
+      const selfUserUnsub = onSnapshot(
+        doc(db, 'users', firebaseUser.uid),
+        (snapshot) => {
+          if (!snapshot.exists()) return;
+          const freshProfile = snapshot.data() as UserAccount;
+          if (!freshProfile.active) {
+            setGoogleAuthError('This user account is suspended. Contact your Administrator.');
+            clearPersistedSessionStorage();
+            setLiveUserProfile(null);
+            setAuthenticatedUser(null);
+            void signOutFirebase().catch(() => {});
+            return;
+          }
+          setLiveUserProfile(freshProfile);
+          setAuthenticatedUser(freshProfile);
+          writeCachedAuthProfile(freshProfile);
+        },
+        (error) => {
+          handleFirestoreError(error, OperationType.GET, `users/${firebaseUser.uid}`);
+        }
+      );
+      unsubs.push(selfUserUnsub);
+
+      const attach = <T,>(
+        colName: keyof LocalSnapshotState,
+        firestoreColPath: string,
+        filterField?: string,
+        filterValue?: string
+      ) => {
+        const baseRef = collection(db, firestoreColPath);
+        const ref =
+          filterField && filterValue !== undefined
+            ? query(baseRef, where(filterField, '==', filterValue))
+            : baseRef;
+        const unsub = onSnapshot(
+          ref,
+          (snapshot) => {
+            const rows = snapshot.docs.map((d) => d.data() as T);
+            if (colName === 'users') {
+              const userRows = rows as unknown as UserAccount[];
+              setLiveState((prev) => ({ ...prev, users: userRows }));
+              setSandboxState((prev) => ({ ...prev, users: userRows }));
+              return;
+            }
+            setTargetEnvState((prev) => ({ ...prev, [colName]: rows }));
+          },
+          (error) => {
+            handleFirestoreError(error, OperationType.LIST, firestoreColPath);
+          }
+        );
+        unsubs.push(unsub);
+      };
+
+      attach<FuelDepot>('depots', `${envPrefix}/depots`);
+      attach<FleetVehicle>(
+        'vehicles',
+        `${envPrefix}/vehicles`,
+        cityWide ? undefined : 'office',
+        cityWide ? undefined : liveUserProfile.department
+      );
+      attach<WorkPlan>(
+        'workPlans',
+        `${envPrefix}/workPlans`,
+        cityWide ? undefined : 'department',
+        cityWide ? undefined : liveUserProfile.department
+      );
+      attach<TripTicket>(
+        'tripTickets',
+        `${envPrefix}/tripTickets`,
+        cityWide ? undefined : 'department',
+        cityWide ? undefined : liveUserProfile.department
+      );
+      if (cityWide) {
+        attach<InventoryLog>('inventoryLogs', `${envPrefix}/inventoryLogs`);
+      }
+
+      if (isAdminUser) {
+        attach<AuditLog>('auditLogs', `${envPrefix}/auditLogs`);
+        attach<UserAccount>('users', 'users');
+      }
+    };
+
+    void startSyncAndListeners();
+
+    return () => {
+      cancelled = true;
+      unsubs.forEach((u) => u());
+    };
+  }, [
+    authReady,
+    firebaseUser,
+    envMode,
+    effectiveOnline,
+    liveUserProfile?.uid,
+    liveUserProfile?.role,
+    liveUserProfile?.department,
+    liveUserProfile?.active,
+    flushSyncQueue,
+    reconcileEnvironmentToCloud,
+  ]);
 
   useEffect(() => {
-    if (effectiveOnline && firebaseUser && syncQueue.length > 0 && envMode === 'live') {
-      flushSyncQueue();
+    if (effectiveOnline && firebaseUser && syncQueue.length > 0) {
+      void flushSyncQueue();
     }
-  }, [effectiveOnline, firebaseUser, syncQueue.length, envMode, flushSyncQueue]);
+  }, [effectiveOnline, firebaseUser, syncQueue.length, flushSyncQueue]);
 
   const activeData = envMode === 'live' ? liveState : sandboxState;
 
@@ -628,7 +1118,7 @@ export function useFuelStore() {
     [activeData.vehicles, currentUser.role, currentUser.department]
   );
 
-  // Unified Persistence Helper
+  // Unified Persistence Helper (Synchronizes BOTH Sandbox & Live + shared Users to Firestore)
   const persistMutation = useCallback(
     async (
       col: SyncQueueItem['collection'],
@@ -636,66 +1126,98 @@ export function useFuelStore() {
       operation: SyncQueueItem['operation'],
       payload?: Record<string, unknown>
     ) => {
-      if (envMode === 'sandbox') {
-        setSandboxState((prev) => {
-          const list = [...(prev[col] as Array<{ id?: string; uid?: string }>)];
-          const matchKey = col === 'users' ? 'uid' : 'id';
-          const idx = list.findIndex((item) => item[matchKey] === docId);
+      const targetEnv: EnvironmentMode = envMode;
+      const normalizedPayload =
+        payload && firebaseUser && operation === 'set'
+          ? prepareFirestoreRecordPayload(payload, firebaseUser.uid, {
+              isCreate: true,
+              collection: col,
+            })
+          : payload;
 
-          if (operation === 'delete') {
-            if (idx >= 0) list.splice(idx, 1);
-          } else if (operation === 'set' && payload) {
-            if (idx >= 0) list[idx] = payload as { id?: string; uid?: string };
-            else list.unshift(payload as { id?: string; uid?: string });
-          } else if (operation === 'update' && payload && idx >= 0) {
-            list[idx] = { ...list[idx], ...payload };
-          }
-          return { ...prev, [col]: list };
-        });
-        return;
-      }
-
-      setLiveState((prev) => {
+      const applyLocalListMutation = (prev: LocalSnapshotState): LocalSnapshotState => {
         const list = [...(prev[col] as Array<{ id?: string; uid?: string }>)];
         const matchKey = col === 'users' ? 'uid' : 'id';
         const idx = list.findIndex((item) => item[matchKey] === docId);
 
         if (operation === 'delete') {
           if (idx >= 0) list.splice(idx, 1);
-        } else if (operation === 'set' && payload) {
-          if (idx >= 0) list[idx] = payload as { id?: string; uid?: string };
-          else list.unshift(payload as { id?: string; uid?: string });
-        } else if (operation === 'update' && payload && idx >= 0) {
-          list[idx] = { ...list[idx], ...payload };
+        } else if (operation === 'set' && normalizedPayload) {
+          if (idx >= 0) list[idx] = normalizedPayload as { id?: string; uid?: string };
+          else list.unshift(normalizedPayload as { id?: string; uid?: string });
+        } else if (operation === 'update' && normalizedPayload && idx >= 0) {
+          list[idx] = { ...list[idx], ...normalizedPayload };
         }
-        const next = { ...prev, [col]: list };
-        saveLocalState(LIVE_CACHE_STORAGE_KEY, next);
-        return next;
-      });
+        return { ...prev, [col]: list };
+      };
+
+      if (col === 'users') {
+        setSandboxState(applyLocalListMutation);
+        setLiveState(applyLocalListMutation);
+      } else if (targetEnv === 'sandbox') {
+        setSandboxState(applyLocalListMutation);
+      } else {
+        setLiveState(applyLocalListMutation);
+      }
 
       if (!effectiveOnline || !firebaseUser) {
         setSyncQueue((prev) => [
           ...prev,
           {
             id: makeId('sync'),
+            envMode: targetEnv,
             collection: col,
             docId,
             operation,
-            payload,
+            payload: normalizedPayload,
             createdAt: new Date().toISOString(),
           },
         ]);
-        setSyncNotice('Offline entry saved locally. Will auto-sync to Firebase when online.');
+        setSyncNotice(
+          !firebaseUser
+            ? `Saved locally in ${targetEnv === 'sandbox' ? 'Sandbox' : 'Live'}. Sign in with Google to push changes to the deployed web app.`
+            : 'Offline entry saved locally. Will auto-sync to Firebase when online.'
+        );
         return;
       }
 
-      const colPath = col === 'users' ? 'users' : `environments/live/${col}`;
+      const colPath = col === 'users' ? 'users' : `environments/${targetEnv}/${col}`;
       const docRef = doc(db, colPath, docId);
       try {
-        if (operation === 'set' && payload) {
-          await setDoc(docRef, payload);
-        } else if (operation === 'update' && payload) {
-          await updateDoc(docRef, payload);
+        if (operation === 'set' && normalizedPayload) {
+          await setDoc(docRef, normalizedPayload);
+        } else if (operation === 'update' && normalizedPayload) {
+          const updatePayload = prepareFirestoreRecordPayload(
+            normalizedPayload,
+            firebaseUser.uid,
+            { isCreate: false, collection: col }
+          );
+          try {
+            await updateDoc(docRef, updatePayload);
+          } catch (updateErr) {
+            const msg = updateErr instanceof Error ? updateErr.message : String(updateErr);
+            if (msg.includes('No document to update') || msg.includes('not-found')) {
+              const sourceState =
+                targetEnv === 'sandbox' ? sandboxStateRef.current : liveStateRef.current;
+              const list = sourceState[col] as unknown as Array<
+                Record<string, unknown> & { id?: string; uid?: string }
+              >;
+              const matchKey = col === 'users' ? 'uid' : 'id';
+              const fullLocal = list.find((item) => item[matchKey] === docId);
+              if (fullLocal) {
+                await setDoc(
+                  docRef,
+                  prepareFirestoreRecordPayload(
+                    { ...fullLocal, ...normalizedPayload },
+                    firebaseUser.uid,
+                    { isCreate: true, collection: col }
+                  )
+                );
+                return;
+              }
+            }
+            throw updateErr;
+          }
         } else if (operation === 'delete') {
           await deleteDoc(docRef);
         }
@@ -710,51 +1232,78 @@ export function useFuelStore() {
     async (action: string, entityType: string, entityId: string, summary: string) => {
       const log: AuditLog = {
         id: makeId('aud'),
-        actorUid: currentUser.uid,
+        actorUid: firebaseUser?.uid ?? currentUser.uid,
         actorEmail: currentUser.email,
         actorRole: currentUser.role,
         department: currentUser.department,
         action,
         entityType,
         entityId,
-        summary,
+        summary: summary.slice(0, 400),
         createdAt: new Date().toISOString(),
       };
       await persistMutation('auditLogs', log.id, 'set', log as unknown as Record<string, unknown>);
     },
-    [currentUser, persistMutation]
+    [firebaseUser?.uid, currentUser, persistMutation]
   );
 
   const isAuthenticatedSession = Boolean(authenticatedUser || (envMode === 'live' && firebaseUser));
 
-  // Credential Authentication (Username & Password assigned by Administrator)
+  const signInWithGoogle = useCallback(async () => {
+    setGoogleAuthError(null);
+    setSessionExpiredNotice(null);
+    clearPersistedSessionStorage();
+    preserveEnvOnAuthRef.current = null;
+    googleSignInInitiatedRef.current = true;
+    try {
+      return await firebaseSignInWithGoogle();
+    } catch (err) {
+      googleSignInInitiatedRef.current = false;
+      throw err;
+    }
+  }, []);
+
+  const connectGoogleForSync = useCallback(async () => {
+    setGoogleAuthError(null);
+    setSessionExpiredNotice(null);
+    preserveEnvOnAuthRef.current = envMode;
+    googleSignInInitiatedRef.current = true;
+    try {
+      return await firebaseSignInWithGoogle();
+    } catch (err) {
+      preserveEnvOnAuthRef.current = null;
+      googleSignInInitiatedRef.current = false;
+      throw err;
+    }
+  }, [envMode]);
+
+  const triggerManualReconcile = useCallback(async () => {
+    if (!firebaseUser || !liveUserProfile) return;
+    await flushSyncQueue();
+    const count = await reconcileEnvironmentToCloud(envMode, firebaseUser, liveUserProfile);
+    if (count === 0) {
+      setSyncNotice(`Cloud (${envMode.toUpperCase()} & User Credentials) is already up to date.`);
+      setTimeout(() => setSyncNotice(null), 4000);
+    }
+  }, [envMode, firebaseUser, liveUserProfile, flushSyncQueue, reconcileEnvironmentToCloud]);
+
+  // Credential Authentication (Username/Email & Password assigned by Administrator)
   const loginWithCredentials = useCallback(
     (username: string, password: string): { ok: boolean; user?: UserAccount; error?: string } => {
-      const cleanUser = username.trim().toLowerCase();
-      if (!cleanUser || !password) {
-        return { ok: false, error: 'Enter both Account Name and Password.' };
+      setGoogleAuthError(null);
+      const result = authenticateLocalUserCredentials({
+        liveUsers: liveState.users,
+        sandboxUsers: sandboxState.users,
+        seedUsers: SEED_USERS,
+        identifier: username,
+        password,
+      });
+
+      if (!result.ok || !result.user) {
+        return result;
       }
 
-      const candidatePool = [
-        ...sandboxState.users,
-        ...liveState.users,
-      ];
-      const matched = candidatePool.find(
-        (u) =>
-          (u.username && u.username.toLowerCase() === cleanUser) ||
-          u.email.toLowerCase() === cleanUser
-      );
-
-      if (!matched) {
-        return { ok: false, error: 'Account Name not recognized. Contact your Administrator.' };
-      }
-      if (!matched.active) {
-        return { ok: false, error: 'This user account is suspended. Contact your Administrator.' };
-      }
-      if (!matched.passwordHash || hashPassword(password) !== matched.passwordHash) {
-        return { ok: false, error: 'Invalid password for this account.' };
-      }
-
+      const matched = result.user;
       const nowMs = Date.now();
       const defaultSection = getDefaultNavSection(matched.role);
       lastActivityAtRef.current = nowMs;
@@ -781,6 +1330,7 @@ export function useFuelStore() {
 
   const logout = useCallback(async () => {
     clearPersistedSessionStorage();
+    setGoogleAuthError(null);
     setSessionExpiredNotice(null);
     setAuthenticatedUser(null);
     setLiveUserProfile(null);
@@ -1006,6 +1556,7 @@ export function useFuelStore() {
         ? planInput.department.trim()
         : currentUser.department.trim();
 
+      const writeOwnerUid = firebaseUser?.uid ?? currentUser.uid;
       const newPlan: WorkPlan = {
         ...planInput,
         department: effectiveDepartment,
@@ -1015,7 +1566,7 @@ export function useFuelStore() {
         totalRequestedLiters: Math.round(totalRequested * 10) / 10,
         totalApprovedLiters: 0,
         totalDispensedLiters: 0,
-        ownerId: currentUser.uid,
+        ownerId: writeOwnerUid,
         createdAt: now,
         updatedAt: now,
       };
@@ -1038,7 +1589,7 @@ export function useFuelStore() {
           forfeitedLiters: 0,
           servedOnce: false,
           status: 'pending',
-          ownerId: currentUser.uid,
+          ownerId: writeOwnerUid,
           createdAt: now,
           updatedAt: now,
         };
@@ -1057,6 +1608,7 @@ export function useFuelStore() {
     [
       activeData.workPlans,
       activeData.tripTickets,
+      firebaseUser?.uid,
       currentUser.uid,
       currentUser.role,
       currentUser.department,
@@ -1196,7 +1748,7 @@ export function useFuelStore() {
         gsoApproverName: currentUser.displayName,
         digitalVerificationCode: `DISP-${ticket.ticketNumber.slice(-5)}`,
         verifiedAt: now,
-        ownerId: currentUser.uid,
+        ownerId: firebaseUser?.uid ?? currentUser.uid,
         createdAt: now,
       };
       await persistMutation('inventoryLogs', invLog.id, 'set', invLog as unknown as Record<string, unknown>);
@@ -1210,7 +1762,7 @@ export function useFuelStore() {
 
       return { ok: true, outcome };
     },
-    [activeData.depots, activeData.workPlans, currentUser, persistMutation, appendAudit]
+    [activeData.depots, activeData.workPlans, firebaseUser?.uid, currentUser, persistMutation, appendAudit]
   );
 
   // 4. Depot Delivery & Pre-Fill Dipping Shrinkage/Overage Adjustment
@@ -1259,7 +1811,7 @@ export function useFuelStore() {
         gsoApproverName: isVerifiedNow ? params.gsoApproverName || currentUser.displayName : undefined,
         digitalVerificationCode: isVerifiedNow ? params.digitalVerificationCode : undefined,
         verifiedAt: isVerifiedNow ? now : undefined,
-        ownerId: currentUser.uid,
+        ownerId: firebaseUser?.uid ?? currentUser.uid,
         createdAt: now,
       };
 
@@ -1361,7 +1913,7 @@ export function useFuelStore() {
         const newVeh: FleetVehicle = {
           ...vehicleData,
           id,
-          ownerId: currentUser.uid,
+          ownerId: firebaseUser?.uid ?? currentUser.uid,
           createdAt: now,
           updatedAt: now,
         };
@@ -1374,7 +1926,7 @@ export function useFuelStore() {
         );
       }
     },
-    [currentUser.uid, persistMutation, appendAudit]
+    [firebaseUser?.uid, currentUser.uid, persistMutation, appendAudit]
   );
 
   const deleteVehicle = useCallback(
@@ -1423,7 +1975,7 @@ export function useFuelStore() {
     [persistMutation, appendAudit]
   );
 
-  // 6. Admin User Creation, Edit, Delete & RBAC Management
+  // 6. Admin User Creation, Edit, Delete & RBAC Management (Always synced to /users + /invites regardless of Sandbox/Live)
   const createUserAccount = useCallback(
     async (input: {
       username: string;
@@ -1440,52 +1992,51 @@ export function useFuelStore() {
       const now = new Date().toISOString();
       const cleanUsername = input.username.trim().toLowerCase();
       const cleanEmail = input.email.trim().toLowerCase() || `${cleanUsername}@baiscity.gov.ph`;
-      const uid = normalizeEmailToId(cleanEmail || cleanUsername) || makeId('usr');
+      const emailKey = normalizeEmailToId(cleanEmail || cleanUsername) || makeId('usr');
+      const existingByEmail = deduplicateUsersByEmail([
+        ...liveStateRef.current.users,
+        ...sandboxStateRef.current.users,
+      ]).find((u) => u.email.trim().toLowerCase() === cleanEmail);
+
+      const targetUid = existingByEmail ? existingByEmail.uid : emailKey;
       const userDoc: UserAccount = {
-        uid,
+        uid: targetUid,
         username: cleanUsername,
         passwordHash: hashPassword(input.password),
         email: cleanEmail,
         displayName: input.displayName.trim(),
         role: input.role,
         department: input.department.trim(),
-        positionTitle: input.positionTitle.trim(),
+        positionTitle: input.positionTitle.trim() || 'Staff',
         canEdit: input.role === 'admin' ? true : input.canEdit,
         canDelete: input.role === 'admin' ? true : input.canDelete,
         canSwitchToLive: input.role === 'admin' ? true : input.canSwitchToLive,
         active: true,
-        createdBy: currentUser.uid,
-        createdAt: now,
+        createdBy: existingByEmail?.createdBy || firebaseUser?.uid || currentUser.uid,
+        createdAt: existingByEmail?.createdAt || now,
         updatedAt: now,
       };
-      await persistMutation('users', uid, 'set', userDoc as unknown as Record<string, unknown>);
+      await persistMutation('users', targetUid, 'set', userDoc as unknown as Record<string, unknown>);
 
-      if (envMode === 'live' && firebaseUser && effectiveOnline) {
-        try {
-          await setDoc(doc(db, 'invites', uid), {
-            id: uid,
-            email: userDoc.email,
-            displayName: userDoc.displayName,
-            role: userDoc.role,
-            department: userDoc.department,
-            positionTitle: userDoc.positionTitle || 'Staff',
-            active: true,
-            createdBy: currentUser.uid,
-            createdAt: now,
-          });
-        } catch (err) {
-          console.warn('Invite write skipped:', err);
+      if (firebaseUser && effectiveOnline) {
+        const invitePayload = buildInvitePayloadFromUser(userDoc, firebaseUser.uid);
+        if (invitePayload && typeof invitePayload.id === 'string') {
+          try {
+            await setDoc(doc(db, 'invites', invitePayload.id), invitePayload, { merge: true });
+          } catch (err) {
+            console.warn('Invite write skipped:', err);
+          }
         }
       }
 
       await appendAudit(
         'USER_CREATED',
         'user',
-        uid,
+        targetUid,
         `Created user ${userDoc.username} (${userDoc.email}) with role ${userDoc.role}, edit=${userDoc.canEdit}, delete=${userDoc.canDelete}, liveSwitch=${userDoc.canSwitchToLive}, dept=${userDoc.department}.`
       );
     },
-    [currentUser.uid, envMode, firebaseUser, effectiveOnline, persistMutation, appendAudit]
+    [currentUser.uid, firebaseUser, effectiveOnline, persistMutation, appendAudit]
   );
 
   const updateUserAccount = useCallback(
@@ -1505,13 +2056,15 @@ export function useFuelStore() {
       }
     ) => {
       const now = new Date().toISOString();
+      const cleanEmail = updates.email.trim().toLowerCase();
+      const cleanUsername = updates.username.trim().toLowerCase();
       const payload: Record<string, unknown> = {
-        username: updates.username.trim().toLowerCase(),
-        email: updates.email.trim().toLowerCase(),
+        username: cleanUsername,
+        email: cleanEmail,
         displayName: updates.displayName.trim(),
         role: updates.role,
         department: updates.department.trim(),
-        positionTitle: updates.positionTitle.trim(),
+        positionTitle: updates.positionTitle.trim() || 'Staff',
         canEdit: updates.role === 'admin' ? true : updates.canEdit,
         canDelete: updates.role === 'admin' ? true : updates.canDelete,
         canSwitchToLive: updates.role === 'admin' ? true : updates.canSwitchToLive,
@@ -1522,8 +2075,43 @@ export function useFuelStore() {
       }
 
       await persistMutation('users', uid, 'update', payload);
+
+      if (firebaseUser && effectiveOnline && cleanEmail) {
+        const existingUser =
+          liveStateRef.current.users.find((u) => u.uid === uid) ??
+          sandboxStateRef.current.users.find((u) => u.uid === uid);
+        const mergedUser: UserAccount = {
+          uid,
+          email: cleanEmail,
+          username: cleanUsername,
+          passwordHash:
+            typeof payload.passwordHash === 'string'
+              ? payload.passwordHash
+              : existingUser?.passwordHash,
+          displayName: String(payload.displayName),
+          role: updates.role,
+          department: String(payload.department),
+          positionTitle: String(payload.positionTitle),
+          canEdit: Boolean(payload.canEdit),
+          canDelete: Boolean(payload.canDelete),
+          canSwitchToLive: Boolean(payload.canSwitchToLive),
+          active: existingUser?.active ?? true,
+          createdBy: existingUser?.createdBy || firebaseUser.uid,
+          createdAt: existingUser?.createdAt || now,
+          updatedAt: now,
+        };
+        const invitePayload = buildInvitePayloadFromUser(mergedUser, firebaseUser.uid);
+        if (invitePayload && typeof invitePayload.id === 'string') {
+          try {
+            await setDoc(doc(db, 'invites', invitePayload.id), invitePayload, { merge: true });
+          } catch (err) {
+            console.warn('Invite sync on user update skipped:', err);
+          }
+        }
+      }
+
       if (authenticatedUser?.uid === uid) {
-        setAuthenticatedUser((prev) => (prev ? { ...prev, ...payload } as UserAccount : null));
+        setAuthenticatedUser((prev) => (prev ? ({ ...prev, ...payload } as UserAccount) : null));
       }
 
       await appendAudit(
@@ -1533,12 +2121,21 @@ export function useFuelStore() {
         `Admin updated user ${String(payload.username)} (${String(payload.department)}).`
       );
     },
-    [authenticatedUser?.uid, persistMutation, appendAudit]
+    [authenticatedUser?.uid, firebaseUser, effectiveOnline, persistMutation, appendAudit]
   );
 
   const deleteUserAccount = useCallback(
     async (user: UserAccount) => {
       await persistMutation('users', user.uid, 'delete');
+      if (firebaseUser && effectiveOnline) {
+        const emailId = normalizeEmailToId(user.email);
+        if (emailId) {
+          if (emailId !== user.uid) {
+            await deleteDoc(doc(db, 'users', emailId)).catch(() => {});
+          }
+          await deleteDoc(doc(db, 'invites', emailId)).catch(() => {});
+        }
+      }
       await appendAudit(
         'USER_DELETED',
         'user',
@@ -1546,68 +2143,145 @@ export function useFuelStore() {
         `Admin deleted user account ${user.username || user.email}.`
       );
     },
-    [persistMutation, appendAudit]
+    [firebaseUser, effectiveOnline, persistMutation, appendAudit]
   );
 
   const toggleUserActive = useCallback(
     async (user: UserAccount) => {
+      const nextActive = !user.active;
+      const now = new Date().toISOString();
       await persistMutation('users', user.uid, 'update', {
-        active: !user.active,
-        updatedAt: new Date().toISOString(),
+        active: nextActive,
+        updatedAt: now,
       });
+      if (firebaseUser && effectiveOnline) {
+        const invitePayload = buildInvitePayloadFromUser(
+          { ...user, active: nextActive, updatedAt: now },
+          firebaseUser.uid
+        );
+        if (invitePayload && typeof invitePayload.id === 'string') {
+          await setDoc(doc(db, 'invites', invitePayload.id), invitePayload, { merge: true }).catch(
+            () => {}
+          );
+        }
+        const emailId = normalizeEmailToId(user.email);
+        if (emailId && emailId !== user.uid) {
+          await updateDoc(doc(db, 'users', emailId), {
+            active: nextActive,
+            updatedAt: now,
+          }).catch(() => {});
+        }
+      }
       await appendAudit(
         'USER_STATUS_TOGGLED',
         'user',
         user.uid,
-        `Set user ${user.username || user.email} active status to ${!user.active}.`
+        `Set user ${user.username || user.email} active status to ${nextActive}.`
       );
     },
-    [persistMutation, appendAudit]
+    [firebaseUser, effectiveOnline, persistMutation, appendAudit]
   );
 
-  // 7. Purge Sandbox Records & Re-seed Sandbox
+  // 7. Purge Sandbox Records & Re-seed Sandbox (Synchronized to Firestore environments/sandbox)
   const purgeSandboxRecords = useCallback(async () => {
-    setSandboxState({
-      users: [...SEED_USERS],
-      depots: [
-        {
-          id: 'depot_gso_central',
-          name: 'GSO Central Fuel Depot',
-          location: 'Bais City Hall Compound, Brgy. Hangyad',
-          gasolineCapacityLiters: 15000,
-          gasolineCurrentLiters: 15000,
-          gasolinePricePerLiter: 64.5,
-          dieselCapacityLiters: 30000,
-          dieselCurrentLiters: 30000,
-          dieselPricePerLiter: 58.2,
-          reorderThresholdPct: 25,
-          updatedAt: new Date().toISOString(),
-        },
-      ],
+    const now = new Date().toISOString();
+    const freshDepot: FuelDepot = {
+      id: 'depot_gso_central',
+      name: 'GSO Central Fuel Depot',
+      location: 'Bais City Hall Compound, Brgy. Hangyad',
+      gasolineCapacityLiters: 15000,
+      gasolineCurrentLiters: 15000,
+      gasolinePricePerLiter: 64.5,
+      dieselCapacityLiters: 30000,
+      dieselCurrentLiters: 30000,
+      dieselPricePerLiter: 58.2,
+      reorderThresholdPct: 25,
+      updatedAt: now,
+    };
+    const purgeLog: AuditLog = {
+      id: makeId('aud'),
+      actorUid: firebaseUser?.uid ?? currentUser.uid,
+      actorEmail: currentUser.email,
+      actorRole: currentUser.role,
+      department: currentUser.department,
+      action: 'SANDBOX_PURGED',
+      entityType: 'environment',
+      entityId: 'sandbox',
+      summary: 'Purged all practice records in Sandbox database.',
+      createdAt: now,
+    };
+
+    setSandboxState((prev) => ({
+      users: prev.users.length > 0 ? prev.users : [...SEED_USERS],
+      depots: [freshDepot],
       vehicles: [],
       workPlans: [],
       tripTickets: [],
       inventoryLogs: [],
-      auditLogs: [
-        {
-          id: makeId('aud'),
-          actorUid: currentUser.uid,
-          actorEmail: currentUser.email,
-          actorRole: currentUser.role,
-          department: currentUser.department,
-          action: 'SANDBOX_PURGED',
-          entityType: 'environment',
-          entityId: 'sandbox',
-          summary: 'Purged all practice records in Sandbox database.',
-          createdAt: new Date().toISOString(),
-        },
-      ],
-    });
-  }, [currentUser]);
+      auditLogs: [purgeLog],
+    }));
 
-  const restoreSandboxDemoData = useCallback(() => {
-    setSandboxState(getInitialSeedState());
-  }, []);
+    setSyncQueue((prev) => prev.filter((q) => (q.envMode ?? 'live') !== 'sandbox'));
+
+    if (firebaseUser && effectiveOnline) {
+      const cols = ['tripTickets', 'workPlans', 'vehicles', 'inventoryLogs', 'depots', 'auditLogs'] as const;
+      for (const colName of cols) {
+        try {
+          const snap = await getDocs(collection(db, `environments/sandbox/${colName}`));
+          if (!snap.empty) {
+            const batch = writeBatch(db);
+            snap.docs.forEach((d) => batch.delete(d.ref));
+            await batch.commit();
+          }
+        } catch (err) {
+          console.warn(`Sandbox purge cleanup failed for ${colName}:`, err);
+        }
+      }
+      await setDoc(doc(db, 'environments/sandbox/depots', freshDepot.id), freshDepot).catch(
+        () => {}
+      );
+      await setDoc(
+        doc(db, 'environments/sandbox/auditLogs', purgeLog.id),
+        prepareFirestoreRecordPayload(purgeLog as unknown as Record<string, unknown>, firebaseUser.uid, {
+          isCreate: true,
+          collection: 'auditLogs',
+        })
+      ).catch(() => {});
+    }
+  }, [firebaseUser, effectiveOnline, currentUser]);
+
+  const restoreSandboxDemoData = useCallback(async () => {
+    const restored = getInitialSeedState();
+    const unifiedUsers = deduplicateUsersByEmail([
+      ...sandboxStateRef.current.users,
+      ...liveStateRef.current.users,
+      ...SEED_USERS,
+    ]);
+    setSandboxState({ ...restored, users: unifiedUsers });
+
+    if (firebaseUser && effectiveOnline) {
+      const envPrefix = 'environments/sandbox';
+      const writeSeeds = async <T extends { id: string }>(colName: string, items: T[]) => {
+        for (const item of items) {
+          await setDoc(
+            doc(db, `${envPrefix}/${colName}`, item.id),
+            prepareFirestoreRecordPayload(item as unknown as Record<string, unknown>, firebaseUser.uid, {
+              isCreate: true,
+              collection: colName,
+            })
+          ).catch((err) => console.warn(`Restore seed ${colName}/${item.id} skipped:`, err));
+        }
+      };
+      await writeSeeds('depots', restored.depots);
+      await writeSeeds('vehicles', restored.vehicles);
+      await writeSeeds('workPlans', restored.workPlans);
+      await writeSeeds('tripTickets', restored.tripTickets);
+      await writeSeeds('inventoryLogs', restored.inventoryLogs);
+      await writeSeeds('auditLogs', restored.auditLogs);
+      setSyncNotice('Restored Sandbox baseline records and synchronized to Cloud.');
+      setTimeout(() => setSyncNotice(null), 4000);
+    }
+  }, [firebaseUser, effectiveOnline]);
 
   const seedLiveBaselineData = useCallback(async () => {
     if (!firebaseUser || envMode !== 'live') return;
@@ -1630,6 +2304,19 @@ export function useFuelStore() {
     );
   }, [firebaseUser, envMode, appendAudit]);
 
+  const deduplicatedUsers = useMemo(
+    () => deduplicateUsersByEmail(activeData.users),
+    [activeData.users]
+  );
+
+  const normalizedData = useMemo(
+    () => ({
+      ...activeData,
+      users: deduplicatedUsers,
+    }),
+    [activeData, deduplicatedUsers]
+  );
+
   return {
     envMode,
     setEnvMode,
@@ -1639,6 +2326,7 @@ export function useFuelStore() {
     isAuthenticated: isAuthenticatedSession,
     initialSection: bootAuth.section,
     sessionExpiredNotice,
+    googleAuthError,
     clearSessionExpiredNotice: () => setSessionExpiredNotice(null),
     persistActiveSection,
     loginWithCredentials,
@@ -1650,12 +2338,14 @@ export function useFuelStore() {
     syncQueue,
     syncNotice,
     flushSyncQueue,
+    connectGoogleForSync,
+    reconcileNow: triggerManualReconcile,
     currentUser,
     sandboxActiveRole,
     setSandboxActiveRole,
     sandboxActiveDepartment,
     setSandboxActiveDepartment,
-    data: activeData,
+    data: normalizedData,
     visibleWorkPlans,
     visibleTickets,
     visibleVehicles,

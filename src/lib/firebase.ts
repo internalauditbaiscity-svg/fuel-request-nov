@@ -17,6 +17,9 @@ import {
   persistentMultipleTabManager,
 } from 'firebase/firestore';
 import firebaseConfig from '../../firebase-applet-config.json';
+import { normalizeEmailToId, stripUndefinedFields } from '../utils/fuelEngine';
+
+export { normalizeEmailToId, stripUndefinedFields };
 
 const app = initializeApp(firebaseConfig);
 
@@ -117,13 +120,4 @@ export async function signInWithGoogle() {
 
 export async function signOutFirebase() {
   return signOut(auth);
-}
-
-export function normalizeEmailToId(email: string): string {
-  return email
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '_')
-    .replace(/^_+|_+$/g, '')
-    .slice(0, 120);
 }

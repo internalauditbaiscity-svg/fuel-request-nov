@@ -3,6 +3,7 @@ import { Building2, Lock, LogIn, ShieldCheck, User } from 'lucide-react';
 
 interface LoginViewProps {
   sessionExpiredNotice?: string | null;
+  externalError?: string | null;
   onCredentialLogin: (
     username: string,
     password: string
@@ -12,6 +13,7 @@ interface LoginViewProps {
 
 export function LoginView({
   sessionExpiredNotice,
+  externalError,
   onCredentialLogin,
   onGoogleSignIn,
 }: LoginViewProps) {
@@ -19,6 +21,7 @@ export function LoginView({
   const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [googleBusy, setGoogleBusy] = useState(false);
+  const displayedError = error || externalError || null;
 
   const usernameInputRef = useRef<HTMLInputElement>(null);
   const passwordInputRef = useRef<HTMLInputElement>(null);
@@ -109,7 +112,7 @@ export function LoginView({
             </div>
           </div>
 
-          {sessionExpiredNotice && !error && (
+          {sessionExpiredNotice && !displayedError && (
             <div
               role="status"
               data-testid="session-expired-notice"
@@ -119,12 +122,12 @@ export function LoginView({
             </div>
           )}
 
-          {error && (
+          {displayedError && (
             <div
               role="alert"
               className="rounded-md border border-red-300 bg-red-50 px-3.5 py-2.5 text-xs font-medium text-red-900"
             >
-              {error}
+              {displayedError}
             </div>
           )}
 
@@ -134,7 +137,7 @@ export function LoginView({
                 htmlFor="login-username"
                 className="block text-xs font-semibold text-[#334E73] mb-1"
               >
-                User Account Name
+                User Account Name or Email
               </label>
               <div className="relative">
                 <User className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[#5A6F8C]" />
@@ -146,7 +149,7 @@ export function LoginView({
                   required
                   autoComplete="off"
                   data-sensitive-clear="true"
-                  placeholder="Enter assigned account name"
+                  placeholder="Enter assigned account name or email"
                   value={username}
                   onChange={(e) => setUsername(e.target.value)}
                   className="w-full rounded-md border border-[#D5DCE6] bg-[#F9FAFC] py-2.5 pl-9 pr-3 text-sm text-[#0B192C] focus:border-[#1B3B6F] focus:bg-white focus:outline-none"

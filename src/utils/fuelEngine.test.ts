@@ -2,8 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   addDaysIso,
+  authenticateLocalUserCredentials,
   buildDailyReconciliationReport,
   buildDispensingCsvContent,
+  buildInvitePayloadFromUser,
   calculateFuelLimit,
   canAccessDepartmentRecord,
   canAccessNavSection,
@@ -23,6 +25,7 @@ import {
   categorizeDepartmentWorkPlans,
   computeSingleDispenseOutcome,
   computeWorkPlanFuelTotals,
+  deduplicateUsersByEmail,
   evaluateTabletopApproval,
   filterAndCategorizeWorkPrograms,
   filterVehiclesForTicket,
@@ -39,12 +42,18 @@ import {
   INACTIVITY_TIMEOUT_MS,
   isSessionExpired,
   isWorkPlanInactive,
+  mergeClaimedUserProfile,
+  normalizeEmailToId,
   parsePersistedSession,
+  prepareFirestoreRecordPayload,
+  reconcileCollectionRecords,
   replaceYearInProjectCode,
+  resolveEffectiveEnvironmentAfterGoogleAuth,
   shiftIsoDateToYear,
+  stripUndefinedFields,
   validateWorkProgramMandatoryFilters,
 } from './fuelEngine';
-import { FleetVehicle, FuelDepot, InventoryLog, TripTicket, WorkPlan } from '../types/fuel';
+import { FleetVehicle, FuelDepot, InventoryLog, TripTicket, UserAccount, WorkPlan } from '../types/fuel';
 
 test('calculateFuelLimit computes km/L vehicles and L/hr heavy equipment accurately', () => {
   const truckLimit = calculateFuelLimit({
@@ -1347,6 +1356,293 @@ test('categorizeAndFilterApprovals routes into 4 folders and strictly excludes n
   assert.equal(septOnly.fullyApproved.length, 0);
   assert.deepEqual(septOnly.inactive.map((w) => w.controlNumber), ['WP-2026-0004']);
 });
+
+test('authenticateLocalUserCredentials resolves Gmail emails and usernames across live/sandbox/seed without stale shadowing', () => {
+  const seedUser: UserAccount = {
+    uid: 'usr_eng',
+    username: 'eng_head',
+    passwordHash: hashPassword('OldPass123!'),
+    email: 'Engineering.Req@Gmail.com',
+    displayName: 'Clarissa Mendoza',
+    role: 'department_head',
+    department: 'City Engineering Office',
+    positionTitle: 'City Engineer',
+    canEdit: true,
+    canDelete: false,
+    canSwitchToLive: false,
+    active: true,
+    createdBy: 'admin',
+    createdAt: '2026-01-01T00:00:00Z',
+    updatedAt: '2026-01-01T00:00:00Z',
+  };
+
+  const liveUpdatedUser: UserAccount = {
+    ...seedUser,
+    uid: 'firebase_uid_999',
+    passwordHash: hashPassword('NewGmailPass!'),
+    canSwitchToLive: true,
+    updatedAt: '2026-11-16T00:00:00Z',
+  };
+
+  const suspendedUser: UserAccount = {
+    uid: 'usr_susp',
+    username: 'suspended_gmail',
+    passwordHash: hashPassword('Secret1!'),
+    email: 'suspended.user@gmail.com',
+    displayName: 'Suspended User',
+    role: 'requester',
+    department: 'CENRO',
+    canEdit: false,
+    canDelete: false,
+    canSwitchToLive: false,
+    active: false,
+    createdBy: 'admin',
+    createdAt: '2026-01-01T00:00:00Z',
+    updatedAt: '2026-01-01T00:00:00Z',
+  };
+
+  // Case-insensitive Gmail match succeeds with updated live password even when seed has older hash
+  const okLive = authenticateLocalUserCredentials({
+    liveUsers: [liveUpdatedUser],
+    sandboxUsers: [seedUser],
+    seedUsers: [seedUser],
+    identifier: '  engineering.req@gmail.com  ',
+    password: 'NewGmailPass!',
+  });
+  assert.equal(okLive.ok, true);
+  assert.equal(okLive.user?.uid, 'firebase_uid_999');
+  assert.equal(okLive.user?.canSwitchToLive, true);
+
+  // Username login also works
+  const okUsername = authenticateLocalUserCredentials({
+    liveUsers: [liveUpdatedUser],
+    sandboxUsers: [seedUser],
+    identifier: 'ENG_HEAD',
+    password: 'NewGmailPass!',
+  });
+  assert.equal(okUsername.ok, true);
+  assert.equal(okUsername.user?.uid, 'firebase_uid_999');
+
+  // Suspended account rejected cleanly
+  const suspended = authenticateLocalUserCredentials({
+    liveUsers: [suspendedUser],
+    identifier: 'suspended.user@gmail.com',
+    password: 'Secret1!',
+  });
+  assert.equal(suspended.ok, false);
+  assert.match(suspended.error ?? '', /suspended/i);
+
+  // Unknown Gmail guides user to Google Sign-In
+  const missing = authenticateLocalUserCredentials({
+    liveUsers: [liveUpdatedUser],
+    identifier: 'another.gmail@gmail.com',
+    password: 'AnyPassword1!',
+  });
+  assert.equal(missing.ok, false);
+  assert.match(missing.error ?? '', /Sign In with Google/i);
+});
+
+test('mergeClaimedUserProfile & deduplicateUsersByEmail handle invite claiming, self-registration, and UID deduplication', () => {
+  assert.equal(normalizeEmailToId('User.Name+01@Gmail.COM'), 'user_name_01_gmail_com');
+  assert.deepEqual(stripUndefinedFields({ a: 1, b: undefined, c: 'ok' }), { a: 1, c: 'ok' });
+
+  // 1. Admin-invited different Gmail claims assigned role, department, and permissions into Firebase Auth UID
+  const claimed = mergeClaimedUserProfile({
+    uid: 'fb_uid_12345',
+    email: 'MayorApprover@Gmail.com',
+    displayName: 'Roberto',
+    sourceProfile: {
+      username: 'mayor_approver',
+      passwordHash: hashPassword('Pass123!'),
+      role: 'approver',
+      department: 'Office of the City Mayor',
+      positionTitle: 'City Administrator',
+      canEdit: true,
+      canDelete: false,
+      canSwitchToLive: true,
+      active: true,
+    },
+    nowIso: '2026-11-16T08:00:00Z',
+  });
+  assert.equal(claimed.uid, 'fb_uid_12345');
+  assert.equal(claimed.email, 'mayorapprover@gmail.com');
+  assert.equal(claimed.role, 'approver');
+  assert.equal(claimed.department, 'Office of the City Mayor');
+  assert.equal(claimed.canSwitchToLive, true);
+  assert.equal(claimed.active, true);
+
+  // 2. Uninvited Gmail user safely self-registers as unprivileged requester
+  const selfReg = mergeClaimedUserProfile({
+    uid: 'fb_uid_uninvited',
+    email: 'field.staff@gmail.com',
+    displayName: 'Field Staff',
+    sourceProfile: null,
+    nowIso: '2026-11-16T08:00:00Z',
+  });
+  assert.equal(selfReg.uid, 'fb_uid_uninvited');
+  assert.equal(selfReg.role, 'requester');
+  assert.equal(selfReg.canEdit, false);
+  assert.equal(selfReg.canDelete, false);
+  assert.equal(selfReg.canSwitchToLive, false);
+  assert.equal(selfReg.createdBy, 'self');
+
+  // 3. Deduplication prefers real Firebase UID over email-derived placeholder document
+  const placeholder: UserAccount = {
+    ...claimed,
+    uid: normalizeEmailToId('MayorApprover@Gmail.com'),
+    updatedAt: '2026-11-16T09:00:00Z',
+  };
+  const deduped = deduplicateUsersByEmail([placeholder, claimed]);
+  assert.equal(deduped.length, 1);
+  assert.equal(deduped[0].uid, 'fb_uid_12345');
+});
+
+test('buildInvitePayloadFromUser and prepareFirestoreRecordPayload sanitize user, audit, and transaction payloads', () => {
+  const user: UserAccount = {
+    uid: 'usr_gso_1',
+    username: '  GSO_Head_Test ',
+    passwordHash: hashPassword('Secret123!'),
+    email: '  GSO.Test@Gmail.com ',
+    displayName: '  Engr. Mario Santos  ',
+    role: 'gso_head',
+    department: 'General Services Office (GSO)',
+    positionTitle: undefined,
+    canEdit: true,
+    canDelete: false,
+    canSwitchToLive: true,
+    active: true,
+    createdBy: 'seed_admin_1',
+    createdAt: '2026-11-16T08:00:00Z',
+    updatedAt: '2026-11-16T08:00:00Z',
+  };
+
+  const invite = buildInvitePayloadFromUser(user, 'fb_admin_uid');
+  assert.ok(invite);
+  assert.equal(invite.id, 'gso_test_gmail_com');
+  assert.equal(invite.email, 'gso.test@gmail.com');
+  assert.equal(invite.username, 'gso_head_test');
+  assert.equal(invite.canEdit, true);
+  assert.equal(invite.canDelete, false);
+  assert.equal(invite.canSwitchToLive, true);
+
+  // Admin role always enforces edit/delete/live permissions
+  const adminInvite = buildInvitePayloadFromUser(
+    { ...user, role: 'admin', canEdit: false, canDelete: false, canSwitchToLive: false },
+    'fb_admin_uid'
+  );
+  assert.equal(adminInvite?.canEdit, true);
+  assert.equal(adminInvite?.canDelete, true);
+  assert.equal(adminInvite?.canSwitchToLive, true);
+
+  // Short username stripped cleanly to satisfy rules (>= 2 chars)
+  const sanitizedUser = prepareFirestoreRecordPayload(
+    { ...user, username: 'a' } as unknown as Record<string, unknown>,
+    'fb_admin_uid',
+    { isCreate: true, collection: 'users' }
+  );
+  assert.equal('username' in sanitizedUser, false);
+  assert.equal(sanitizedUser.email, 'gso.test@gmail.com');
+
+  // WorkPlan create normalizes ownerId to firebaseUid; update preserves provided fields
+  const wpCreate = prepareFirestoreRecordPayload(
+    { id: 'wp_1', ownerId: 'seed_admin_1', status: 'approved' },
+    'fb_admin_uid',
+    { isCreate: true, collection: 'workPlans' }
+  );
+  assert.equal(wpCreate.ownerId, 'fb_admin_uid');
+
+  const wpUpdate = prepareFirestoreRecordPayload(
+    { ownerId: 'seed_admin_1', status: 'completed' },
+    'fb_admin_uid',
+    { isCreate: false, collection: 'workPlans' }
+  );
+  assert.equal(wpUpdate.ownerId, 'seed_admin_1');
+
+  // Audit log create normalizes actorUid and clamps summary
+  const audCreate = prepareFirestoreRecordPayload(
+    { id: 'aud_1', actorUid: 'seed_admin_1', summary: 'x' },
+    'fb_admin_uid',
+    { isCreate: true, collection: 'auditLogs' }
+  );
+  assert.equal(audCreate.actorUid, 'fb_admin_uid');
+  assert.equal(audCreate.summary, 'Audit entry');
+});
+
+test('reconcileCollectionRecords merges AI Studio local records with cloud while respecting purges and untouched seeds', () => {
+  type Rec = { id: string; label: string; createdAt?: string; updatedAt?: string };
+  const seedTs = new Map<string, string>([['seed_1', '2026-11-09T08:00:00Z']]);
+
+  const localItems: Rec[] = [
+    // Untouched seed item deleted in cloud -> should NOT be resurrected when cloud has records
+    { id: 'seed_1', label: 'Seed Baseline', updatedAt: '2026-11-09T08:00:00Z' },
+    // Pre-purge local item -> should NOT be pushed after cloudPurgeAt
+    { id: 'old_local', label: 'Pre-Purge Local', updatedAt: '2026-11-10T08:00:00Z' },
+    // New local AI Studio transaction created after purge -> MUST be created in cloud
+    { id: 'new_local', label: 'AI Studio New TX', updatedAt: '2026-11-16T10:00:00Z' },
+    // Modified locally more recently than cloud -> MUST update cloud
+    { id: 'shared_1', label: 'Updated Locally', updatedAt: '2026-11-16T12:00:00Z' },
+    // Older locally than cloud -> Cloud wins
+    { id: 'shared_2', label: 'Stale Local', updatedAt: '2026-11-14T08:00:00Z' },
+  ];
+
+  const cloudItems: Rec[] = [
+    { id: 'shared_1', label: 'Older Cloud', updatedAt: '2026-11-15T08:00:00Z' },
+    { id: 'shared_2', label: 'Newer Cloud', updatedAt: '2026-11-16T11:00:00Z' },
+    { id: 'cloud_only', label: 'Deployed App TX', updatedAt: '2026-11-16T09:00:00Z' },
+  ];
+
+  const rec = reconcileCollectionRecords({
+    localItems,
+    cloudItems,
+    keyField: 'id',
+    cloudPurgeAt: '2026-11-12T00:00:00Z',
+    seedUpdatedAtByKey: seedTs,
+  });
+
+  assert.deepEqual(rec.toCreate.map((r) => r.id), ['new_local']);
+  assert.deepEqual(rec.toUpdate.map((r) => r.id), ['shared_1']);
+
+  const mergedById = new Map(rec.merged.map((r) => [r.id, r]));
+  assert.equal(mergedById.has('seed_1'), false);
+  assert.equal(mergedById.has('old_local'), false);
+  assert.equal(mergedById.get('new_local')?.label, 'AI Studio New TX');
+  assert.equal(mergedById.get('shared_1')?.label, 'Updated Locally');
+  assert.equal(mergedById.get('shared_2')?.label, 'Newer Cloud');
+  assert.equal(mergedById.get('cloud_only')?.label, 'Deployed App TX');
+});
+
+test('resolveEffectiveEnvironmentAfterGoogleAuth keeps Sandbox when linking for sync and enforces live permissions otherwise', () => {
+  assert.equal(
+    resolveEffectiveEnvironmentAfterGoogleAuth({
+      preserveEnvMode: 'sandbox',
+      user: { role: 'admin', canSwitchToLive: true },
+    }),
+    'sandbox'
+  );
+  assert.equal(
+    resolveEffectiveEnvironmentAfterGoogleAuth({
+      preserveEnvMode: null,
+      user: { role: 'admin', canSwitchToLive: true },
+    }),
+    'live'
+  );
+  assert.equal(
+    resolveEffectiveEnvironmentAfterGoogleAuth({
+      preserveEnvMode: 'live',
+      user: { role: 'requester', canSwitchToLive: false },
+    }),
+    'sandbox'
+  );
+  assert.equal(
+    resolveEffectiveEnvironmentAfterGoogleAuth({
+      preserveEnvMode: null,
+      user: { role: 'approver', canSwitchToLive: true },
+    }),
+    'live'
+  );
+});
+
+
 
 
 

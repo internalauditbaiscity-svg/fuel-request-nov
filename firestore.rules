@@ -27,8 +27,16 @@ service cloud.firestore {
       return resource.data;
     }
 
+    function normalizedAuthEmail() {
+      return isVerified() && request.auth.token.email is string ? request.auth.token.email.lower() : '';
+    }
+
+    function emailDocId() {
+      return normalizedAuthEmail().replace('[^a-z0-9]+', '_').replace('^_+|_+$', '');
+    }
+
     function isBootstrappedAdmin() {
-      return isVerified() && request.auth.token.email == 'internalaudit.baiscity@gmail.com';
+      return isVerified() && normalizedAuthEmail() == 'internalaudit.baiscity@gmail.com';
     }
 
     function isAdmin() {
@@ -257,16 +265,68 @@ service cloud.firestore {
 
     function isValidUserInvite(data) {
       return data.keys().hasAll(['id', 'email', 'displayName', 'role', 'department', 'active', 'createdBy', 'createdAt']) &&
-        data.keys().hasOnly(['id', 'email', 'displayName', 'role', 'department', 'positionTitle', 'active', 'createdBy', 'createdAt']) &&
+        data.keys().hasOnly(['id', 'email', 'username', 'passwordHash', 'displayName', 'role', 'department', 'positionTitle', 'canEdit', 'canDelete', 'canSwitchToLive', 'active', 'createdBy', 'createdAt']) &&
         isValidId(data.id) &&
         data.email is string && data.email.size() >= 3 && data.email.size() <= 254 &&
+        (!('username' in data) || (data.username is string && data.username.size() >= 2 && data.username.size() <= 64)) &&
+        (!('passwordHash' in data) || (data.passwordHash is string && data.passwordHash.size() <= 128)) &&
         data.displayName is string && data.displayName.size() >= 2 && data.displayName.size() <= 120 &&
         data.role in ['admin', 'approver', 'gso_head', 'gso_dispenser', 'department_head', 'requester', 'auditor'] &&
         data.department is string && data.department.size() >= 2 && data.department.size() <= 120 &&
         (!('positionTitle' in data) || (data.positionTitle is string && data.positionTitle.size() <= 120)) &&
+        (!('canEdit' in data) || data.canEdit is bool) &&
+        (!('canDelete' in data) || data.canDelete is bool) &&
+        (!('canSwitchToLive' in data) || data.canSwitchToLive is bool) &&
         data.active is bool &&
         data.createdBy is string && data.createdBy.size() >= 1 && data.createdBy.size() <= 128 &&
         data.createdAt is string && data.createdAt.size() >= 10 && data.createdAt.size() <= 64;
+    }
+
+    function matchesProvisionedRecord(incomingData, sourceData) {
+      return sourceData.active == true &&
+        sourceData.email is string &&
+        sourceData.email.lower() == normalizedAuthEmail() &&
+        incomingData.email.lower() == normalizedAuthEmail() &&
+        incomingData.role == sourceData.role &&
+        incomingData.department == sourceData.department &&
+        incomingData.active == true &&
+        ((!('canEdit' in sourceData) && (!('canEdit' in incomingData) || incomingData.canEdit == false)) ||
+         ('canEdit' in sourceData && 'canEdit' in incomingData && incomingData.canEdit == sourceData.canEdit)) &&
+        ((!('canDelete' in sourceData) && (!('canDelete' in incomingData) || incomingData.canDelete == false)) ||
+         ('canDelete' in sourceData && 'canDelete' in incomingData && incomingData.canDelete == sourceData.canDelete)) &&
+        ((!('canSwitchToLive' in sourceData) && (!('canSwitchToLive' in incomingData) || incomingData.canSwitchToLive == false)) ||
+         ('canSwitchToLive' in sourceData && 'canSwitchToLive' in incomingData && incomingData.canSwitchToLive == sourceData.canSwitchToLive));
+    }
+
+    function isClaimingValidInvite(data) {
+      return isValidId(emailDocId()) &&
+        exists(/databases/$(database)/documents/invites/$(emailDocId())) &&
+        matchesProvisionedRecord(data, get(/databases/$(database)/documents/invites/$(emailDocId())).data);
+    }
+
+    function isClaimingLegacyUser(data) {
+      return isValidId(emailDocId()) &&
+        exists(/databases/$(database)/documents/users/$(emailDocId())) &&
+        matchesProvisionedRecord(data, get(/databases/$(database)/documents/users/$(emailDocId())).data);
+    }
+
+    function isEmailSuspended() {
+      return isValidId(emailDocId()) && (
+        (exists(/databases/$(database)/documents/invites/$(emailDocId())) &&
+         get(/databases/$(database)/documents/invites/$(emailDocId())).data.active == false) ||
+        (exists(/databases/$(database)/documents/users/$(emailDocId())) &&
+         get(/databases/$(database)/documents/users/$(emailDocId())).data.active == false)
+      );
+    }
+
+    function isSafeSelfRegistration(data) {
+      return !isEmailSuspended() &&
+        data.email.lower() == normalizedAuthEmail() &&
+        data.role == 'requester' &&
+        data.active == true &&
+        (!('canEdit' in data) || data.canEdit == false) &&
+        (!('canDelete' in data) || data.canDelete == false) &&
+        (!('canSwitchToLive' in data) || data.canSwitchToLive == false);
     }
 
     // Admins Registry
@@ -281,8 +341,16 @@ service cloud.firestore {
 
     // Invites Registry (Admin-managed role provisioning)
     match /invites/{inviteId} {
-      allow get: if isValidId(inviteId) && isVerified() && (isAdmin() || existing().email == request.auth.token.email);
-      allow list: if isAdmin() || (isVerified() && existing().email == request.auth.token.email);
+      allow get: if isValidId(inviteId) && isVerified() && (
+        isAdmin() ||
+        inviteId == emailDocId() ||
+        (existing().email is string && existing().email.lower() == normalizedAuthEmail())
+      );
+      allow list: if isAdmin() || (
+        isVerified() &&
+        existing().email is string &&
+        existing().email.lower() == normalizedAuthEmail()
+      );
       allow create: if isValidId(inviteId) && isAdmin() && isValidUserInvite(incoming()) && incoming().id == inviteId;
       allow update: if isValidId(inviteId) && isAdmin() && isValidUserInvite(incoming()) && incoming().id == existing().id;
       allow delete: if isValidId(inviteId) && isAdmin();
@@ -290,11 +358,25 @@ service cloud.firestore {
 
     // Users & RBAC Registry (PII restricted to owner or Admin)
     match /users/{userId} {
-      allow get: if isValidId(userId) && isVerified() && (request.auth.uid == userId || isAdmin() || existing().email == request.auth.token.email);
-      allow list: if isAdmin() || (isVerified() && (existing().uid == request.auth.uid || existing().email == request.auth.token.email));
-      allow create: if isValidId(userId) && isValidUserAccount(incoming()) && incoming().uid == userId && (
+      allow get: if isValidId(userId) && isVerified() && (
+        request.auth.uid == userId ||
         isAdmin() ||
-        (isBootstrappedAdmin() && userId == request.auth.uid && incoming().role == 'admin')
+        (existing().email is string && existing().email.lower() == normalizedAuthEmail())
+      );
+      allow list: if isAdmin() || (
+        isVerified() && (
+          existing().uid == request.auth.uid ||
+          (existing().email is string && existing().email.lower() == normalizedAuthEmail())
+        )
+      );
+      allow create: if isValidId(userId) && isVerified() && isValidUserAccount(incoming()) && incoming().uid == userId && (
+        isAdmin() ||
+        (isBootstrappedAdmin() && userId == request.auth.uid && incoming().role == 'admin') ||
+        (userId == request.auth.uid && (
+          isClaimingValidInvite(incoming()) ||
+          isClaimingLegacyUser(incoming()) ||
+          isSafeSelfRegistration(incoming())
+        ))
       );
       allow update: if isValidId(userId) && isAdmin() && isValidUserAccount(incoming()) &&
         incoming().uid == existing().uid && incoming().createdAt == existing().createdAt;
@@ -344,10 +426,13 @@ service cloud.firestore {
           (isCityWideOversight() || existing().ownerId == request.auth.uid || existing().department == userDepartment() || envId == 'sandbox');
         allow create: if isValidId(workPlanId) && isValidEnv(envId) && isVerified() &&
           isValidWorkPlan(incoming()) && incoming().id == workPlanId &&
-          incoming().ownerId == request.auth.uid &&
-          incoming().status == 'pending_approval' &&
-          incoming().totalDispensedLiters == 0 &&
-          (isAdmin() || hasActiveProfile() || envId == 'sandbox');
+          incoming().ownerId == request.auth.uid && (
+            isAdmin() || (
+              incoming().status == 'pending_approval' &&
+              incoming().totalDispensedLiters == 0 &&
+              (hasActiveProfile() || envId == 'sandbox')
+            )
+          );
         allow update: if isValidId(workPlanId) && isValidEnv(envId) && isVerified() &&
           isValidWorkPlan(incoming()) &&
           incoming().id == existing().id && incoming().ownerId == existing().ownerId && incoming().createdAt == existing().createdAt && (
@@ -371,11 +456,14 @@ service cloud.firestore {
         allow create: if isValidId(ticketId) && isValidEnv(envId) && isVerified() &&
           isValidTripTicket(incoming()) && incoming().id == ticketId &&
           incoming().ownerId == request.auth.uid &&
-          incoming().servedOnce == false &&
-          incoming().dispensedLiters == 0 &&
-          incoming().status == 'pending' &&
           exists(/databases/$(database)/documents/environments/$(envId)/workPlans/$(incoming().workPlanId)) &&
-          exists(/databases/$(database)/documents/environments/$(envId)/vehicles/$(incoming().vehicleId));
+          exists(/databases/$(database)/documents/environments/$(envId)/vehicles/$(incoming().vehicleId)) && (
+            isAdmin() || (
+              incoming().servedOnce == false &&
+              incoming().dispensedLiters == 0 &&
+              incoming().status == 'pending'
+            )
+          );
         allow update: if isValidId(ticketId) && isValidEnv(envId) && isVerified() &&
           isValidTripTicket(incoming()) &&
           incoming().id == existing().id && incoming().workPlanId == existing().workPlanId &&

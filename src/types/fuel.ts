@@ -255,6 +255,7 @@ export interface DailyReconciliationSummary {
 
 export interface SyncQueueItem {
   id: string;
+  envMode?: EnvironmentMode;
   collection: 'workPlans' | 'tripTickets' | 'vehicles' | 'depots' | 'inventoryLogs' | 'auditLogs' | 'users';
   docId: string;
   operation: 'set' | 'update' | 'delete';

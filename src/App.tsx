@@ -100,6 +100,15 @@ export default function App() {
     }
   };
 
+  const handleConnectGoogleForSync = async () => {
+    setAuthError(null);
+    try {
+      await store.connectGoogleForSync();
+    } catch (err) {
+      setAuthError(err instanceof Error ? err.message : 'Google Sign-In failed.');
+    }
+  };
+
   const handleClosePdf = useCallback(() => {
     setActivePdf((prev) => {
       if (prev?.blobUrl) {
@@ -201,6 +210,7 @@ export default function App() {
       <LoginView
         key={`login_${sessionNonce}`}
         sessionExpiredNotice={store.sessionExpiredNotice}
+        externalError={store.googleAuthError}
         onCredentialLogin={store.loginWithCredentials}
         onGoogleSignIn={async () => {
           await store.signInWithGoogle();
@@ -258,7 +268,7 @@ export default function App() {
           simulatedOffline={store.simulatedOffline}
           onToggleSimulatedOffline={() => store.setSimulatedOffline((v) => !v)}
           syncQueueCount={store.syncQueue.length}
-          onFlushSyncQueue={store.flushSyncQueue}
+          onFlushSyncQueue={store.firebaseUser ? store.reconcileNow : handleConnectGoogleForSync}
           isActualAdmin={isActualAdmin}
           canCreateWorkPlan={canCreateWorkPlan}
           firebaseUser={store.firebaseUser}
@@ -307,24 +317,36 @@ export default function App() {
             </div>
           )}
 
-          {store.envMode === 'live' && !store.firebaseUser && (
-            <div className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-[#1B3B6F] bg-white px-4 py-3 text-xs">
-              <div className="flex items-center gap-2.5">
-                <Database className="h-4 w-4 text-[#1B3B6F] shrink-0" />
-                <span>
-                  <strong>Live Cloud Database Selected:</strong> Sign in with Google to synchronize real-time records with Firebase Firestore. Offline entries will queue until authenticated.
-                </span>
-              </div>
-              <button
-                type="button"
-                onClick={handleGoogleSignIn}
-                className="inline-flex items-center gap-1.5 rounded-md bg-[#0B192C] px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-[#1B3B6F] whitespace-nowrap"
+          {!store.firebaseUser &&
+            (store.envMode === 'live' || isActualAdmin || store.syncQueue.length > 0) && (
+              <div
+                data-testid="cloud-sync-banner"
+                className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-[#1B3B6F] bg-white px-4 py-3 text-xs"
               >
-                <LogIn className="h-3.5 w-3.5" />
-                <span>Sign In with Google</span>
-              </button>
-            </div>
-          )}
+                <div className="flex items-center gap-2.5">
+                  <Database className="h-4 w-4 text-[#1B3B6F] shrink-0" />
+                  {store.envMode === 'live' ? (
+                    <span>
+                      <strong>Live Cloud Database Selected:</strong> Sign in with Google to synchronize real-time records with Firebase Firestore. Offline entries will queue until authenticated.
+                    </span>
+                  ) : (
+                    <span>
+                      <strong>Cloud Sync Standby (Sandbox):</strong> Transactions and user credentials created here synchronize with the deployed web app once linked via Google.
+                    </span>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  onClick={handleConnectGoogleForSync}
+                  className="inline-flex items-center gap-1.5 rounded-md bg-[#0B192C] px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-[#1B3B6F] whitespace-nowrap"
+                >
+                  <LogIn className="h-3.5 w-3.5" />
+                  <span>
+                    {store.envMode === 'sandbox' ? 'Sign In with Google to Sync' : 'Sign In with Google'}
+                  </span>
+                </button>
+              </div>
+            )}
 
           {store.envMode === 'live' &&
             store.firebaseUser &&

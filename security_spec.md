@@ -3,7 +3,7 @@
 ## 1. Data Invariants
 1. **Strict Environment Isolation**: `envId` MUST be `'live'` or `'sandbox'`.
 2. **Identity Integrity**: Every document created by a user MUST assert `ownerId == request.auth.uid` (or `actorUid == request.auth.uid` for audit logs) and `request.auth.token.email_verified == true`.
-3. **RBAC Privilege Escalation Prevention**: Non-admin users cannot create or modify `/admins/{userId}` or elevate their own `role` in `/users/{userId}`. Only elevated administrators (`isAdmin()`) can create/edit/delete user accounts in `/users/{userId}`.
+3. **RBAC Privilege Escalation Prevention**: Non-admin users cannot create or modify `/admins/{userId}` or elevate their own `role` in `/users/{userId}`. Only elevated administrators (`isAdmin()`) can assign elevated roles or edit/delete user accounts in `/users/{userId}`. Verified Google users may only create their own `/users/{ownUid}` document either by claiming an active Admin-provisioned `/invites/{emailId}` matching their verified email and exact assigned role/permissions, or as an unprivileged `'requester'` with `canEdit == false`, `canDelete == false`, and `canSwitchToLive == false`.
 4. **Departmental Isolation**: Requesters and department heads can only read/list Work Plans and Trip Tickets belonging to their assigned `department` (unless the user has city-wide oversight role: `admin`, `approver`, `gso_dispenser`, or `auditor`).
 5. **Single-Dispense Terminal Lock**: Once a `TripTicket` transitions to `dispensed` (`servedOnce == true`), non-admin users cannot re-dispense or alter dispensed/forfeited liters.
 6. **GSO Adjustment Verification**: Inventory shrinkage/overage adjustments can only be marked `verified` by an `admin` or `gso_dispenser` with a non-empty `digitalVerificationCode`.

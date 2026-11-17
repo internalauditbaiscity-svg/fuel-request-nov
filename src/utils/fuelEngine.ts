@@ -2,6 +2,7 @@ import {
   DailyReconciliationSummary,
   DiscrepancyAlert,
   EfficiencyUnit,
+  EnvironmentMode,
   EquipmentClass,
   EQUIPMENT_CLASS_SPECS,
   FleetVehicle,
@@ -1517,5 +1518,326 @@ export function parsePersistedSession(
   } catch {
     return { session: null, expired: false };
   }
+}
+
+export function normalizeEmailToId(email: string): string {
+  return email
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 120);
+}
+
+export function stripUndefinedFields<T extends Record<string, unknown>>(obj: T): Record<string, unknown> {
+  const cleaned: Record<string, unknown> = {};
+  for (const [key, val] of Object.entries(obj)) {
+    if (val !== undefined) {
+      cleaned[key] = val;
+    }
+  }
+  return cleaned;
+}
+
+export interface CredentialAuthResult {
+  ok: boolean;
+  user?: UserAccount;
+  error?: string;
+}
+
+export function authenticateLocalUserCredentials(params: {
+  liveUsers?: UserAccount[];
+  sandboxUsers?: UserAccount[];
+  seedUsers?: UserAccount[];
+  identifier: string;
+  password: string;
+}): CredentialAuthResult {
+  const cleanId = params.identifier.trim().toLowerCase();
+  if (!cleanId || !params.password) {
+    return { ok: false, error: 'Enter both Account Name and Password.' };
+  }
+
+  const orderedPool = [
+    ...(params.liveUsers ?? []),
+    ...(params.sandboxUsers ?? []),
+    ...(params.seedUsers ?? []),
+  ];
+
+  const matchingAccounts = orderedPool.filter(
+    (u) =>
+      (u.username && u.username.trim().toLowerCase() === cleanId) ||
+      u.email.trim().toLowerCase() === cleanId
+  );
+
+  if (matchingAccounts.length === 0) {
+    return {
+      ok: false,
+      error:
+        'Account Name not recognized on this device. If you are using a different Gmail account or Live Cloud profile, click "Sign In with Google (Live Cloud)" below or contact your Administrator.',
+    };
+  }
+
+  const activeCandidates = matchingAccounts.filter((u) => u.active);
+  if (activeCandidates.length === 0) {
+    return {
+      ok: false,
+      error: 'This user account is suspended. Contact your Administrator.',
+    };
+  }
+
+  const inputHash = hashPassword(params.password);
+  const authenticated = activeCandidates.find(
+    (u) => Boolean(u.passwordHash) && u.passwordHash === inputHash
+  );
+
+  if (!authenticated) {
+    return { ok: false, error: 'Invalid password for this account.' };
+  }
+
+  return { ok: true, user: authenticated };
+}
+
+export function mergeClaimedUserProfile(params: {
+  uid: string;
+  email: string;
+  displayName?: string | null;
+  sourceProfile?: Partial<UserAccount> | null;
+  isBootstrappedAdmin?: boolean;
+  nowIso?: string;
+}): UserAccount {
+  const now = params.nowIso ?? new Date().toISOString();
+  const cleanEmail = params.email.trim().toLowerCase();
+  const emailId = normalizeEmailToId(cleanEmail) || params.uid;
+
+  if (params.isBootstrappedAdmin) {
+    return {
+      uid: params.uid,
+      username: params.sourceProfile?.username?.trim().toLowerCase() || 'admin',
+      ...(params.sourceProfile?.passwordHash ? { passwordHash: params.sourceProfile.passwordHash } : {}),
+      email: cleanEmail,
+      displayName: (
+        params.sourceProfile?.displayName ||
+        params.displayName ||
+        'Bais Internal Audit Admin'
+      )
+        .trim()
+        .slice(0, 120),
+      role: 'admin',
+      department: params.sourceProfile?.department?.trim() || 'Internal Audit Service',
+      positionTitle: params.sourceProfile?.positionTitle?.trim() || 'System Administrator',
+      canEdit: true,
+      canDelete: true,
+      canSwitchToLive: true,
+      active: true,
+      createdBy: params.sourceProfile?.createdBy || 'system',
+      createdAt: params.sourceProfile?.createdAt || now,
+      updatedAt: now,
+    };
+  }
+
+  const src = params.sourceProfile;
+  if (src) {
+    const role: UserRole = src.role ?? 'requester';
+    const isAdminRole = role === 'admin';
+    return {
+      uid: params.uid,
+      username: (src.username || emailId).trim().toLowerCase().slice(0, 64),
+      ...(src.passwordHash ? { passwordHash: src.passwordHash } : {}),
+      email: cleanEmail,
+      displayName: (src.displayName || params.displayName || cleanEmail).trim().slice(0, 120) || 'City Staff',
+      role,
+      department: (src.department || 'City Engineering Office').trim().slice(0, 120),
+      positionTitle: (src.positionTitle || 'Staff').trim().slice(0, 120),
+      canEdit: isAdminRole ? true : Boolean(src.canEdit),
+      canDelete: isAdminRole ? true : Boolean(src.canDelete),
+      canSwitchToLive: isAdminRole ? true : Boolean(src.canSwitchToLive),
+      active: src.active !== false,
+      createdBy: src.createdBy || 'admin',
+      createdAt: src.createdAt || now,
+      updatedAt: now,
+    };
+  }
+
+  return {
+    uid: params.uid,
+    username: emailId.slice(0, 64),
+    email: cleanEmail,
+    displayName: (params.displayName || cleanEmail).trim().slice(0, 120) || 'City Staff',
+    role: 'requester',
+    department: 'City Engineering Office',
+    positionTitle: 'Department Requester',
+    canEdit: false,
+    canDelete: false,
+    canSwitchToLive: false,
+    active: true,
+    createdBy: 'self',
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+export function deduplicateUsersByEmail(users: UserAccount[]): UserAccount[] {
+  const byEmail = new Map<string, UserAccount>();
+  for (const user of users) {
+    const key = user.email.trim().toLowerCase();
+    if (!key) {
+      byEmail.set(user.uid, user);
+      continue;
+    }
+    const existing = byEmail.get(key);
+    if (!existing) {
+      byEmail.set(key, user);
+      continue;
+    }
+    const emailPlaceholderId = normalizeEmailToId(key);
+    const existingIsPlaceholder = existing.uid === emailPlaceholderId;
+    const currentIsPlaceholder = user.uid === emailPlaceholderId;
+
+    if (existingIsPlaceholder && !currentIsPlaceholder) {
+      byEmail.set(key, user);
+    } else if (!existingIsPlaceholder && currentIsPlaceholder) {
+      continue;
+    } else if ((user.updatedAt || '') > (existing.updatedAt || '')) {
+      byEmail.set(key, user);
+    }
+  }
+  return Array.from(byEmail.values());
+}
+
+export function buildInvitePayloadFromUser(
+  user: UserAccount,
+  actorUid: string
+): Record<string, unknown> | null {
+  const cleanEmail = (user.email || '').trim().toLowerCase();
+  const inviteId = normalizeEmailToId(cleanEmail);
+  if (!inviteId || cleanEmail.length < 3) return null;
+  const cleanUsername = (user.username || '').trim().toLowerCase();
+  const isAdminRole = user.role === 'admin';
+  const payload: Record<string, unknown> = {
+    id: inviteId,
+    email: cleanEmail.slice(0, 254),
+    ...(cleanUsername.length >= 2 ? { username: cleanUsername.slice(0, 64) } : {}),
+    ...(user.passwordHash ? { passwordHash: user.passwordHash.slice(0, 128) } : {}),
+    displayName: (user.displayName || cleanEmail).trim().slice(0, 120) || 'City Staff',
+    role: user.role,
+    department: (user.department || 'City Engineering Office').trim().slice(0, 120),
+    positionTitle: (user.positionTitle || 'Staff').trim().slice(0, 120),
+    canEdit: isAdminRole ? true : Boolean(user.canEdit),
+    canDelete: isAdminRole ? true : Boolean(user.canDelete),
+    canSwitchToLive: isAdminRole ? true : Boolean(user.canSwitchToLive),
+    active: user.active !== false,
+    createdBy: (user.createdBy || actorUid || 'admin').slice(0, 128),
+    createdAt: user.createdAt && user.createdAt.length >= 10 ? user.createdAt : new Date().toISOString(),
+  };
+  return stripUndefinedFields(payload);
+}
+
+export function prepareFirestoreRecordPayload<T extends Record<string, unknown>>(
+  record: T,
+  firebaseUid: string,
+  options?: { isCreate?: boolean; collection?: string }
+): Record<string, unknown> {
+  const cleaned = stripUndefinedFields(record);
+
+  if (options?.collection === 'users') {
+    if (typeof cleaned.username === 'string' && cleaned.username.trim().length < 2) {
+      delete cleaned.username;
+    }
+    if (typeof cleaned.email === 'string') {
+      cleaned.email = cleaned.email.trim().toLowerCase().slice(0, 254);
+    }
+    if (typeof cleaned.displayName === 'string') {
+      cleaned.displayName = cleaned.displayName.trim().slice(0, 120);
+    }
+    if (typeof cleaned.department === 'string') {
+      cleaned.department = cleaned.department.trim().slice(0, 120);
+    }
+    return cleaned;
+  }
+
+  if (options?.collection === 'auditLogs') {
+    if (options.isCreate && firebaseUid) {
+      cleaned.actorUid = firebaseUid;
+    }
+    if (typeof cleaned.summary === 'string') {
+      const trimmedSummary = cleaned.summary.trim().slice(0, 400);
+      cleaned.summary = trimmedSummary.length < 2 ? 'Audit entry' : trimmedSummary;
+    }
+    return cleaned;
+  }
+
+  if (options?.isCreate && firebaseUid && 'ownerId' in cleaned) {
+    cleaned.ownerId = firebaseUid;
+  }
+
+  return cleaned;
+}
+
+export function reconcileCollectionRecords<
+  T extends { id?: string; uid?: string; updatedAt?: string; createdAt?: string }
+>(params: {
+  localItems: T[];
+  cloudItems: T[];
+  keyField: 'id' | 'uid';
+  cloudPurgeAt?: string | null;
+  seedUpdatedAtByKey?: ReadonlyMap<string, string>;
+}): { merged: T[]; toCreate: T[]; toUpdate: T[] } {
+  const cloudByKey = new Map<string, T>();
+  for (const item of params.cloudItems) {
+    const key = item[params.keyField];
+    if (typeof key === 'string' && key) {
+      cloudByKey.set(key, item);
+    }
+  }
+
+  const getTimestamp = (item: { updatedAt?: string; createdAt?: string }): string =>
+    item.updatedAt || item.createdAt || '';
+
+  const cloudHasRecords = params.cloudItems.length > 0;
+  const toCreate: T[] = [];
+  const toUpdate: T[] = [];
+  const mergedByKey = new Map<string, T>(cloudByKey);
+
+  for (const localItem of params.localItems) {
+    const key = localItem[params.keyField];
+    if (typeof key !== 'string' || !key) continue;
+
+    const localTs = getTimestamp(localItem);
+    const cloudItem = cloudByKey.get(key);
+
+    if (!cloudItem) {
+      if (params.cloudPurgeAt && (!localTs || localTs <= params.cloudPurgeAt)) {
+        continue;
+      }
+      const seedTs = params.seedUpdatedAtByKey?.get(key);
+      if (cloudHasRecords && seedTs && (!localTs || localTs <= seedTs)) {
+        continue;
+      }
+      toCreate.push(localItem);
+      mergedByKey.set(key, localItem);
+    } else {
+      const cloudTs = getTimestamp(cloudItem);
+      if (localTs && (!cloudTs || localTs > cloudTs)) {
+        toUpdate.push(localItem);
+        mergedByKey.set(key, localItem);
+      }
+    }
+  }
+
+  return {
+    merged: Array.from(mergedByKey.values()),
+    toCreate,
+    toUpdate,
+  };
+}
+
+export function resolveEffectiveEnvironmentAfterGoogleAuth(params: {
+  preserveEnvMode?: EnvironmentMode | null;
+  user: Pick<UserAccount, 'role' | 'canSwitchToLive'>;
+}): EnvironmentMode {
+  if (params.preserveEnvMode === 'sandbox') {
+    return 'sandbox';
+  }
+  return canUserSwitchToLive(params.user) ? 'live' : 'sandbox';
 }
 

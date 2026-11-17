@@ -562,6 +562,107 @@ export function isWorkPlanInactive(workPlan: WorkPlan, referenceDate = new Date(
   return diffDays > INACTIVE_WORKPLAN_DAYS;
 }
 
+export type ApprovalFolderKey =
+  | 'for_approval'
+  | 'partially_approved'
+  | 'fully_approved'
+  | 'inactive';
+
+export interface ApprovalFilterCriteria {
+  department?: string;
+  month?: string;
+  year?: string;
+  referenceDate?: Date;
+}
+
+export function classifyApprovalFolder(
+  wp: WorkPlan,
+  planTickets: TripTicket[],
+  referenceDate = new Date()
+): ApprovalFolderKey | null {
+  if (wp.status === 'pending_approval') {
+    return isWorkPlanInactive(wp, referenceDate) ? 'inactive' : 'for_approval';
+  }
+  if (wp.status === 'partially_approved') {
+    return 'partially_approved';
+  }
+  if (wp.status === 'approved' || wp.status === 'completed') {
+    const hasPartialTicket = planTickets.some(
+      (t) => t.status === 'reduced' || t.status === 'rejected'
+    );
+    const hasReducedTotal =
+      wp.totalRequestedLiters > 0 && wp.totalApprovedLiters < wp.totalRequestedLiters;
+    return hasPartialTicket || hasReducedTotal ? 'partially_approved' : 'fully_approved';
+  }
+  return null;
+}
+
+export function categorizeAndFilterApprovals(
+  workPlans: WorkPlan[],
+  tickets: TripTicket[],
+  criteria: ApprovalFilterCriteria = {}
+): {
+  forApproval: WorkPlan[];
+  partiallyApproved: WorkPlan[];
+  fullyApproved: WorkPlan[];
+  inactive: WorkPlan[];
+  filteredTotal: number;
+} {
+  const deptFilter =
+    criteria.department && criteria.department !== 'all'
+      ? criteria.department.trim().toLowerCase()
+      : '';
+  const monthFilter = criteria.month && criteria.month !== 'all' ? criteria.month.trim() : '';
+  const yearFilter = criteria.year && criteria.year !== 'all' ? criteria.year.trim() : '';
+  const refDate = criteria.referenceDate ?? new Date();
+
+  const sortedPlans = [...workPlans].sort((a, b) => {
+    const aMs = Date.parse(a.createdAt || a.weekStart || '');
+    const bMs = Date.parse(b.createdAt || b.weekStart || '');
+    if (!Number.isNaN(aMs) && !Number.isNaN(bMs) && bMs !== aMs) {
+      return bMs - aMs;
+    }
+    return b.controlNumber.localeCompare(a.controlNumber);
+  });
+
+  const forApproval: WorkPlan[] = [];
+  const partiallyApproved: WorkPlan[] = [];
+  const fullyApproved: WorkPlan[] = [];
+  const inactive: WorkPlan[] = [];
+
+  for (const wp of sortedPlans) {
+    if (deptFilter && wp.department.trim().toLowerCase() !== deptFilter) {
+      continue;
+    }
+    const dateRef = wp.weekStart || wp.createdAt || '';
+    const wpYear = dateRef.slice(0, 4);
+    const wpMonth = dateRef.slice(5, 7);
+    if (yearFilter && wpYear !== yearFilter) continue;
+    if (monthFilter && wpMonth !== monthFilter) continue;
+
+    const planTickets = tickets.filter((t) => t.workPlanId === wp.id);
+    const folder = classifyApprovalFolder(wp, planTickets, refDate);
+    if (folder === 'for_approval') {
+      forApproval.push(wp);
+    } else if (folder === 'partially_approved') {
+      partiallyApproved.push(wp);
+    } else if (folder === 'fully_approved') {
+      fullyApproved.push(wp);
+    } else if (folder === 'inactive') {
+      inactive.push(wp);
+    }
+  }
+
+  return {
+    forApproval,
+    partiallyApproved,
+    fullyApproved,
+    inactive,
+    filteredTotal:
+      forApproval.length + partiallyApproved.length + fullyApproved.length + inactive.length,
+  };
+}
+
 export function computeWorkPlanFuelTotals(tickets: TripTicket[]): {
   totalDiesel: number;
   totalGasoline: number;
@@ -928,7 +1029,8 @@ export function validateWorkProgramMandatoryFilters(criteria: {
   year?: string;
 }): WorkProgramFilterValidation {
   const missingFields: Array<'month' | 'year'> = [];
-  if (!criteria.month || !/^(0[1-9]|1[0-2])$/.test(criteria.month.trim())) {
+  const cleanMonth = criteria.month?.trim() ?? '';
+  if (!cleanMonth || (cleanMonth !== 'all' && !/^(0[1-9]|1[0-2])$/.test(cleanMonth))) {
     missingFields.push('month');
   }
   if (!criteria.year || !/^\d{4}$/.test(criteria.year.trim())) {
@@ -951,6 +1053,43 @@ export function validateWorkProgramMandatoryFilters(criteria: {
     missingFields,
     error: `${label} ${missingFields.length === 2 ? 'are' : 'is'} mandatory to preview Work Program records.`,
   };
+}
+
+function dateMatchesMonthYear(dateRef: string | undefined, month: string, year: string): boolean {
+  if (!dateRef || dateRef.length < 4) return false;
+  const yr = dateRef.slice(0, 4);
+  if (yr !== year) return false;
+  if (month === 'all') return true;
+  return dateRef.slice(5, 7) === month;
+}
+
+export function doesWorkPlanMatchPeriod(
+  wp: Pick<WorkPlan, 'weekStart' | 'createdAt'>,
+  planTickets: Array<Pick<TripTicket, 'scheduledDate' | 'createdAt'>>,
+  month: string,
+  year: string
+): boolean {
+  const wpDateRef = wp.weekStart || wp.createdAt || '';
+  if (dateMatchesMonthYear(wpDateRef, month, year)) return true;
+  return planTickets.some((t) =>
+    dateMatchesMonthYear(t.scheduledDate || t.createdAt || '', month, year)
+  );
+}
+
+export function getWorkPlansForPeriod(
+  workPlans: WorkPlan[],
+  tickets: TripTicket[],
+  criteria: { month?: string; year?: string }
+): WorkPlan[] {
+  const validation = validateWorkProgramMandatoryFilters(criteria);
+  if (!validation.valid || !criteria.month || !criteria.year) return [];
+  const month = criteria.month.trim();
+  const year = criteria.year.trim();
+
+  return workPlans.filter((wp) => {
+    const planTickets = tickets.filter((t) => t.workPlanId === wp.id);
+    return doesWorkPlanMatchPeriod(wp, planTickets, month, year);
+  });
 }
 
 export function summarizeWorkProgramRow(
@@ -1090,14 +1229,11 @@ export function filterAndCategorizeWorkPrograms(
       continue;
     }
 
-    const dateRef = wp.weekStart || wp.createdAt || '';
-    const yr = dateRef.slice(0, 4);
-    const mo = dateRef.slice(5, 7);
-    if (yr !== criteria.year || mo !== criteria.month) {
+    const planTickets = tickets.filter((t) => t.workPlanId === wp.id);
+
+    if (!doesWorkPlanMatchPeriod(wp, planTickets, criteria.month.trim(), criteria.year.trim())) {
       continue;
     }
-
-    const planTickets = tickets.filter((t) => t.workPlanId === wp.id);
 
     if (ticketStatusFilter && !planTickets.some((t) => t.status === ticketStatusFilter)) {
       continue;

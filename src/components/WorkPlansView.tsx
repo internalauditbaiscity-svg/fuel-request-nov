@@ -39,6 +39,7 @@ import {
   generateNextWorkPlanNumber,
   getDynamicProgressiveYearOptions,
   getMissingTicketMandatoryFields,
+  getWorkPlansForPeriod,
   hasCityWideAccess,
   MAX_TICKETS_PER_WORKPLAN,
   replaceYearInProjectCode,
@@ -50,6 +51,7 @@ import { generateWorkPlanPdf } from '../utils/pdfGenerator';
 import { RecordsPreviewGate } from './RecordsPreviewGate';
 
 const WORK_PROGRAM_MONTH_OPTIONS = [
+  { value: 'all', label: 'All Months' },
   { value: '01', label: 'January' },
   { value: '02', label: 'February' },
   { value: '03', label: 'March' },
@@ -287,9 +289,24 @@ export function WorkPlansView({
   const canDelete = canUserDeleteRecords(currentUser);
   const canPdf = canPreviewAndDownloadPdf(currentUser.role);
 
+  const periodWorkPlans = useMemo(
+    () =>
+      getWorkPlansForPeriod(workPlans, tickets, {
+        month: monthFilter,
+        year: yearFilter,
+      }),
+    [workPlans, tickets, monthFilter, yearFilter]
+  );
+
   const workPlanOptions = useMemo(() => {
-    return [...workPlans].sort((a, b) => b.controlNumber.localeCompare(a.controlNumber));
-  }, [workPlans]);
+    return [...periodWorkPlans].sort((a, b) => b.controlNumber.localeCompare(a.controlNumber));
+  }, [periodWorkPlans]);
+
+  useEffect(() => {
+    if (workPlanFilter !== 'all' && !workPlanOptions.some((wp) => wp.id === workPlanFilter)) {
+      setWorkPlanFilter('all');
+    }
+  }, [workPlanFilter, workPlanOptions]);
 
   const yearOptions = useMemo(() => {
     return getDynamicProgressiveYearOptions({
@@ -316,6 +333,14 @@ export function WorkPlansView({
   const isYearMissing = workProgramResult.missingFields.includes('year');
   const showMandatoryError =
     !workProgramResult.valid && (filterValidationShown || previewOpen || isMonthMissing || isYearMissing);
+  const isPreviewDisabled = !workProgramResult.valid || periodWorkPlans.length === 0;
+
+  useEffect(() => {
+    if (isPreviewDisabled && previewOpen) {
+      setPreviewOpen(false);
+      setSelectedPlanId(null);
+    }
+  }, [isPreviewDisabled, previewOpen]);
 
   const visibleFolderCount = workProgramResult.valid
     ? activeFolderTab === 'approved_dispensed'
@@ -332,8 +357,10 @@ export function WorkPlansView({
   );
 
   const handleTogglePreview = (nextOpen: boolean) => {
-    if (nextOpen && !workProgramResult.valid) {
-      setFilterValidationShown(true);
+    if (nextOpen && isPreviewDisabled) {
+      if (!workProgramResult.valid) {
+        setFilterValidationShown(true);
+      }
       setPreviewOpen(false);
       return;
     }
@@ -1189,55 +1216,6 @@ export function WorkPlansView({
         <div className="grid grid-cols-1 gap-3 border-t border-[#E6EBF2] pt-3 sm:grid-cols-2 lg:grid-cols-4 text-xs">
           <div>
             <label
-              htmlFor="wp-filter-ticket-status"
-              className="block text-[11px] font-semibold text-[#334E73] mb-1"
-            >
-              Status of Trip Ticket
-            </label>
-            <select
-              id="wp-filter-ticket-status"
-              value={ticketStatusFilter}
-              onChange={(e) => {
-                setTicketStatusFilter(e.target.value as TripTicketStatus | 'all');
-                setSelectedPlanId(null);
-              }}
-              className="w-full rounded-md border border-[#D5DCE6] bg-[#F9FAFC] px-2.5 py-2 text-xs text-[#0B192C] focus:border-[#1B3B6F] focus:bg-white focus:outline-none"
-            >
-              {TRIP_TICKET_STATUS_OPTIONS.map((opt) => (
-                <option key={opt.value} value={opt.value}>
-                  {opt.label}
-                </option>
-              ))}
-            </select>
-          </div>
-
-          <div>
-            <label
-              htmlFor="wp-filter-work-plan"
-              className="block text-[11px] font-semibold text-[#334E73] mb-1"
-            >
-              Work Plan
-            </label>
-            <select
-              id="wp-filter-work-plan"
-              value={workPlanFilter}
-              onChange={(e) => {
-                setWorkPlanFilter(e.target.value);
-                setSelectedPlanId(null);
-              }}
-              className="w-full rounded-md border border-[#D5DCE6] bg-[#F9FAFC] px-2.5 py-2 text-xs text-[#0B192C] focus:border-[#1B3B6F] focus:bg-white focus:outline-none"
-            >
-              <option value="all">All Work Plans</option>
-              {workPlanOptions.map((wp) => (
-                <option key={wp.id} value={wp.id}>
-                  {wp.controlNumber} — {wp.department}
-                </option>
-              ))}
-            </select>
-          </div>
-
-          <div>
-            <label
               htmlFor="wp-filter-month"
               className={`block text-[11px] font-semibold mb-1 ${
                 showMandatoryError && isMonthMissing ? 'text-red-700' : 'text-[#334E73]'
@@ -1307,6 +1285,57 @@ export function WorkPlansView({
               ))}
             </select>
           </div>
+
+          <div>
+            <label
+              htmlFor="wp-filter-work-plan"
+              className="block text-[11px] font-semibold text-[#334E73] mb-1"
+            >
+              Work Plan
+            </label>
+            <select
+              id="wp-filter-work-plan"
+              value={workPlanFilter}
+              onChange={(e) => {
+                setWorkPlanFilter(e.target.value);
+                setSelectedPlanId(null);
+              }}
+              className="w-full rounded-md border border-[#D5DCE6] bg-[#F9FAFC] px-2.5 py-2 text-xs text-[#0B192C] focus:border-[#1B3B6F] focus:bg-white focus:outline-none"
+            >
+              <option value="all">
+                {workPlanOptions.length === 0 ? 'No Work Plans in Period' : 'All Work Plans'}
+              </option>
+              {workPlanOptions.map((wp) => (
+                <option key={wp.id} value={wp.id}>
+                  {wp.controlNumber} — {wp.department}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div>
+            <label
+              htmlFor="wp-filter-ticket-status"
+              className="block text-[11px] font-semibold text-[#334E73] mb-1"
+            >
+              Trip Ticket
+            </label>
+            <select
+              id="wp-filter-ticket-status"
+              value={ticketStatusFilter}
+              onChange={(e) => {
+                setTicketStatusFilter(e.target.value as TripTicketStatus | 'all');
+                setSelectedPlanId(null);
+              }}
+              className="w-full rounded-md border border-[#D5DCE6] bg-[#F9FAFC] px-2.5 py-2 text-xs text-[#0B192C] focus:border-[#1B3B6F] focus:bg-white focus:outline-none"
+            >
+              {TRIP_TICKET_STATUS_OPTIONS.map((opt) => (
+                <option key={opt.value} value={opt.value}>
+                  {opt.label}
+                </option>
+              ))}
+            </select>
+          </div>
         </div>
 
         {showMandatoryError && workProgramResult.validationError && (
@@ -1324,11 +1353,17 @@ export function WorkPlansView({
       {/* Preview-Gated Tabular Work Program View (3 Folders) */}
       <RecordsPreviewGate
         title="Departmental Work Program Preview"
-        description="Work Program records remain hidden until Preview is pressed. Select a mandatory Month and Year, then click Preview to inspect folders and expand full records."
+        description="Work Program records remain hidden until Preview is pressed. Select a Month and Year with matching records, then click Preview to inspect folders and expand full records."
         recordCount={visibleFolderCount}
         previewOpen={previewOpen}
         onTogglePreview={handleTogglePreview}
         buttonLabel="Preview Work Plans"
+        disabled={isPreviewDisabled}
+        disabledReason={
+          !workProgramResult.valid
+            ? workProgramResult.validationError
+            : 'Preview is disabled because no Work Plan or Trip Ticket falls under the selected Month and Year.'
+        }
       >
         {!workProgramResult.valid ? (
           <div className="rounded-lg border border-red-300 bg-red-50 p-8 text-center space-y-2">

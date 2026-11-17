@@ -8,6 +8,8 @@ interface RecordsPreviewGateProps {
   previewOpen: boolean;
   onTogglePreview: (open: boolean) => void;
   buttonLabel?: string;
+  disabled?: boolean;
+  disabledReason?: string;
   children: ReactNode;
 }
 
@@ -18,6 +20,8 @@ export function RecordsPreviewGate({
   previewOpen,
   onTogglePreview,
   buttonLabel = 'Preview',
+  disabled = false,
+  disabledReason,
   children,
 }: RecordsPreviewGateProps) {
   if (!previewOpen) {
@@ -33,14 +37,22 @@ export function RecordsPreviewGate({
         <div className="pt-1 flex flex-col items-center gap-2">
           <button
             type="button"
-            onClick={() => onTogglePreview(true)}
-            className="inline-flex items-center gap-2 rounded-md bg-[#0B192C] px-5 py-2.5 text-xs font-semibold text-white hover:bg-[#1B3B6F] transition-colors"
+            disabled={disabled}
+            onClick={() => {
+              if (!disabled) onTogglePreview(true);
+            }}
+            className="inline-flex items-center gap-2 rounded-md bg-[#0B192C] px-5 py-2.5 text-xs font-semibold text-white hover:bg-[#1B3B6F] transition-colors disabled:cursor-not-allowed disabled:bg-[#94A3B8] disabled:hover:bg-[#94A3B8]"
           >
             <Eye className="h-4 w-4" />
             <span>
               {buttonLabel} ({recordCount})
             </span>
           </button>
+          {disabled && disabledReason && (
+            <p className="text-xs font-medium text-[#5A6F8C]" role="status">
+              {disabledReason}
+            </p>
+          )}
         </div>
       </section>
     );

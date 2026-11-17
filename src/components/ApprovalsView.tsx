@@ -1,12 +1,22 @@
 import { useMemo, useState } from 'react';
-import { Archive, CheckCircle2, ClipboardCheck, FolderOpen, ShieldAlert, X } from 'lucide-react';
+import {
+  Archive,
+  CheckCircle2,
+  ClipboardCheck,
+  Clock,
+  FileCheck2,
+  FolderCheck,
+  ShieldAlert,
+  X,
+} from 'lucide-react';
 import { TripTicket, UserAccount, WorkPlan } from '../types/fuel';
 import {
+  ApprovalFolderKey,
   canPerformTabletopApproval,
+  categorizeAndFilterApprovals,
   computeWorkPlanFuelTotals,
   evaluateTabletopApproval,
   getDynamicProgressiveYearOptions,
-  isWorkPlanInactive,
 } from '../utils/fuelEngine';
 import { RecordsPreviewGate } from './RecordsPreviewGate';
 
@@ -45,7 +55,7 @@ export function ApprovalsView({
 }: ApprovalsViewProps) {
   const canApprove = canPerformTabletopApproval(currentUser.role);
   const [previewOpen, setPreviewOpen] = useState(false);
-  const [folderTab, setFolderTab] = useState<'active' | 'inactive'>('active');
+  const [folderTab, setFolderTab] = useState<ApprovalFolderKey>('for_approval');
   const [departmentFilter, setDepartmentFilter] = useState('all');
   const [monthFilter, setMonthFilter] = useState('all');
   const [yearFilter, setYearFilter] = useState('all');
@@ -70,30 +80,37 @@ export function ApprovalsView({
     });
   }, [workPlans, tickets]);
 
-  const activeFolderCount = useMemo(
-    () => workPlans.filter((wp) => !isWorkPlanInactive(wp)).length,
-    [workPlans]
-  );
-  const inactiveFolderCount = useMemo(
-    () => workPlans.filter((wp) => isWorkPlanInactive(wp)).length,
-    [workPlans]
+  const approvalFolders = useMemo(
+    () =>
+      categorizeAndFilterApprovals(workPlans, tickets, {
+        department: departmentFilter,
+        month: monthFilter,
+        year: yearFilter,
+      }),
+    [workPlans, tickets, departmentFilter, monthFilter, yearFilter]
   );
 
   const filteredPlans = useMemo(() => {
-    return workPlans.filter((wp) => {
-      const inactive = isWorkPlanInactive(wp);
-      if (folderTab === 'active' && inactive) return false;
-      if (folderTab === 'inactive' && !inactive) return false;
+    switch (folderTab) {
+      case 'for_approval':
+        return approvalFolders.forApproval;
+      case 'partially_approved':
+        return approvalFolders.partiallyApproved;
+      case 'fully_approved':
+        return approvalFolders.fullyApproved;
+      case 'inactive':
+        return approvalFolders.inactive;
+    }
+  }, [approvalFolders, folderTab]);
 
-      if (departmentFilter !== 'all' && wp.department !== departmentFilter) return false;
-      const dateRef = wp.weekStart || wp.createdAt || '';
-      const wpYear = dateRef.slice(0, 4);
-      const wpMonth = dateRef.slice(5, 7);
-      if (yearFilter !== 'all' && wpYear !== yearFilter) return false;
-      if (monthFilter !== 'all' && wpMonth !== monthFilter) return false;
-      return true;
-    });
-  }, [workPlans, folderTab, departmentFilter, monthFilter, yearFilter]);
+  const activeFolderLabel =
+    folderTab === 'for_approval'
+      ? 'For Approval'
+      : folderTab === 'partially_approved'
+        ? 'Partially Approved'
+        : folderTab === 'fully_approved'
+          ? 'Fully Approved'
+          : 'Inactive Folder (>30d)';
 
   const selectedPlan = useMemo(
     () => filteredPlans.find((wp) => wp.id === selectedPlanId) ?? null,
@@ -130,48 +147,22 @@ export function ApprovalsView({
         </div>
       )}
 
-      {/* Folder Tabs (Active vs >30-Day Untouched Inactive) + Department / Month / Year Filters */}
-      <div className="rounded-lg border border-[#D5DCE6] bg-white p-4 space-y-3">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={() => {
-                setFolderTab('active');
-                setSelectedPlanId(null);
-              }}
-              className={`inline-flex items-center gap-1.5 rounded-md px-3.5 py-2 text-xs font-semibold transition-colors ${
-                folderTab === 'active'
-                  ? 'bg-[#0B192C] text-white'
-                  : 'bg-[#F3F5F8] text-[#334E73] hover:bg-[#E6EBF2]'
-              }`}
-            >
-              <FolderOpen className="h-3.5 w-3.5" />
-              <span>Active Folder ({activeFolderCount})</span>
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                setFolderTab('inactive');
-                setSelectedPlanId(null);
-              }}
-              className={`inline-flex items-center gap-1.5 rounded-md px-3.5 py-2 text-xs font-semibold transition-colors ${
-                folderTab === 'inactive'
-                  ? 'bg-[#0B192C] text-white'
-                  : 'bg-[#F3F5F8] text-[#334E73] hover:bg-[#E6EBF2]'
-              }`}
-            >
-              <Archive className="h-3.5 w-3.5" />
-              <span>Inactive Folder &gt;30d ({inactiveFolderCount})</span>
-            </button>
-          </div>
-
-          <div className="flex flex-wrap items-center gap-2 text-xs">
+      {/* Left: Filter Sequence (Department, Month, Year) | Right: 4 Approval Folders */}
+      <div className="rounded-lg border border-[#D5DCE6] bg-white p-4">
+        <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
+          <div
+            data-testid="approvals-filters"
+            className="flex flex-wrap items-center gap-2 text-xs"
+          >
             <select
+              id="approvals-filter-department"
               aria-label="Filter by Department"
               value={departmentFilter}
-              onChange={(e) => setDepartmentFilter(e.target.value)}
-              className="rounded-md border border-[#D5DCE6] bg-[#F9FAFC] px-2.5 py-1.5 text-xs text-[#0B192C]"
+              onChange={(e) => {
+                setDepartmentFilter(e.target.value);
+                setSelectedPlanId(null);
+              }}
+              className="max-w-[215px] rounded-md border border-[#D5DCE6] bg-[#F9FAFC] px-2.5 py-2 text-xs text-[#0B192C] focus:border-[#1B3B6F] focus:bg-white focus:outline-none"
             >
               <option value="all">All Departments</option>
               {departmentOptions.map((dept) => (
@@ -182,10 +173,14 @@ export function ApprovalsView({
             </select>
 
             <select
+              id="approvals-filter-month"
               aria-label="Filter by Month"
               value={monthFilter}
-              onChange={(e) => setMonthFilter(e.target.value)}
-              className="rounded-md border border-[#D5DCE6] bg-[#F9FAFC] px-2.5 py-1.5 text-xs text-[#0B192C]"
+              onChange={(e) => {
+                setMonthFilter(e.target.value);
+                setSelectedPlanId(null);
+              }}
+              className="rounded-md border border-[#D5DCE6] bg-[#F9FAFC] px-2.5 py-2 text-xs text-[#0B192C] focus:border-[#1B3B6F] focus:bg-white focus:outline-none"
             >
               {MONTH_OPTIONS.map((m) => (
                 <option key={m.value} value={m.value}>
@@ -195,10 +190,14 @@ export function ApprovalsView({
             </select>
 
             <select
+              id="approvals-filter-year"
               aria-label="Filter by Year"
               value={yearFilter}
-              onChange={(e) => setYearFilter(e.target.value)}
-              className="rounded-md border border-[#D5DCE6] bg-[#F9FAFC] px-2.5 py-1.5 font-mono text-xs text-[#0B192C]"
+              onChange={(e) => {
+                setYearFilter(e.target.value);
+                setSelectedPlanId(null);
+              }}
+              className="rounded-md border border-[#D5DCE6] bg-[#F9FAFC] px-2.5 py-2 font-mono text-xs text-[#0B192C] focus:border-[#1B3B6F] focus:bg-white focus:outline-none"
             >
               <option value="all">All Years</option>
               {yearOptions.map((yr) => (
@@ -208,12 +207,70 @@ export function ApprovalsView({
               ))}
             </select>
           </div>
+
+          <div
+            data-testid="approvals-folders"
+            role="tablist"
+            aria-label="Approval Status Folders"
+            className="flex flex-wrap items-center gap-1.5 xl:justify-end"
+          >
+            {(
+              [
+                {
+                  id: 'for_approval',
+                  label: 'For Approval',
+                  count: approvalFolders.forApproval.length,
+                  Icon: Clock,
+                },
+                {
+                  id: 'partially_approved',
+                  label: 'Partially Approved',
+                  count: approvalFolders.partiallyApproved.length,
+                  Icon: FileCheck2,
+                },
+                {
+                  id: 'fully_approved',
+                  label: 'Fully Approved',
+                  count: approvalFolders.fullyApproved.length,
+                  Icon: FolderCheck,
+                },
+                {
+                  id: 'inactive',
+                  label: 'Inactive Folder',
+                  count: approvalFolders.inactive.length,
+                  Icon: Archive,
+                },
+              ] as const
+            ).map(({ id, label, count, Icon }) => (
+              <button
+                key={id}
+                type="button"
+                role="tab"
+                aria-selected={folderTab === id}
+                data-testid={`approval-folder-${id}`}
+                onClick={() => {
+                  setFolderTab(id);
+                  setSelectedPlanId(null);
+                }}
+                className={`inline-flex items-center gap-1.5 rounded-md px-2.5 py-2 text-xs font-semibold transition-colors whitespace-nowrap ${
+                  folderTab === id
+                    ? 'bg-[#0B192C] text-white'
+                    : 'bg-[#F3F5F8] text-[#334E73] hover:bg-[#E6EBF2]'
+                }`}
+              >
+                <Icon className="h-3.5 w-3.5 shrink-0" />
+                <span>
+                  {label} ({count})
+                </span>
+              </button>
+            ))}
+          </div>
         </div>
       </div>
 
       {/* Preview-Gated Collapsed 5-Column Tabular Display */}
       <RecordsPreviewGate
-        title={`Tabletop Approval — ${folderTab === 'active' ? 'Active Folder' : 'Inactive Folder (>1 Month Untouched)'}`}
+        title={`Tabletop Approval — ${activeFolderLabel}`}
         description="Click Preview to load the collapsed 5-column work plan summary table. Select any row to inspect trip tickets, reduce fuel requests, and approve."
         recordCount={filteredPlans.length}
         previewOpen={previewOpen}
@@ -224,7 +281,7 @@ export function ApprovalsView({
           <div className="rounded-lg border border-[#D5DCE6] bg-white p-10 text-center space-y-2">
             <CheckCircle2 className="mx-auto h-8 w-8 text-emerald-700" />
             <h2 className="font-display text-base font-bold text-[#0B192C]">
-              No Work Plans in {folderTab === 'active' ? 'Active' : 'Inactive'} Folder
+              No Work Plans in {activeFolderLabel}
             </h2>
             <p className="text-xs text-[#5A6F8C]">
               Adjust your Department, Month, or Year filters to inspect other submissions.

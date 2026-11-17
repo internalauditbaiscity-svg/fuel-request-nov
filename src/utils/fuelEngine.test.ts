@@ -18,6 +18,7 @@ import {
   canUserSwitchToLive,
   canViewAuditLogs,
   canViewDailyReconciliation,
+  categorizeAndFilterApprovals,
   categorizeAndFilterDispensingTickets,
   categorizeDepartmentWorkPlans,
   computeSingleDispenseOutcome,
@@ -32,6 +33,7 @@ import {
   getDynamicProgressiveYearOptions,
   getMissingTicketMandatoryFields,
   getRemainingInactivityMs,
+  getWorkPlansForPeriod,
   hashPassword,
   hasValidPumpReadingProof,
   INACTIVITY_TIMEOUT_MS,
@@ -1146,6 +1148,207 @@ test('dynamic progressive years support future work plan & trip ticket creation 
   assert.equal(filtered2027.pendingApproval.length, 1);
   assert.equal(filtered2027.pendingApproval[0].workPlan.controlNumber, 'WP-2027-0001');
 });
+
+test('All Months filter and period-scoped getWorkPlansForPeriod support month=all and empty-period detection', () => {
+  assert.equal(validateWorkProgramMandatoryFilters({ month: 'all', year: '2026' }).valid, true);
+
+  const plans: WorkPlan[] = [
+    {
+      id: 'wp_nov',
+      controlNumber: 'WP-2026-0001',
+      department: 'City Engineering Office',
+      projectTitle: 'Nov Paving',
+      projectCode: 'INFRA-2026-01',
+      weekStart: '2026-11-09',
+      weekEnd: '2026-11-15',
+      status: 'approved',
+      totalRequestedLiters: 80,
+      totalApprovedLiters: 80,
+      totalDispensedLiters: 0,
+      preparedBy: 'Clarissa',
+      reviewedBy: 'Noel',
+      approvedBy: 'Roberto',
+      ownerId: 'u1',
+      createdAt: '2026-11-09T08:00:00Z',
+      updatedAt: '2026-11-09T08:00:00Z',
+    },
+    {
+      id: 'wp_sep',
+      controlNumber: 'WP-2026-0004',
+      department: 'City Health Office',
+      projectTitle: 'Sept Outreach',
+      projectCode: 'HLTH-2026-04',
+      weekStart: '2026-09-28',
+      weekEnd: '2026-10-04',
+      status: 'pending_approval',
+      totalRequestedLiters: 40,
+      totalApprovedLiters: 0,
+      totalDispensedLiters: 0,
+      preparedBy: 'Marisol',
+      reviewedBy: 'Carmela',
+      approvedBy: 'Roberto',
+      ownerId: 'u2',
+      createdAt: '2026-09-25T08:00:00Z',
+      updatedAt: '2026-09-25T08:00:00Z',
+    },
+  ];
+
+  const tickets: TripTicket[] = [
+    {
+      id: 't_nov',
+      workPlanId: 'wp_nov',
+      ticketNumber: '0000001',
+      department: 'City Engineering Office',
+      projectTitle: 'Nov Paving',
+      vehicleId: 'v1',
+      plateNumber: 'SGV-042',
+      driverName: 'Ramon',
+      fuelType: 'diesel',
+      depotId: 'd1',
+      scheduledDate: '2026-11-12',
+      destination: 'Brgy. 1',
+      computedLimitLiters: 80,
+      requestedLiters: 80,
+      approvedLiters: 80,
+      dispensedLiters: 0,
+      forfeitedLiters: 0,
+      servedOnce: false,
+      status: 'approved',
+      ownerId: 'u1',
+      createdAt: '2026-11-09T08:00:00Z',
+      updatedAt: '2026-11-09T08:00:00Z',
+    },
+    {
+      id: 't_sep',
+      workPlanId: 'wp_sep',
+      ticketNumber: '0000005',
+      department: 'City Health Office',
+      projectTitle: 'Sept Outreach',
+      vehicleId: 'v2',
+      plateNumber: 'SLF-210',
+      driverName: 'Victorino',
+      fuelType: 'diesel',
+      depotId: 'd1',
+      scheduledDate: '2026-09-29',
+      destination: 'Brgy. Cabanlutan',
+      computedLimitLiters: 40,
+      requestedLiters: 40,
+      approvedLiters: 0,
+      dispensedLiters: 0,
+      forfeitedLiters: 0,
+      servedOnce: false,
+      status: 'pending',
+      ownerId: 'u2',
+      createdAt: '2026-09-25T08:00:00Z',
+      updatedAt: '2026-09-25T08:00:00Z',
+    },
+  ];
+
+  // All Months in 2026 returns both Sept and Nov plans
+  const all2026 = filterAndCategorizeWorkPrograms(plans, tickets, { month: 'all', year: '2026' });
+  assert.equal(all2026.valid, true);
+  assert.equal(all2026.totalCount, 2);
+
+  // Work plan filter options scoped strictly to selected Month + Year
+  assert.deepEqual(
+    getWorkPlansForPeriod(plans, tickets, { month: 'all', year: '2026' }).map((w) => w.controlNumber),
+    ['WP-2026-0001', 'WP-2026-0004']
+  );
+  assert.deepEqual(
+    getWorkPlansForPeriod(plans, tickets, { month: '09', year: '2026' }).map((w) => w.controlNumber),
+    ['WP-2026-0004']
+  );
+  // Empty period returns 0 work plans (Preview disabled)
+  assert.equal(getWorkPlansForPeriod(plans, tickets, { month: '02', year: '2026' }).length, 0);
+  assert.equal(getWorkPlansForPeriod(plans, tickets, { month: 'all', year: '2027' }).length, 0);
+});
+
+test('categorizeAndFilterApprovals routes into 4 folders and strictly excludes non-matching filtered records', () => {
+  const refDate = new Date('2026-11-16T00:00:00Z');
+  const plans = [
+    {
+      id: 'wp_for_appr',
+      controlNumber: 'WP-2026-0002',
+      department: 'City Agriculture Office',
+      weekStart: '2026-11-09',
+      status: 'pending_approval',
+      totalRequestedLiters: 95,
+      totalApprovedLiters: 0,
+      createdAt: '2026-11-12T06:45:00Z',
+      updatedAt: '2026-11-12T06:45:00Z',
+    },
+    {
+      id: 'wp_partial',
+      controlNumber: 'WP-2026-0001',
+      department: 'City Engineering Office',
+      weekStart: '2026-11-09',
+      status: 'approved',
+      totalRequestedLiters: 190,
+      totalApprovedLiters: 165,
+      createdAt: '2026-11-09T07:30:00Z',
+      updatedAt: '2026-11-12T08:15:00Z',
+    },
+    {
+      id: 'wp_full',
+      controlNumber: 'WP-2026-0003',
+      department: 'CENRO',
+      weekStart: '2026-11-09',
+      status: 'approved',
+      totalRequestedLiters: 35,
+      totalApprovedLiters: 35,
+      createdAt: '2026-11-11T14:00:00Z',
+      updatedAt: '2026-11-12T07:10:00Z',
+    },
+    {
+      id: 'wp_inactive',
+      controlNumber: 'WP-2026-0004',
+      department: 'City Health Office',
+      weekStart: '2026-09-28',
+      status: 'pending_approval',
+      totalRequestedLiters: 48,
+      totalApprovedLiters: 0,
+      createdAt: '2026-09-25T08:00:00Z',
+      updatedAt: '2026-09-25T08:00:00Z',
+    },
+  ] as WorkPlan[];
+
+  const tickets = [
+    { id: 't1', workPlanId: 'wp_partial', status: 'dispensed', requestedLiters: 75, approvedLiters: 75 },
+    { id: 't2', workPlanId: 'wp_partial', status: 'reduced', requestedLiters: 115, approvedLiters: 90 },
+    { id: 't3', workPlanId: 'wp_for_appr', status: 'pending', requestedLiters: 95, approvedLiters: 0 },
+    { id: 't4', workPlanId: 'wp_full', status: 'approved', requestedLiters: 35, approvedLiters: 35 },
+    { id: 't5', workPlanId: 'wp_inactive', status: 'pending', requestedLiters: 48, approvedLiters: 0 },
+  ] as TripTicket[];
+
+  const all = categorizeAndFilterApprovals(plans, tickets, { referenceDate: refDate });
+  assert.deepEqual(all.forApproval.map((w) => w.controlNumber), ['WP-2026-0002']);
+  assert.deepEqual(all.partiallyApproved.map((w) => w.controlNumber), ['WP-2026-0001']);
+  assert.deepEqual(all.fullyApproved.map((w) => w.controlNumber), ['WP-2026-0003']);
+  assert.deepEqual(all.inactive.map((w) => w.controlNumber), ['WP-2026-0004']);
+
+  // Filtering by Department strictly excludes non-matching records from ALL folders
+  const engOnly = categorizeAndFilterApprovals(plans, tickets, {
+    department: 'City Engineering Office',
+    referenceDate: refDate,
+  });
+  assert.equal(engOnly.forApproval.length, 0);
+  assert.deepEqual(engOnly.partiallyApproved.map((w) => w.controlNumber), ['WP-2026-0001']);
+  assert.equal(engOnly.fullyApproved.length, 0);
+  assert.equal(engOnly.inactive.length, 0);
+
+  // Filtering by Month = 09 strictly shows only Sept record in Inactive Folder
+  const septOnly = categorizeAndFilterApprovals(plans, tickets, {
+    month: '09',
+    year: '2026',
+    referenceDate: refDate,
+  });
+  assert.equal(septOnly.forApproval.length, 0);
+  assert.equal(septOnly.partiallyApproved.length, 0);
+  assert.equal(septOnly.fullyApproved.length, 0);
+  assert.deepEqual(septOnly.inactive.map((w) => w.controlNumber), ['WP-2026-0004']);
+});
+
+
 
 
 

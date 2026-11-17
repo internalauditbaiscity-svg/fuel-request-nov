@@ -1,10 +1,22 @@
 export type UserRole =
   | 'admin'
   | 'approver'
+  | 'gso_head'
   | 'gso_dispenser'
   | 'department_head'
   | 'requester'
   | 'auditor';
+
+export type NavSection =
+  | 'dashboard'
+  | 'fleet'
+  | 'work_plans'
+  | 'approvals'
+  | 'dispensing'
+  | 'inventory'
+  | 'users'
+  | 'reports'
+  | 'audit';
 
 export type EnvironmentMode = 'sandbox' | 'live';
 
@@ -63,6 +75,7 @@ export interface UserAccount {
   positionTitle?: string;
   canEdit?: boolean;
   canDelete?: boolean;
+  canSwitchToLive?: boolean;
   active: boolean;
   createdBy: string;
   createdAt: string;
@@ -317,6 +330,7 @@ export const EQUIPMENT_CLASS_SPECS: Record<
 export const ROLE_LABELS: Record<UserRole, string> = {
   admin: 'System Administrator',
   approver: 'Tabletop Approver',
+  gso_head: 'GSO Head',
   gso_dispenser: 'GSO Depot Dispenser',
   department_head: 'Department Head',
   requester: 'Department Requester',

@@ -22,6 +22,7 @@ interface UsersAdminViewProps {
     positionTitle: string;
     canEdit: boolean;
     canDelete: boolean;
+    canSwitchToLive: boolean;
   }) => Promise<void>;
   onUpdateUser: (
     uid: string,
@@ -35,6 +36,7 @@ interface UsersAdminViewProps {
       positionTitle: string;
       canEdit: boolean;
       canDelete: boolean;
+      canSwitchToLive: boolean;
     }
   ) => Promise<void>;
   onDeleteUser: (user: UserAccount) => Promise<void>;
@@ -62,6 +64,7 @@ export function UsersAdminView({
   const [positionTitle, setPositionTitle] = useState('');
   const [canEdit, setCanEdit] = useState(false);
   const [canDelete, setCanDelete] = useState(false);
+  const [canSwitchToLive, setCanSwitchToLive] = useState(false);
   const [submitting, setSubmitting] = useState(false);
 
   // Edit modal state
@@ -75,6 +78,7 @@ export function UsersAdminView({
   const [editPositionTitle, setEditPositionTitle] = useState('');
   const [editCanEdit, setEditCanEdit] = useState(false);
   const [editCanDelete, setEditCanDelete] = useState(false);
+  const [editCanSwitchToLive, setEditCanSwitchToLive] = useState(false);
 
   if (!isAdmin) {
     return (
@@ -102,6 +106,7 @@ export function UsersAdminView({
         positionTitle: positionTitle.trim() || ROLE_LABELS[role],
         canEdit: role === 'admin' ? true : canEdit,
         canDelete: role === 'admin' ? true : canDelete,
+        canSwitchToLive: role === 'admin' ? true : canSwitchToLive,
       });
       setUsername('');
       setPassword('');
@@ -111,6 +116,7 @@ export function UsersAdminView({
       setPositionTitle('');
       setCanEdit(false);
       setCanDelete(false);
+      setCanSwitchToLive(false);
     } finally {
       setSubmitting(false);
     }
@@ -127,6 +133,7 @@ export function UsersAdminView({
     setEditPositionTitle(u.positionTitle || '');
     setEditCanEdit(u.role === 'admin' ? true : Boolean(u.canEdit));
     setEditCanDelete(u.role === 'admin' ? true : Boolean(u.canDelete));
+    setEditCanSwitchToLive(u.role === 'admin' ? true : Boolean(u.canSwitchToLive));
   };
 
   const closeEditModal = () => {
@@ -139,6 +146,7 @@ export function UsersAdminView({
     setEditPositionTitle('');
     setEditCanEdit(false);
     setEditCanDelete(false);
+    setEditCanSwitchToLive(false);
   };
 
   const handleSaveEdit = async (e: React.FormEvent) => {
@@ -156,6 +164,7 @@ export function UsersAdminView({
       positionTitle: editPositionTitle.trim() || ROLE_LABELS[editRole],
       canEdit: editRole === 'admin' ? true : editCanEdit,
       canDelete: editRole === 'admin' ? true : editCanDelete,
+      canSwitchToLive: editRole === 'admin' ? true : editCanSwitchToLive,
     });
     closeEditModal();
   };
@@ -289,8 +298,8 @@ export function UsersAdminView({
             </div>
 
             <div className="flex flex-col justify-center gap-1.5 rounded border border-[#E6EBF2] bg-[#F9FAFC] px-3 py-2">
-              <span className="text-[11px] font-semibold text-[#334E73]">Record Access Permissions</span>
-              <div className="flex items-center gap-4 text-xs">
+              <span className="text-[11px] font-semibold text-[#334E73]">Record & Environment Permissions</span>
+              <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 text-xs">
                 <label className="inline-flex items-center gap-1.5 cursor-pointer">
                   <input
                     type="checkbox"
@@ -310,6 +319,17 @@ export function UsersAdminView({
                     className="accent-[#0B192C]"
                   />
                   <span>Can Delete</span>
+                </label>
+                <label className="inline-flex items-center gap-1.5 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    data-testid="create-user-can-switch-live"
+                    checked={role === 'admin' ? true : canSwitchToLive}
+                    disabled={role === 'admin'}
+                    onChange={(e) => setCanSwitchToLive(e.target.checked)}
+                    className="accent-[#0B192C]"
+                  />
+                  <span>Switch to Live</span>
                 </label>
               </div>
             </div>
@@ -349,7 +369,7 @@ export function UsersAdminView({
                   <th className="px-4 py-2.5 font-semibold">User & Account Name</th>
                   <th className="px-4 py-2.5 font-semibold">Role</th>
                   <th className="px-4 py-2.5 font-semibold">Department Concerned</th>
-                  <th className="px-4 py-2.5 font-semibold">Edit / Delete Perms</th>
+                  <th className="px-4 py-2.5 font-semibold">Edit / Delete / Live Perms</th>
                   <th className="px-4 py-2.5 font-semibold">Status</th>
                   <th className="px-4 py-2.5 font-semibold text-right">Admin Actions</th>
                 </tr>
@@ -370,7 +390,8 @@ export function UsersAdminView({
                     <td className="px-4 py-2.5 text-[#334E73]">{u.department}</td>
                     <td className="px-4 py-2.5 font-mono text-[11px] text-[#334E73]">
                       {u.role === 'admin' || u.canEdit ? 'Edit: Yes' : 'Edit: No'} ·{' '}
-                      {u.role === 'admin' || u.canDelete ? 'Delete: Yes' : 'Delete: No'}
+                      {u.role === 'admin' || u.canDelete ? 'Delete: Yes' : 'Delete: No'} ·{' '}
+                      {u.role === 'admin' || u.canSwitchToLive ? 'Live: Yes' : 'Live: No'}
                     </td>
                     <td className="px-4 py-2.5">
                       <span
@@ -521,7 +542,7 @@ export function UsersAdminView({
                   className="w-full rounded border border-[#D5DCE6] px-2.5 py-2"
                 />
               </div>
-              <div className="sm:col-span-2 flex items-center gap-6 rounded border border-[#E6EBF2] bg-[#F9FAFC] px-3 py-2.5">
+              <div className="sm:col-span-2 flex flex-wrap items-center gap-x-5 gap-y-2 rounded border border-[#E6EBF2] bg-[#F9FAFC] px-3 py-2.5">
                 <span className="font-semibold text-[#334E73]">Access Permissions:</span>
                 <label className="inline-flex items-center gap-1.5 cursor-pointer">
                   <input
@@ -542,6 +563,17 @@ export function UsersAdminView({
                     className="accent-[#0B192C]"
                   />
                   <span>Can Delete Records</span>
+                </label>
+                <label className="inline-flex items-center gap-1.5 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    data-testid="edit-user-can-switch-live"
+                    checked={editRole === 'admin' ? true : editCanSwitchToLive}
+                    disabled={editRole === 'admin'}
+                    onChange={(e) => setEditCanSwitchToLive(e.target.checked)}
+                    className="accent-[#0B192C]"
+                  />
+                  <span>Can Switch to Live Data</span>
                 </label>
               </div>
             </div>

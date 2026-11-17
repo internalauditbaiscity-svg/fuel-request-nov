@@ -5,6 +5,7 @@ import {
   canPerformTabletopApproval,
   computeWorkPlanFuelTotals,
   evaluateTabletopApproval,
+  getDynamicProgressiveYearOptions,
   isWorkPlanInactive,
 } from '../utils/fuelEngine';
 import { RecordsPreviewGate } from './RecordsPreviewGate';
@@ -62,13 +63,12 @@ export function ApprovalsView({
   }, [workPlans]);
 
   const yearOptions = useMemo(() => {
-    const set = new Set<string>();
-    workPlans.forEach((wp) => {
-      const yr = wp.createdAt.slice(0, 4);
-      if (yr) set.add(yr);
+    return getDynamicProgressiveYearOptions({
+      workPlans,
+      tickets,
+      order: 'asc',
     });
-    return Array.from(set).sort().reverse();
-  }, [workPlans]);
+  }, [workPlans, tickets]);
 
   const activeFolderCount = useMemo(
     () => workPlans.filter((wp) => !isWorkPlanInactive(wp)).length,
@@ -86,8 +86,9 @@ export function ApprovalsView({
       if (folderTab === 'inactive' && !inactive) return false;
 
       if (departmentFilter !== 'all' && wp.department !== departmentFilter) return false;
-      const wpYear = wp.createdAt.slice(0, 4);
-      const wpMonth = wp.createdAt.slice(5, 7);
+      const dateRef = wp.weekStart || wp.createdAt || '';
+      const wpYear = dateRef.slice(0, 4);
+      const wpMonth = dateRef.slice(5, 7);
       if (yearFilter !== 'all' && wpYear !== yearFilter) return false;
       if (monthFilter !== 'all' && wpMonth !== monthFilter) return false;
       return true;

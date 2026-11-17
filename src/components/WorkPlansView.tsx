@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertCircle,
   ChevronDown,
@@ -6,6 +6,10 @@ import {
   Edit3,
   FileDown,
   FileText,
+  Folder,
+  FolderCheck,
+  FolderClock,
+  FolderOpen,
   Plus,
   Search,
   Trash2,
@@ -19,23 +23,56 @@ import {
   FuelDepot,
   FuelType,
   TripTicket,
+  TripTicketStatus,
   UserAccount,
   WorkPlan,
 } from '../types/fuel';
 import {
+  addDaysIso,
   canPreviewAndDownloadPdf,
   canUserDeleteRecords,
   canUserEditRecords,
-  categorizeDepartmentWorkPlans,
   evaluateRequestedLitersAgainstVehicle,
+  filterAndCategorizeWorkPrograms,
   filterVehiclesForTicket,
   generateNextTripTicketNumbers,
   generateNextWorkPlanNumber,
+  getDynamicProgressiveYearOptions,
   getMissingTicketMandatoryFields,
+  hasCityWideAccess,
   MAX_TICKETS_PER_WORKPLAN,
+  replaceYearInProjectCode,
+  shiftIsoDateToYear,
+  WorkProgramFolderKey,
+  WorkProgramRowSummary,
 } from '../utils/fuelEngine';
 import { generateWorkPlanPdf } from '../utils/pdfGenerator';
 import { RecordsPreviewGate } from './RecordsPreviewGate';
+
+const WORK_PROGRAM_MONTH_OPTIONS = [
+  { value: '01', label: 'January' },
+  { value: '02', label: 'February' },
+  { value: '03', label: 'March' },
+  { value: '04', label: 'April' },
+  { value: '05', label: 'May' },
+  { value: '06', label: 'June' },
+  { value: '07', label: 'July' },
+  { value: '08', label: 'August' },
+  { value: '09', label: 'September' },
+  { value: '10', label: 'October' },
+  { value: '11', label: 'November' },
+  { value: '12', label: 'December' },
+];
+
+const TRIP_TICKET_STATUS_OPTIONS: Array<{ value: TripTicketStatus | 'all'; label: string }> = [
+  { value: 'all', label: 'All Trip Ticket Statuses' },
+  { value: 'pending', label: 'Pending' },
+  { value: 'approved', label: 'Approved' },
+  { value: 'reduced', label: 'Reduced (Tabletop)' },
+  { value: 'dispensed', label: 'Dispensed' },
+  { value: 'forfeited', label: 'Forfeited' },
+  { value: 'rejected', label: 'Rejected' },
+];
 
 interface WorkPlansViewProps {
   workPlans: WorkPlan[];
@@ -103,6 +140,25 @@ interface TicketDraftRow {
   requestedLiters: number;
 }
 
+function getLatestPeriodFromPlans(plans: WorkPlan[]): { month: string; year: string } {
+  const now = new Date();
+  const fallbackYear = String(now.getFullYear());
+  const fallbackMonth = String(now.getMonth() + 1).padStart(2, '0');
+  if (plans.length === 0) {
+    return { month: fallbackMonth, year: fallbackYear };
+  }
+  const sorted = [...plans].sort((a, b) => {
+    const aMs = Date.parse(a.createdAt || a.weekStart || '');
+    const bMs = Date.parse(b.createdAt || b.weekStart || '');
+    if (!Number.isNaN(aMs) && !Number.isNaN(bMs) && bMs !== aMs) return bMs - aMs;
+    return b.controlNumber.localeCompare(a.controlNumber);
+  });
+  const ref = sorted[0]?.weekStart || sorted[0]?.createdAt || '';
+  const yr = /^\d{4}/.test(ref) ? ref.slice(0, 4) : fallbackYear;
+  const mo = /^(0[1-9]|1[0-2])$/.test(ref.slice(5, 7)) ? ref.slice(5, 7) : fallbackMonth;
+  return { month: mo, year: yr };
+}
+
 export function WorkPlansView({
   workPlans,
   allWorkPlans,
@@ -119,32 +175,57 @@ export function WorkPlansView({
   onUpdateWorkPlanAdmin,
   onDeleteWorkPlan,
 }: WorkPlansViewProps) {
+  const initialPeriod = useMemo(() => getLatestPeriodFromPlans(workPlans), [workPlans]);
+  const userAdjustedPeriodRef = useRef(false);
+
   const [previewOpen, setPreviewOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
-  const [statusFilter, setStatusFilter] = useState<'all' | 'pending' | 'approved'>('all');
-  const [expandedPlanId, setExpandedPlanId] = useState<string | null>(
-    workPlans[0]?.id ?? null
-  );
+  const [ticketStatusFilter, setTicketStatusFilter] = useState<TripTicketStatus | 'all'>('all');
+  const [workPlanFilter, setWorkPlanFilter] = useState<string>('all');
+  const [monthFilter, setMonthFilter] = useState<string>(initialPeriod.month);
+  const [yearFilter, setYearFilter] = useState<string>(initialPeriod.year);
+  const [activeFolderTab, setActiveFolderTab] = useState<'all' | WorkProgramFolderKey>('all');
+  const [filterValidationShown, setFilterValidationShown] = useState(false);
+
+  // Records remain collapsed until selected; deselection collapses them back.
+  const [selectedPlanId, setSelectedPlanId] = useState<string | null>(null);
   const [editingPlan, setEditingPlan] = useState<WorkPlan | null>(null);
   const [editProjectTitle, setEditProjectTitle] = useState('');
   const [editDivisionHead, setEditDivisionHead] = useState('');
   const [editUnitLead, setEditUnitLead] = useState('');
   const [editSectionManager, setEditSectionManager] = useState('');
 
+  useEffect(() => {
+    if (!userAdjustedPeriodRef.current) {
+      setMonthFilter(initialPeriod.month);
+      setYearFilter(initialPeriod.year);
+    }
+  }, [initialPeriod.month, initialPeriod.year]);
+
   // New Work Plan Form State
   const today = new Date().toISOString().slice(0, 10);
   const nextWeek = new Date(Date.now() + 6 * 86400000).toISOString().slice(0, 10);
+  const currentSystemYear = String(new Date().getFullYear());
 
+  const [requestYear, setRequestYear] = useState<string>(currentSystemYear);
   const preAssignedControlNumber = useMemo(
-    () => generateNextWorkPlanNumber(allWorkPlans),
-    [allWorkPlans]
+    () => generateNextWorkPlanNumber(allWorkPlans, Number(requestYear) || new Date().getFullYear()),
+    [allWorkPlans, requestYear]
   );
 
+  const isDepartmentLocked = !hasCityWideAccess(currentUser.role);
   const [department, setDepartment] = useState<string>(
     currentUser.department || BAIS_DEPARTMENTS[0]
   );
+
+  useEffect(() => {
+    if (isDepartmentLocked && currentUser.department) {
+      setDepartment(currentUser.department);
+    }
+  }, [isDepartmentLocked, currentUser.department]);
+
   const [projectTitle, setProjectTitle] = useState('');
-  const [projectCode, setProjectCode] = useState('INFRA-2026-');
+  const [projectCode, setProjectCode] = useState(`INFRA-${currentSystemYear}-`);
   const [weekStart, setWeekStart] = useState(today);
   const [weekEnd, setWeekEnd] = useState(nextWeek);
 
@@ -206,30 +287,115 @@ export function WorkPlansView({
   const canDelete = canUserDeleteRecords(currentUser);
   const canPdf = canPreviewAndDownloadPdf(currentUser.role);
 
-  const searchMatchedPlans = useMemo(() => {
-    const q = searchQuery.trim().toLowerCase();
-    return workPlans.filter((wp) => {
-      if (!q) return true;
-      return (
-        wp.controlNumber.toLowerCase().includes(q) ||
-        wp.projectTitle.toLowerCase().includes(q) ||
-        wp.department.toLowerCase().includes(q) ||
-        wp.projectCode.toLowerCase().includes(q)
-      );
-    });
-  }, [workPlans, searchQuery]);
+  const workPlanOptions = useMemo(() => {
+    return [...workPlans].sort((a, b) => b.controlNumber.localeCompare(a.controlNumber));
+  }, [workPlans]);
 
-  const categorizedPlans = useMemo(
-    () => categorizeDepartmentWorkPlans(searchMatchedPlans, tickets),
-    [searchMatchedPlans, tickets]
+  const yearOptions = useMemo(() => {
+    return getDynamicProgressiveYearOptions({
+      workPlans: allWorkPlans,
+      tickets: allTickets,
+      extraYears: [yearFilter, requestYear],
+      order: 'asc',
+    });
+  }, [allWorkPlans, allTickets, yearFilter, requestYear]);
+
+  const workProgramResult = useMemo(
+    () =>
+      filterAndCategorizeWorkPrograms(workPlans, tickets, {
+        searchQuery,
+        ticketStatus: ticketStatusFilter,
+        workPlanId: workPlanFilter,
+        month: monthFilter,
+        year: yearFilter,
+      }),
+    [workPlans, tickets, searchQuery, ticketStatusFilter, workPlanFilter, monthFilter, yearFilter]
   );
 
-  const visibleCategoryCount =
-    statusFilter === 'pending'
-      ? categorizedPlans.pending.length
-      : statusFilter === 'approved'
-        ? categorizedPlans.approved.length
-        : categorizedPlans.pending.length + categorizedPlans.approved.length;
+  const isMonthMissing = workProgramResult.missingFields.includes('month');
+  const isYearMissing = workProgramResult.missingFields.includes('year');
+  const showMandatoryError =
+    !workProgramResult.valid && (filterValidationShown || previewOpen || isMonthMissing || isYearMissing);
+
+  const visibleFolderCount = workProgramResult.valid
+    ? activeFolderTab === 'approved_dispensed'
+      ? workProgramResult.approvedDispensed.length
+      : activeFolderTab === 'pending_approval'
+        ? workProgramResult.pendingApproval.length
+        : activeFolderTab === 'approved_undispensed'
+          ? workProgramResult.approvedWithUndispensed.length
+          : workProgramResult.totalCount
+    : 0;
+
+  const hasOptionalFiltersActive = Boolean(
+    searchQuery.trim() || ticketStatusFilter !== 'all' || workPlanFilter !== 'all'
+  );
+
+  const handleTogglePreview = (nextOpen: boolean) => {
+    if (nextOpen && !workProgramResult.valid) {
+      setFilterValidationShown(true);
+      setPreviewOpen(false);
+      return;
+    }
+    setPreviewOpen(nextOpen);
+    if (!nextOpen) {
+      setSelectedPlanId(null);
+    }
+  };
+
+  const handleResetFilters = () => {
+    userAdjustedPeriodRef.current = false;
+    setSearchQuery('');
+    setTicketStatusFilter('all');
+    setWorkPlanFilter('all');
+    setMonthFilter(initialPeriod.month);
+    setYearFilter(initialPeriod.year);
+    setActiveFolderTab('all');
+    setFilterValidationShown(false);
+    setSelectedPlanId(null);
+  };
+
+  const handleToggleRowSelection = (planId: string) => {
+    setSelectedPlanId((prev) => (prev === planId ? null : planId));
+  };
+
+  const handleRequestYearChange = (nextYear: string) => {
+    setRequestYear(nextYear);
+    const shiftedStart = shiftIsoDateToYear(weekStart, nextYear);
+    setWeekStart(shiftedStart);
+    setWeekEnd(addDaysIso(shiftedStart, 6));
+    setProjectCode((prev) => replaceYearInProjectCode(prev, nextYear));
+    setTicketDrafts((prev) =>
+      prev.map((row) => ({
+        ...row,
+        scheduledDate: shiftIsoDateToYear(row.scheduledDate || shiftedStart, nextYear),
+      }))
+    );
+  };
+
+  const handleWeekStartChange = (nextStart: string) => {
+    setWeekStart(nextStart);
+    const yrMatch = nextStart.match(/^(\d{4})-/);
+    if (yrMatch) {
+      const yrNum = Number(yrMatch[1]);
+      if (yrNum >= 2000 && yrNum <= 2100) {
+        const yr = yrMatch[1];
+        if (yr !== requestYear) {
+          setRequestYear(yr);
+          setProjectCode((prev) => replaceYearInProjectCode(prev, yr));
+          setTicketDrafts((prev) =>
+            prev.map((row) => ({
+              ...row,
+              scheduledDate: shiftIsoDateToYear(row.scheduledDate || nextStart, yr),
+            }))
+          );
+        }
+        if (weekEnd < nextStart) {
+          setWeekEnd(addDaysIso(nextStart, 6));
+        }
+      }
+    }
+  };
 
   const handleVehiclePick = (index: number, vehicleId: string) => {
     const veh = vehicles.find((v) => v.id === vehicleId);
@@ -460,6 +626,7 @@ export function WorkPlansView({
 
       const created = await onCreateWorkPlan(
         {
+          controlNumber: preAssignedControlNumber,
           department: department.trim(),
           projectTitle: projectTitle.trim(),
           projectCode: projectCode.trim(),
@@ -480,6 +647,10 @@ export function WorkPlansView({
       pdfResult.doc.save(pdfResult.filename);
       URL.revokeObjectURL(pdfResult.blobUrl);
 
+      setRequestYear(currentSystemYear);
+      setProjectCode(`INFRA-${currentSystemYear}-`);
+      setWeekStart(today);
+      setWeekEnd(nextWeek);
       setProjectTitle('');
       setReviewedBy('');
       setReviewedByDesignation('');
@@ -514,640 +685,774 @@ export function WorkPlansView({
     }
   };
 
-  return (
-    <div className="space-y-5">
-      {/* Filter & Search Toolbar */}
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between rounded-lg border border-[#D5DCE6] bg-white p-4">
-        <div className="relative flex-1 max-w-md">
-          <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[#5A6F8C]" />
-          <input
-            type="text"
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            placeholder="Search work plan no., office, or infrastructure project..."
-            aria-label="Search departmental work plans"
-            className="w-full rounded-md border border-[#D5DCE6] bg-[#F3F5F8] py-2 pl-9 pr-3 text-sm text-[#0B192C] placeholder:text-[#5A6F8C] focus:border-[#1B3B6F] focus:bg-white focus:outline-none"
-          />
-        </div>
+  const renderFullRecordReview = (summary: WorkProgramRowSummary) => {
+    const { workPlan: wp, planTickets } = summary;
+    const isPendingPlan = summary.folder === 'pending_approval';
 
-        <div className="flex flex-wrap items-center gap-2">
-          <div className="flex flex-wrap items-center gap-1.5">
-            {(
-              [
-                {
-                  id: 'all',
-                  label: `All (${categorizedPlans.pending.length + categorizedPlans.approved.length})`,
-                },
-                { id: 'pending', label: `Pending (${categorizedPlans.pending.length})` },
-                { id: 'approved', label: `Approved (${categorizedPlans.approved.length})` },
-              ] as const
-            ).map((tab) => (
-              <button
-                key={tab.id}
-                type="button"
-                onClick={() => setStatusFilter(tab.id)}
-                className={`rounded-md px-3 py-1.5 text-xs font-semibold transition-colors whitespace-nowrap ${
-                  statusFilter === tab.id
-                    ? 'bg-[#0B192C] text-white'
-                    : 'bg-[#F3F5F8] text-[#334E73] hover:bg-[#E6EBF2]'
-                }`}
-              >
-                {tab.label}
-              </button>
-            ))}
+    return (
+      <div
+        data-testid={`full-record-review-${wp.controlNumber}`}
+        className="space-y-4 rounded-md border border-[#D5DCE6] bg-white p-4"
+      >
+        {/* Red Header Note for Undispensed Approved Fuel Requests */}
+        {summary.hasUndispensedApproved && (
+          <div
+            role="status"
+            className="flex flex-wrap items-center justify-between gap-2 rounded border border-red-200 bg-red-50 px-3.5 py-2 text-xs font-semibold text-red-700"
+          >
+            <span className="flex items-center gap-1.5">
+              <AlertCircle className="h-3.5 w-3.5 shrink-0 text-red-700" />
+              <span>
+                UNDISPENSED APPROVED FUEL REQUEST — {summary.undispensedApprovedLiters.toFixed(1)} L
+                approved by {wp.approvedBy || 'Authorized Approver'} across{' '}
+                {summary.undispensedTicketCount} ticket(s), awaiting GSO dispensing
+              </span>
+            </span>
+            <span className="font-mono text-[11px] uppercase tracking-wide text-red-800 whitespace-nowrap">
+              Undispensed
+            </span>
+          </div>
+        )}
+
+        {/* Full Record Header */}
+        <div className="flex flex-col gap-3 border-b border-[#E6EBF2] pb-3 lg:flex-row lg:items-center lg:justify-between">
+          <div className="space-y-1">
+            <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs">
+              <span className="font-mono font-bold text-[#1B3B6F]">{wp.controlNumber}</span>
+              <span className="text-[#94A3B8]" aria-hidden="true">
+                ·
+              </span>
+              <span className="font-semibold text-[#0B192C]">{wp.department}</span>
+              <span className="text-[#94A3B8]" aria-hidden="true">
+                ·
+              </span>
+              <span className="font-mono text-[#5A6F8C]">
+                {wp.weekStart} to {wp.weekEnd}
+              </span>
+              <span className="text-[#94A3B8]" aria-hidden="true">
+                ·
+              </span>
+              <span className="font-mono text-[#5A6F8C]">Project {wp.projectCode}</span>
+            </div>
+            <h3 className="font-display text-sm sm:text-base font-bold text-[#0B192C]">
+              {wp.projectTitle}
+            </h3>
+            {wp.approverNote && (
+              <p className="text-xs text-[#334E73]">
+                <span className="font-semibold">Approver Note:</span> {wp.approverNote}
+              </p>
+            )}
           </div>
 
-          <button
-            type="button"
-            onClick={onOpenModal}
-            className="inline-flex items-center gap-1.5 rounded-md bg-[#0B192C] px-3.5 py-2 text-xs font-semibold text-white hover:bg-[#1B3B6F] whitespace-nowrap"
-          >
-            <Plus className="h-4 w-4" />
-            <span>New Work Plan</span>
-          </button>
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
+            <span
+              className={`text-[11px] font-bold uppercase tracking-wide whitespace-nowrap mr-1 ${
+                isPendingPlan
+                  ? 'text-amber-800'
+                  : summary.hasUndispensedApproved
+                    ? 'text-red-700'
+                    : 'text-emerald-800'
+              }`}
+            >
+              {wp.status.replace(/_/g, ' ')}
+            </span>
+
+            {canPdf && (
+              <button
+                type="button"
+                onClick={() => onPreviewPdf(wp, planTickets)}
+                className="inline-flex items-center gap-1 rounded-md border border-[#D5DCE6] bg-[#F3F5F8] px-2.5 py-1.5 text-xs font-semibold text-[#0B192C] hover:bg-[#E6EBF2] whitespace-nowrap"
+              >
+                <FileDown className="h-3.5 w-3.5" />
+                <span>PDF</span>
+              </button>
+            )}
+
+            {canEdit && (
+              <button
+                type="button"
+                onClick={() => {
+                  setEditingPlan(wp);
+                  setEditProjectTitle(wp.projectTitle);
+                  setEditDivisionHead(wp.divisionHead ?? '');
+                  setEditUnitLead(wp.unitLead ?? '');
+                  setEditSectionManager(wp.sectionManager ?? '');
+                }}
+                aria-label={`Edit work plan ${wp.controlNumber}`}
+                className="rounded border border-[#D5DCE6] p-1.5 text-[#334E73] hover:bg-[#F3F5F8]"
+              >
+                <Edit3 className="h-3.5 w-3.5" />
+              </button>
+            )}
+
+            {canDelete && (
+              <button
+                type="button"
+                onClick={() => onDeleteWorkPlan(wp)}
+                aria-label={`Delete work plan ${wp.controlNumber}`}
+                className="rounded border border-[#D5DCE6] p-1.5 text-red-700 hover:bg-red-50"
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+              </button>
+            )}
+
+            <button
+              type="button"
+              onClick={() => setSelectedPlanId(null)}
+              aria-label={`Collapse full record review for ${wp.controlNumber}`}
+              className="inline-flex items-center gap-1 rounded-md border border-[#D5DCE6] bg-white px-2.5 py-1.5 text-xs font-semibold text-[#334E73] hover:bg-[#F3F5F8] whitespace-nowrap"
+            >
+              <X className="h-3.5 w-3.5" />
+              <span>Collapse</span>
+            </button>
+          </div>
+        </div>
+
+        {/* Summary Volume Metrics */}
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-5 rounded-md border border-[#E6EBF2] bg-[#F9FAFC] p-3 text-xs">
+          <div>
+            <div className="text-[11px] text-[#5A6F8C]">Requested Fuel</div>
+            <div className="font-mono font-bold tabular-nums text-[#0B192C]">
+              {wp.totalRequestedLiters.toFixed(1)} L
+            </div>
+          </div>
+          <div>
+            <div className="text-[11px] text-[#5A6F8C]">Diesel Approved / Dispensed</div>
+            <div className="font-mono font-bold tabular-nums text-[#1B3B6F]">
+              {summary.totalDieselApproved.toFixed(1)} L / {summary.totalDieselDispensed.toFixed(1)} L
+            </div>
+          </div>
+          <div>
+            <div className="text-[11px] text-[#5A6F8C]">Gasoline Approved / Dispensed</div>
+            <div className="font-mono font-bold tabular-nums text-[#1B3B6F]">
+              {summary.totalGasApproved.toFixed(1)} L / {summary.totalGasDispensed.toFixed(1)} L
+            </div>
+          </div>
+          <div>
+            <div className="text-[11px] text-[#5A6F8C]">Tickets Approved / Dispensed</div>
+            <div className="font-mono font-bold tabular-nums text-[#0B192C]">
+              {summary.ticketsApprovedCount} / {summary.ticketsDispensedCount}
+            </div>
+          </div>
+          <div>
+            <div className="text-[11px] text-[#5A6F8C]">Total Approved (Approver)</div>
+            <div className="font-mono font-bold tabular-nums text-emerald-800">
+              {wp.totalApprovedLiters.toFixed(1)} L
+            </div>
+          </div>
+        </div>
+
+        {/* Embedded Trip Tickets Full Table */}
+        <div className="overflow-x-auto rounded-md border border-[#D5DCE6]">
+          <table className="w-full text-left text-xs">
+            <thead className="border-b border-[#D5DCE6] bg-[#F3F5F8] text-[#334E73]">
+              <tr>
+                <th className="px-3 py-2.5 font-semibold">Ticket #</th>
+                <th className="px-3 py-2.5 font-semibold">Vehicle / Equipment</th>
+                <th className="px-3 py-2.5 font-semibold">Assigned Driver</th>
+                <th className="px-3 py-2.5 font-semibold">Purpose / Project & Destination</th>
+                <th className="px-3 py-2.5 font-semibold text-right">Auto Limit</th>
+                <th className="px-3 py-2.5 font-semibold text-right">Requested</th>
+                <th className="px-3 py-2.5 font-semibold text-right">Approved (Approver)</th>
+                <th className="px-3 py-2.5 font-semibold text-right">Actual Fuel Dispensed</th>
+                <th className="px-3 py-2.5 font-semibold">Ticket State</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-[#E6EBF2]">
+              {planTickets.map((t) => {
+                const isUndispensedApproved =
+                  !t.servedOnce &&
+                  (t.status === 'approved' || t.status === 'reduced') &&
+                  t.approvedLiters > 0;
+                return (
+                  <tr
+                    key={t.id}
+                    className={
+                      isUndispensedApproved
+                        ? 'bg-red-50/40 hover:bg-red-50/70'
+                        : 'hover:bg-[#F9FAFC]'
+                    }
+                  >
+                    <td className="px-3 py-2.5 font-mono font-semibold text-[#0B192C] whitespace-nowrap">
+                      {t.ticketNumber}
+                    </td>
+                    <td className="px-3 py-2.5">
+                      <div className="font-mono font-semibold text-[#0B192C]">{t.plateNumber}</div>
+                      <div className="text-[11px] text-[#5A6F8C]">
+                        {t.vehicleLabel} · {t.fuelType.toUpperCase()}
+                      </div>
+                    </td>
+                    <td className="px-3 py-2.5">
+                      <div className="font-medium text-[#0B192C]">{t.driverName}</div>
+                      {t.driverLicense && (
+                        <div className="font-mono text-[11px] text-[#5A6F8C]">
+                          Lic: {t.driverLicense}
+                        </div>
+                      )}
+                    </td>
+                    <td className="px-3 py-2.5">
+                      <div className="font-medium text-[#0B192C]">
+                        {t.purposeOrProject || t.projectTitle}
+                      </div>
+                      <div className="text-[11px] text-[#5A6F8C]">
+                        {t.scheduledDate} · {t.destination}
+                      </div>
+                    </td>
+                    <td className="px-3 py-2.5 text-right font-mono tabular-nums text-[#5A6F8C]">
+                      {t.computedLimitLiters.toFixed(1)} L
+                    </td>
+                    <td className="px-3 py-2.5 text-right font-mono tabular-nums font-medium text-[#0B192C]">
+                      {t.requestedLiters.toFixed(1)} L
+                    </td>
+                    <td className="px-3 py-2.5 text-right font-mono tabular-nums font-semibold text-[#1B3B6F]">
+                      {t.status === 'pending' ? (
+                        <span className="font-normal text-[#5A6F8C]">Pending</span>
+                      ) : (
+                        <>
+                          <div>{t.approvedLiters.toFixed(1)} L</div>
+                          {t.status === 'reduced' && (
+                            <div className="text-[10px] font-normal text-[#5A6F8C]">
+                              Tabletop reduced
+                            </div>
+                          )}
+                        </>
+                      )}
+                    </td>
+                    <td className="px-3 py-2.5 text-right font-mono tabular-nums font-semibold">
+                      {t.servedOnce ? (
+                        <div className="text-emerald-800">
+                          <div>{t.dispensedLiters.toFixed(1)} L</div>
+                          {t.dispensedBy && (
+                            <div className="text-[10px] font-sans font-normal text-[#5A6F8C]">
+                              By {t.dispensedBy}
+                            </div>
+                          )}
+                          {t.forfeitedLiters > 0 && (
+                            <div className="text-[10px] text-red-700">
+                              -{t.forfeitedLiters.toFixed(1)} L void
+                            </div>
+                          )}
+                        </div>
+                      ) : isUndispensedApproved ? (
+                        <span className="text-red-700">0.0 L (Undispensed)</span>
+                      ) : (
+                        <span className="text-[#5A6F8C]">{t.dispensedLiters.toFixed(1)} L</span>
+                      )}
+                    </td>
+                    <td className="px-3 py-2.5 whitespace-nowrap">
+                      {isUndispensedApproved ? (
+                        <span className="font-semibold text-red-700">Undispensed · Approved</span>
+                      ) : t.status === 'pending' ? (
+                        <span className="font-medium text-amber-800">Pending Approval</span>
+                      ) : (
+                        <span className="font-medium text-emerald-800 capitalize">{t.status}</span>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+
+        {/* Mandatory Sign-offs */}
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-3 rounded-md border border-[#D5DCE6] bg-[#F9FAFC] p-3 text-xs">
+          <div>
+            <div className="text-[11px] text-[#5A6F8C]">Prepared by</div>
+            <div className="font-semibold text-[#0B192C]">{wp.preparedBy}</div>
+            {wp.preparedByDesignation && (
+              <div className="text-[11px] text-[#5A6F8C]">{wp.preparedByDesignation}</div>
+            )}
+          </div>
+          <div>
+            <div className="text-[11px] text-[#5A6F8C]">Reviewed by</div>
+            <div className="font-semibold text-[#0B192C]">{wp.reviewedBy}</div>
+            {wp.reviewedByDesignation && (
+              <div className="text-[11px] text-[#5A6F8C]">{wp.reviewedByDesignation}</div>
+            )}
+          </div>
+          <div>
+            <div className="text-[11px] text-[#5A6F8C]">Approved by (Authorized Approver)</div>
+            <div className="font-semibold text-[#0B192C]">{wp.approvedBy}</div>
+            {wp.approvedByDesignation && (
+              <div className="text-[11px] text-[#5A6F8C]">{wp.approvedByDesignation}</div>
+            )}
+          </div>
         </div>
       </div>
+    );
+  };
 
-      {/* Preview-Gated Work Plans List (Categorized: Pending & Approved) */}
-      <RecordsPreviewGate
-        title="Departmental Weekly Work Plans"
-        description="Submitted work plans and embedded 7-digit trip tickets are hidden until Preview is pressed."
-        recordCount={visibleCategoryCount}
-        previewOpen={previewOpen}
-        onTogglePreview={setPreviewOpen}
-        buttonLabel="Preview Work Plans"
+  const renderFolderTableSection = (opts: {
+    folderKey: WorkProgramFolderKey;
+    title: string;
+    subtitle: string;
+    rows: WorkProgramRowSummary[];
+    emptyMessage: string;
+    icon: 'dispensed' | 'undispensed' | 'pending';
+  }) => {
+    const FolderIcon =
+      opts.icon === 'dispensed'
+        ? FolderCheck
+        : opts.icon === 'undispensed'
+          ? FolderOpen
+          : FolderClock;
+
+    return (
+      <section
+        aria-label={opts.title}
+        data-testid={`workplan-folder-${opts.folderKey}`}
+        className="rounded-lg border border-[#D5DCE6] bg-white overflow-hidden"
       >
-        {visibleCategoryCount === 0 ? (
-          <div className="rounded-lg border border-[#D5DCE6] bg-white p-10 text-center space-y-3">
-            <FileText className="mx-auto h-9 w-9 text-[#5A6F8C]" />
-            <h2 className="font-display text-base font-bold text-[#0B192C]">
-              No weekly work plans found
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#D5DCE6] bg-[#F8FAFC] px-4 py-3">
+          <div className="flex items-center gap-2">
+            <FolderIcon
+              className={`h-4 w-4 shrink-0 ${
+                opts.icon === 'dispensed'
+                  ? 'text-emerald-700'
+                  : opts.icon === 'undispensed'
+                    ? 'text-red-700'
+                    : 'text-amber-700'
+              }`}
+            />
+            <h2 className="font-display text-sm font-bold text-[#0B192C]">
+              {opts.title} ({opts.rows.length})
             </h2>
-            <p className="text-sm text-[#5A6F8C] max-w-md mx-auto">
-              Create a departmental weekly work plan (up to 12 trip tickets) with mandatory hierarchical sign-offs and designations.
-            </p>
+          </div>
+          <span className="text-xs text-[#5A6F8C]">{opts.subtitle}</span>
+        </div>
+
+        {opts.rows.length === 0 ? (
+          <div className="p-6 text-center text-xs text-[#5A6F8C]">{opts.emptyMessage}</div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table
+              data-testid={`workplan-table-${opts.folderKey}`}
+              className="w-full text-left text-xs"
+            >
+              <thead className="border-b border-[#D5DCE6] bg-[#F3F5F8] text-[#334E73]">
+                <tr className="align-bottom">
+                  <th className="px-3 py-2.5 font-semibold">Department</th>
+                  <th className="px-2.5 py-2.5 font-semibold whitespace-nowrap">Work Plan No</th>
+                  <th className="px-2.5 py-2.5 font-semibold text-right leading-tight">
+                    No. of Trip Ticket Approved
+                  </th>
+                  <th className="px-2.5 py-2.5 font-semibold text-right leading-tight">
+                    No. Trip Tickets Dispensed
+                  </th>
+                  <th className="px-2.5 py-2.5 font-semibold text-right leading-tight">
+                    Total Diesel Approved
+                  </th>
+                  <th className="px-2.5 py-2.5 font-semibold text-right leading-tight">
+                    Total Diesel Dispensed
+                  </th>
+                  <th className="px-2.5 py-2.5 font-semibold text-right leading-tight">
+                    Total Gas Approved
+                  </th>
+                  <th className="px-3 py-2.5 font-semibold text-right leading-tight">
+                    Total Gasoline Dispensed
+                  </th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-[#E6EBF2]">
+                {opts.rows.map((summary) => {
+                  const wp = summary.workPlan;
+                  const isSelected = selectedPlanId === wp.id;
+
+                  return [
+                    <tr
+                      key={wp.id}
+                      data-testid={`workplan-row-${wp.controlNumber}`}
+                      data-selected={isSelected ? 'true' : 'false'}
+                      onClick={() => handleToggleRowSelection(wp.id)}
+                      className={`cursor-pointer transition-colors ${
+                        isSelected
+                          ? 'bg-[#EEF2F8]'
+                          : summary.hasUndispensedApproved
+                            ? 'bg-red-50/25 hover:bg-red-50/60'
+                            : 'hover:bg-[#F9FAFC]'
+                      }`}
+                    >
+                      <td className="px-3 py-2.5 font-medium text-[#0B192C] max-w-[200px]">
+                        <div className="truncate" title={wp.department}>
+                          {wp.department}
+                        </div>
+                        <div
+                          className="text-[11px] font-normal text-[#5A6F8C] truncate"
+                          title={wp.projectTitle}
+                        >
+                          {wp.projectTitle}
+                        </div>
+                      </td>
+                      <td className="px-2.5 py-2.5 whitespace-nowrap">
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleToggleRowSelection(wp.id);
+                          }}
+                          aria-expanded={isSelected}
+                          aria-label={`${isSelected ? 'Deselect and collapse' : 'Select and review'} work plan ${wp.controlNumber}`}
+                          className="inline-flex items-center gap-1 font-mono font-bold text-[#1B3B6F] hover:underline"
+                        >
+                          {isSelected ? (
+                            <ChevronDown className="h-3.5 w-3.5 shrink-0 text-[#0B192C]" />
+                          ) : (
+                            <ChevronRight className="h-3.5 w-3.5 shrink-0 text-[#5A6F8C]" />
+                          )}
+                          <span>{wp.controlNumber}</span>
+                        </button>
+                      </td>
+                      <td className="px-2.5 py-2.5 text-right font-mono font-semibold tabular-nums text-[#0B192C] whitespace-nowrap">
+                        {summary.ticketsApprovedCount}
+                      </td>
+                      <td
+                        className={`px-2.5 py-2.5 text-right font-mono font-semibold tabular-nums whitespace-nowrap ${
+                          summary.hasUndispensedApproved
+                            ? 'text-red-700'
+                            : summary.ticketsDispensedCount > 0
+                              ? 'text-emerald-800'
+                              : 'text-[#5A6F8C]'
+                        }`}
+                      >
+                        {summary.ticketsDispensedCount}
+                      </td>
+                      <td className="px-2.5 py-2.5 text-right font-mono font-semibold tabular-nums text-[#1B3B6F] whitespace-nowrap">
+                        {summary.totalDieselApproved.toFixed(1)} L
+                      </td>
+                      <td className="px-2.5 py-2.5 text-right font-mono font-semibold tabular-nums text-emerald-800 whitespace-nowrap">
+                        {summary.totalDieselDispensed.toFixed(1)} L
+                      </td>
+                      <td className="px-2.5 py-2.5 text-right font-mono font-semibold tabular-nums text-[#1B3B6F] whitespace-nowrap">
+                        {summary.totalGasApproved.toFixed(1)} L
+                      </td>
+                      <td className="px-3 py-2.5 text-right font-mono font-semibold tabular-nums text-emerald-800 whitespace-nowrap">
+                        {summary.totalGasDispensed.toFixed(1)} L
+                      </td>
+                    </tr>,
+                    isSelected ? (
+                      <tr key={`${wp.id}_review`} className="bg-[#F9FAFC]">
+                        <td colSpan={8} className="p-4">
+                          {renderFullRecordReview(summary)}
+                        </td>
+                      </tr>
+                    ) : null,
+                  ];
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+    );
+  };
+
+  return (
+    <div className="space-y-5">
+      {/* Work Program Filtering Toolbar (Trip Ticket Status, Work Plan, Mandatory Month & Year) */}
+      <div className="space-y-3 rounded-lg border border-[#D5DCE6] bg-white p-4">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div className="relative flex-1 max-w-md">
+            <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[#5A6F8C]" />
+            <input
+              type="text"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="Search work plan no., office, ticket no., or project..."
+              aria-label="Search departmental work plans"
+              className="w-full rounded-md border border-[#D5DCE6] bg-[#F3F5F8] py-2 pl-9 pr-3 text-xs text-[#0B192C] placeholder:text-[#5A6F8C] focus:border-[#1B3B6F] focus:bg-white focus:outline-none"
+            />
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            {(hasOptionalFiltersActive || !workProgramResult.valid) && (
+              <button
+                type="button"
+                onClick={handleResetFilters}
+                className="rounded-md border border-[#D5DCE6] bg-[#F3F5F8] px-3 py-2 text-xs font-semibold text-[#1B3B6F] hover:bg-[#E6EBF2] whitespace-nowrap"
+              >
+                Reset Filters
+              </button>
+            )}
+
             <button
               type="button"
               onClick={onOpenModal}
-              className="inline-flex items-center gap-1.5 rounded-md bg-[#0B192C] px-4 py-2 text-xs font-semibold text-white hover:bg-[#1B3B6F]"
+              className="inline-flex items-center gap-1.5 rounded-md bg-[#0B192C] px-3.5 py-2 text-xs font-semibold text-white hover:bg-[#1B3B6F] whitespace-nowrap"
             >
               <Plus className="h-4 w-4" />
-              <span>Create Weekly Work Plan</span>
+              <span>New Work Plan</span>
             </button>
           </div>
+        </div>
+
+        <div className="grid grid-cols-1 gap-3 border-t border-[#E6EBF2] pt-3 sm:grid-cols-2 lg:grid-cols-4 text-xs">
+          <div>
+            <label
+              htmlFor="wp-filter-ticket-status"
+              className="block text-[11px] font-semibold text-[#334E73] mb-1"
+            >
+              Status of Trip Ticket
+            </label>
+            <select
+              id="wp-filter-ticket-status"
+              value={ticketStatusFilter}
+              onChange={(e) => {
+                setTicketStatusFilter(e.target.value as TripTicketStatus | 'all');
+                setSelectedPlanId(null);
+              }}
+              className="w-full rounded-md border border-[#D5DCE6] bg-[#F9FAFC] px-2.5 py-2 text-xs text-[#0B192C] focus:border-[#1B3B6F] focus:bg-white focus:outline-none"
+            >
+              {TRIP_TICKET_STATUS_OPTIONS.map((opt) => (
+                <option key={opt.value} value={opt.value}>
+                  {opt.label}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div>
+            <label
+              htmlFor="wp-filter-work-plan"
+              className="block text-[11px] font-semibold text-[#334E73] mb-1"
+            >
+              Work Plan
+            </label>
+            <select
+              id="wp-filter-work-plan"
+              value={workPlanFilter}
+              onChange={(e) => {
+                setWorkPlanFilter(e.target.value);
+                setSelectedPlanId(null);
+              }}
+              className="w-full rounded-md border border-[#D5DCE6] bg-[#F9FAFC] px-2.5 py-2 text-xs text-[#0B192C] focus:border-[#1B3B6F] focus:bg-white focus:outline-none"
+            >
+              <option value="all">All Work Plans</option>
+              {workPlanOptions.map((wp) => (
+                <option key={wp.id} value={wp.id}>
+                  {wp.controlNumber} — {wp.department}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div>
+            <label
+              htmlFor="wp-filter-month"
+              className={`block text-[11px] font-semibold mb-1 ${
+                showMandatoryError && isMonthMissing ? 'text-red-700' : 'text-[#334E73]'
+              }`}
+            >
+              Month (Mandatory) *
+            </label>
+            <select
+              id="wp-filter-month"
+              required
+              aria-required="true"
+              aria-invalid={showMandatoryError && isMonthMissing}
+              value={monthFilter}
+              onChange={(e) => {
+                userAdjustedPeriodRef.current = true;
+                setMonthFilter(e.target.value);
+                setFilterValidationShown(true);
+                setSelectedPlanId(null);
+              }}
+              className={`w-full rounded-md border px-2.5 py-2 text-xs focus:outline-none ${
+                showMandatoryError && isMonthMissing
+                  ? 'border-red-600 bg-red-50 text-red-900'
+                  : 'border-[#D5DCE6] bg-[#F9FAFC] text-[#0B192C] focus:border-[#1B3B6F] focus:bg-white'
+              }`}
+            >
+              <option value="">Select Month...</option>
+              {WORK_PROGRAM_MONTH_OPTIONS.map((m) => (
+                <option key={m.value} value={m.value}>
+                  {m.label}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div>
+            <label
+              htmlFor="wp-filter-year"
+              className={`block text-[11px] font-semibold mb-1 ${
+                showMandatoryError && isYearMissing ? 'text-red-700' : 'text-[#334E73]'
+              }`}
+            >
+              Year (Mandatory) *
+            </label>
+            <select
+              id="wp-filter-year"
+              required
+              aria-required="true"
+              aria-invalid={showMandatoryError && isYearMissing}
+              value={yearFilter}
+              onChange={(e) => {
+                userAdjustedPeriodRef.current = true;
+                setYearFilter(e.target.value);
+                setFilterValidationShown(true);
+                setSelectedPlanId(null);
+              }}
+              className={`w-full rounded-md border px-2.5 py-2 font-mono text-xs focus:outline-none ${
+                showMandatoryError && isYearMissing
+                  ? 'border-red-600 bg-red-50 text-red-900'
+                  : 'border-[#D5DCE6] bg-[#F9FAFC] text-[#0B192C] focus:border-[#1B3B6F] focus:bg-white'
+              }`}
+            >
+              <option value="">Select Year...</option>
+              {yearOptions.map((yr) => (
+                <option key={yr} value={yr}>
+                  {yr}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+
+        {showMandatoryError && workProgramResult.validationError && (
+          <div
+            role="alert"
+            data-testid="workplan-mandatory-filter-error"
+            className="flex items-center gap-2 rounded-md border border-red-300 bg-red-50 px-3.5 py-2.5 text-xs font-semibold text-red-800"
+          >
+            <AlertCircle className="h-4 w-4 shrink-0 text-red-700" />
+            <span>{workProgramResult.validationError}</span>
+          </div>
+        )}
+      </div>
+
+      {/* Preview-Gated Tabular Work Program View (3 Folders) */}
+      <RecordsPreviewGate
+        title="Departmental Work Program Preview"
+        description="Work Program records remain hidden until Preview is pressed. Select a mandatory Month and Year, then click Preview to inspect folders and expand full records."
+        recordCount={visibleFolderCount}
+        previewOpen={previewOpen}
+        onTogglePreview={handleTogglePreview}
+        buttonLabel="Preview Work Plans"
+      >
+        {!workProgramResult.valid ? (
+          <div className="rounded-lg border border-red-300 bg-red-50 p-8 text-center space-y-2">
+            <AlertCircle className="mx-auto h-8 w-8 text-red-700" />
+            <h2 className="font-display text-sm font-bold text-red-900">
+              Mandatory Month and Year Required
+            </h2>
+            <p className="text-xs text-red-800 max-w-md mx-auto">
+              {workProgramResult.validationError}
+            </p>
+          </div>
         ) : (
-          <div className="space-y-6">
-            {/* Category 1: Pending Work Plans */}
-            {(statusFilter === 'all' || statusFilter === 'pending') && (
-              <section aria-label="Pending Department Requests" className="space-y-3">
-                <div className="flex items-center justify-between border-b border-[#D5DCE6] pb-2">
-                  <div className="flex items-center gap-2">
-                    <h2 className="font-display text-sm font-bold text-[#0B192C]">
-                      Pending Requests
-                    </h2>
-                    <span className="rounded bg-[#E6EBF2] px-2 py-0.5 font-mono text-xs font-semibold text-[#0B192C]">
-                      {categorizedPlans.pending.length}
-                    </span>
-                  </div>
-                  <span className="text-xs text-[#5A6F8C]">
-                    Awaiting authorized tabletop assessment
-                  </span>
+          <div className="space-y-4">
+            {/* Folder Navigation Tabs */}
+            <div
+              className="flex flex-wrap items-center gap-1.5 rounded-lg border border-[#D5DCE6] bg-white p-2"
+              role="tablist"
+              aria-label="Work Program Folders"
+            >
+              {(
+                [
+                  {
+                    id: 'all',
+                    label: `All Folders (${workProgramResult.totalCount})`,
+                  },
+                  {
+                    id: 'approved_dispensed',
+                    label: `Approved / Dispense Folder (${workProgramResult.approvedDispensed.length})`,
+                  },
+                  {
+                    id: 'approved_undispensed',
+                    label: `Approved with Undispensed Trip Folder (${workProgramResult.approvedWithUndispensed.length})`,
+                  },
+                  {
+                    id: 'pending_approval',
+                    label: `Pending Approval Folder (${workProgramResult.pendingApproval.length})`,
+                  },
+                ] as const
+              ).map((tab) => (
+                <button
+                  key={tab.id}
+                  type="button"
+                  role="tab"
+                  aria-selected={activeFolderTab === tab.id}
+                  data-testid={`folder-tab-${tab.id}`}
+                  onClick={() => {
+                    setActiveFolderTab(tab.id);
+                    setSelectedPlanId(null);
+                  }}
+                  className={`inline-flex items-center gap-1.5 rounded-md px-3 py-2 text-xs font-semibold transition-colors whitespace-nowrap ${
+                    activeFolderTab === tab.id
+                      ? 'bg-[#0B192C] text-white'
+                      : 'bg-[#F3F5F8] text-[#334E73] hover:bg-[#E6EBF2]'
+                  }`}
+                >
+                  <Folder className="h-3.5 w-3.5 shrink-0" />
+                  <span>{tab.label}</span>
+                </button>
+              ))}
+            </div>
+
+            {workProgramResult.totalCount === 0 ? (
+              <div className="rounded-lg border border-[#D5DCE6] bg-white p-10 text-center space-y-3">
+                <FileText className="mx-auto h-9 w-9 text-[#5A6F8C]" />
+                <h2 className="font-display text-base font-bold text-[#0B192C]">
+                  No Work Program records match the selected filters
+                </h2>
+                <p className="text-sm text-[#5A6F8C] max-w-md mx-auto">
+                  Adjust the Month, Year, Work Plan, or Trip Ticket Status filter, or submit a new weekly work plan.
+                </p>
+                <div className="flex items-center justify-center gap-2">
+                  <button
+                    type="button"
+                    onClick={handleResetFilters}
+                    className="inline-flex items-center gap-1.5 rounded-md border border-[#D5DCE6] bg-[#F3F5F8] px-4 py-2 text-xs font-semibold text-[#0B192C] hover:bg-[#E6EBF2]"
+                  >
+                    <span>Reset Filters</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={onOpenModal}
+                    className="inline-flex items-center gap-1.5 rounded-md bg-[#0B192C] px-4 py-2 text-xs font-semibold text-white hover:bg-[#1B3B6F]"
+                  >
+                    <Plus className="h-4 w-4" />
+                    <span>Create Weekly Work Plan</span>
+                  </button>
                 </div>
+              </div>
+            ) : (
+              <div className="space-y-5">
+                {(activeFolderTab === 'all' || activeFolderTab === 'approved_dispensed') &&
+                  renderFolderTableSection({
+                    folderKey: 'approved_dispensed',
+                    title: 'Approved / Dispense Folder',
+                    subtitle: 'Approved work plans with all trip tickets fully dispensed at GSO',
+                    rows: workProgramResult.approvedDispensed,
+                    emptyMessage:
+                      'No fully dispensed work plans found for the selected filters.',
+                    icon: 'dispensed',
+                  })}
 
-                {categorizedPlans.pending.length === 0 ? (
-                  <div className="rounded-lg border border-[#D5DCE6] bg-white p-6 text-center text-xs text-[#5A6F8C]">
-                    No pending work plans match your current search.
-                  </div>
-                ) : (
-                  <div className="space-y-3">
-                    {categorizedPlans.pending.map(({ workPlan: wp, planTickets }) => {
-                      const isExpanded = expandedPlanId === wp.id;
-                      return (
-                        <div
-                          key={wp.id}
-                          className="rounded-lg border border-[#D5DCE6] bg-white overflow-hidden"
-                        >
-                          <div className="flex flex-col gap-3 p-4 lg:flex-row lg:items-center lg:justify-between">
-                            <div className="flex items-start gap-3 min-w-0">
-                              <button
-                                type="button"
-                                onClick={() => setExpandedPlanId(isExpanded ? null : wp.id)}
-                                aria-expanded={isExpanded}
-                                aria-label={`Toggle details for ${wp.controlNumber}`}
-                                className="mt-0.5 rounded border border-[#D5DCE6] p-1 text-[#334E73] hover:bg-[#F3F5F8] shrink-0"
-                              >
-                                {isExpanded ? (
-                                  <ChevronDown className="h-4 w-4" />
-                                ) : (
-                                  <ChevronRight className="h-4 w-4" />
-                                )}
-                              </button>
-                              <div className="min-w-0 space-y-1">
-                                <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs">
-                                  <span className="font-mono font-semibold text-[#1B3B6F] whitespace-nowrap">
-                                    {wp.controlNumber}
-                                  </span>
-                                  <span className="text-[#94A3B8]" aria-hidden="true">·</span>
-                                  <span className="font-medium text-[#334E73]">
-                                    {wp.department}
-                                  </span>
-                                  <span className="text-[#94A3B8]" aria-hidden="true">·</span>
-                                  <span className="font-mono text-[#5A6F8C] whitespace-nowrap">
-                                    {wp.weekStart} to {wp.weekEnd}
-                                  </span>
-                                </div>
-                                <h3 className="font-display text-sm sm:text-base font-bold text-[#0B192C]">
-                                  {wp.projectTitle}
-                                </h3>
-                                <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-[#5A6F8C]">
-                                  <span className="whitespace-nowrap">Project {wp.projectCode}</span>
-                                  <span aria-hidden="true">·</span>
-                                  <span className="whitespace-nowrap">{planTickets.length} Trip Ticket(s)</span>
-                                  <span aria-hidden="true">·</span>
-                                  <span>Prepared by {wp.preparedBy}</span>
-                                </div>
-                              </div>
-                            </div>
+                {(activeFolderTab === 'all' || activeFolderTab === 'approved_undispensed') &&
+                  renderFolderTableSection({
+                    folderKey: 'approved_undispensed',
+                    title: 'Approved with Undispensed Trip Folder',
+                    subtitle:
+                      'Approved work plans that still have pending or undispensed trip tickets',
+                    rows: workProgramResult.approvedWithUndispensed,
+                    emptyMessage:
+                      'No approved work plans with undispensed trip tickets found for the selected filters.',
+                    icon: 'undispensed',
+                  })}
 
-                            <div className="flex flex-wrap items-center gap-3 shrink-0 pl-8 lg:pl-0">
-                              <div className="border-r border-[#D5DCE6] pr-4 text-right">
-                                <div className="text-[11px] text-[#5A6F8C]">Requested</div>
-                                <div className="font-mono text-sm font-semibold tabular-nums text-[#0B192C]">
-                                  {wp.totalRequestedLiters.toFixed(1)} L
-                                </div>
-                              </div>
-
-                              <span className="text-[11px] font-bold uppercase tracking-wide whitespace-nowrap text-amber-800">
-                                Pending Approval
-                              </span>
-
-                              {canPdf && (
-                                <button
-                                  type="button"
-                                  onClick={() => onPreviewPdf(wp, planTickets)}
-                                  className="inline-flex items-center gap-1 rounded-md border border-[#D5DCE6] bg-[#F3F5F8] px-2.5 py-1.5 text-xs font-semibold text-[#0B192C] hover:bg-[#E6EBF2] whitespace-nowrap"
-                                >
-                                  <FileDown className="h-3.5 w-3.5" />
-                                  <span>PDF</span>
-                                </button>
-                              )}
-
-                              {(canEdit || canDelete) && (
-                                <div className="flex items-center gap-1">
-                                  {canEdit && (
-                                    <button
-                                      type="button"
-                                      onClick={() => {
-                                        setEditingPlan(wp);
-                                        setEditProjectTitle(wp.projectTitle);
-                                        setEditDivisionHead(wp.divisionHead ?? '');
-                                        setEditUnitLead(wp.unitLead ?? '');
-                                        setEditSectionManager(wp.sectionManager ?? '');
-                                      }}
-                                      aria-label={`Edit work plan ${wp.controlNumber}`}
-                                      className="rounded border border-[#D5DCE6] p-1.5 text-[#334E73] hover:bg-[#F3F5F8]"
-                                    >
-                                      <Edit3 className="h-3.5 w-3.5" />
-                                    </button>
-                                  )}
-                                  {canDelete && (
-                                    <button
-                                      type="button"
-                                      onClick={() => onDeleteWorkPlan(wp)}
-                                      aria-label={`Delete work plan ${wp.controlNumber}`}
-                                      className="rounded border border-[#D5DCE6] p-1.5 text-red-700 hover:bg-red-50"
-                                    >
-                                      <Trash2 className="h-3.5 w-3.5" />
-                                    </button>
-                                  )}
-                                </div>
-                              )}
-                            </div>
-                          </div>
-
-                          {isExpanded && (
-                            <div className="border-t border-[#D5DCE6] bg-[#F9FAFC] p-4 space-y-4">
-                              <div className="overflow-x-auto rounded-md border border-[#D5DCE6] bg-white">
-                                <table className="w-full text-left text-xs">
-                                  <thead className="border-b border-[#D5DCE6] bg-[#F3F5F8] text-[#334E73]">
-                                    <tr>
-                                      <th className="px-3 py-2.5 font-semibold">Ticket #</th>
-                                      <th className="px-3 py-2.5 font-semibold">Vehicle / Equipment</th>
-                                      <th className="px-3 py-2.5 font-semibold">Assigned Driver</th>
-                                      <th className="px-3 py-2.5 font-semibold">Purpose / Project & Destination</th>
-                                      <th className="px-3 py-2.5 font-semibold text-right">Auto Limit</th>
-                                      <th className="px-3 py-2.5 font-semibold text-right">Requested</th>
-                                      <th className="px-3 py-2.5 font-semibold">Status</th>
-                                    </tr>
-                                  </thead>
-                                  <tbody className="divide-y divide-[#E6EBF2]">
-                                    {planTickets.map((t) => (
-                                      <tr key={t.id} className="hover:bg-[#F9FAFC]">
-                                        <td className="px-3 py-2.5 font-mono font-semibold text-[#0B192C] whitespace-nowrap">
-                                          {t.ticketNumber}
-                                        </td>
-                                        <td className="px-3 py-2.5">
-                                          <div className="font-mono font-semibold text-[#0B192C]">
-                                            {t.plateNumber}
-                                          </div>
-                                          <div className="text-[11px] text-[#5A6F8C]">
-                                            {t.vehicleLabel} · {t.fuelType.toUpperCase()}
-                                          </div>
-                                        </td>
-                                        <td className="px-3 py-2.5">
-                                          <div className="font-medium text-[#0B192C]">{t.driverName}</div>
-                                          {t.driverLicense && (
-                                            <div className="font-mono text-[11px] text-[#5A6F8C]">
-                                              Lic: {t.driverLicense}
-                                            </div>
-                                          )}
-                                        </td>
-                                        <td className="px-3 py-2.5">
-                                          <div className="font-medium text-[#0B192C]">
-                                            {t.purposeOrProject || t.projectTitle}
-                                          </div>
-                                          <div className="text-[11px] text-[#5A6F8C]">
-                                            {t.scheduledDate} · {t.destination}
-                                          </div>
-                                        </td>
-                                        <td className="px-3 py-2.5 text-right font-mono tabular-nums text-[#5A6F8C]">
-                                          {t.computedLimitLiters.toFixed(1)} L
-                                        </td>
-                                        <td className="px-3 py-2.5 text-right font-mono tabular-nums font-medium text-[#0B192C]">
-                                          {t.requestedLiters.toFixed(1)} L
-                                        </td>
-                                        <td className="px-3 py-2.5 whitespace-nowrap font-medium text-amber-800">
-                                          Pending Approval
-                                        </td>
-                                      </tr>
-                                    ))}
-                                  </tbody>
-                                </table>
-                              </div>
-
-                              <div className="grid grid-cols-1 gap-3 sm:grid-cols-3 rounded-md border border-[#D5DCE6] bg-white p-3 text-xs">
-                                <div>
-                                  <div className="text-[11px] text-[#5A6F8C]">Prepared by</div>
-                                  <div className="font-semibold text-[#0B192C]">{wp.preparedBy}</div>
-                                  {wp.preparedByDesignation && (
-                                    <div className="text-[11px] text-[#5A6F8C]">{wp.preparedByDesignation}</div>
-                                  )}
-                                </div>
-                                <div>
-                                  <div className="text-[11px] text-[#5A6F8C]">Reviewed by</div>
-                                  <div className="font-semibold text-[#0B192C]">{wp.reviewedBy}</div>
-                                  {wp.reviewedByDesignation && (
-                                    <div className="text-[11px] text-[#5A6F8C]">{wp.reviewedByDesignation}</div>
-                                  )}
-                                </div>
-                                <div>
-                                  <div className="text-[11px] text-[#5A6F8C]">Designated Approver</div>
-                                  <div className="font-semibold text-[#0B192C]">{wp.approvedBy}</div>
-                                  {wp.approvedByDesignation && (
-                                    <div className="text-[11px] text-[#5A6F8C]">{wp.approvedByDesignation}</div>
-                                  )}
-                                </div>
-                              </div>
-                            </div>
-                          )}
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-              </section>
-            )}
-
-            {/* Category 2: Approved Work Plans */}
-            {(statusFilter === 'all' || statusFilter === 'approved') && (
-              <section aria-label="Approved Department Requests" className="space-y-3">
-                <div className="flex items-center justify-between border-b border-[#D5DCE6] pb-2">
-                  <div className="flex items-center gap-2">
-                    <h2 className="font-display text-sm font-bold text-[#0B192C]">
-                      Approved Requests
-                    </h2>
-                    <span className="rounded bg-[#E6EBF2] px-2 py-0.5 font-mono text-xs font-semibold text-[#1B3B6F]">
-                      {categorizedPlans.approved.length}
-                    </span>
-                  </div>
-                  <span className="text-xs text-[#5A6F8C]">
-                    Includes authorized approver allocation and actual GSO fuel dispensed
-                  </span>
-                </div>
-
-                {categorizedPlans.approved.length === 0 ? (
-                  <div className="rounded-lg border border-[#D5DCE6] bg-white p-6 text-center text-xs text-[#5A6F8C]">
-                    No approved work plans match your current search.
-                  </div>
-                ) : (
-                  <div className="space-y-3">
-                    {categorizedPlans.approved.map((summary) => {
-                      const { workPlan: wp, planTickets } = summary;
-                      const isExpanded = expandedPlanId === wp.id;
-
-                      return (
-                        <div
-                          key={wp.id}
-                          className={`rounded-lg border bg-white overflow-hidden ${
-                            summary.hasUndispensedApproved
-                              ? 'border-red-300'
-                              : 'border-[#D5DCE6]'
-                          }`}
-                        >
-                          {/* Red Header Note for Undispensed Approved Fuel Requests */}
-                          {summary.hasUndispensedApproved && (
-                            <div
-                              role="status"
-                              className="flex flex-wrap items-center justify-between gap-2 border-b border-red-200 bg-red-50 px-4 py-2 text-xs font-semibold text-red-700"
-                            >
-                              <span className="flex items-center gap-1.5">
-                                <AlertCircle className="h-3.5 w-3.5 shrink-0 text-red-700" />
-                                <span>
-                                  UNDISPENSED APPROVED FUEL REQUEST —{' '}
-                                  {summary.undispensedApprovedLiters.toFixed(1)} L approved by{' '}
-                                  {wp.approvedBy || 'Authorized Approver'} across{' '}
-                                  {summary.undispensedTicketCount} ticket(s), awaiting GSO dispensing
-                                </span>
-                              </span>
-                              <span className="font-mono text-[11px] uppercase tracking-wide text-red-800 whitespace-nowrap">
-                                Undispensed
-                              </span>
-                            </div>
-                          )}
-
-                          {/* Approved Work Plan Summary Row */}
-                          <div className="flex flex-col gap-3 p-4 lg:flex-row lg:items-center lg:justify-between">
-                            <div className="flex items-start gap-3 min-w-0">
-                              <button
-                                type="button"
-                                onClick={() => setExpandedPlanId(isExpanded ? null : wp.id)}
-                                aria-expanded={isExpanded}
-                                aria-label={`Toggle details for ${wp.controlNumber}`}
-                                className="mt-0.5 rounded border border-[#D5DCE6] p-1 text-[#334E73] hover:bg-[#F3F5F8] shrink-0"
-                              >
-                                {isExpanded ? (
-                                  <ChevronDown className="h-4 w-4" />
-                                ) : (
-                                  <ChevronRight className="h-4 w-4" />
-                                )}
-                              </button>
-                              <div className="min-w-0 space-y-1">
-                                <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs">
-                                  <span className="font-mono font-semibold text-[#1B3B6F] whitespace-nowrap">
-                                    {wp.controlNumber}
-                                  </span>
-                                  <span className="text-[#94A3B8]" aria-hidden="true">·</span>
-                                  <span className="font-medium text-[#334E73]">
-                                    {wp.department}
-                                  </span>
-                                  <span className="text-[#94A3B8]" aria-hidden="true">·</span>
-                                  <span className="font-mono text-[#5A6F8C] whitespace-nowrap">
-                                    {wp.weekStart} to {wp.weekEnd}
-                                  </span>
-                                </div>
-                                <h3 className="font-display text-sm sm:text-base font-bold text-[#0B192C]">
-                                  {wp.projectTitle}
-                                </h3>
-                                <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-[#5A6F8C]">
-                                  <span className="whitespace-nowrap">Project {wp.projectCode}</span>
-                                  <span aria-hidden="true">·</span>
-                                  <span className="whitespace-nowrap">{planTickets.length} Trip Ticket(s)</span>
-                                  <span aria-hidden="true">·</span>
-                                  <span className="font-medium text-[#1B3B6F]">
-                                    Approved by {wp.approvedBy || 'Authorized Approver'}:{' '}
-                                    {summary.approvedLiters.toFixed(1)} L
-                                  </span>
-                                </div>
-                              </div>
-                            </div>
-
-                            {/* Right Metrics & Actions */}
-                            <div className="flex flex-wrap items-center gap-3 shrink-0 pl-8 lg:pl-0">
-                              <div className="grid grid-cols-3 gap-4 border-r border-[#D5DCE6] pr-4 text-right">
-                                <div>
-                                  <div className="text-[11px] text-[#5A6F8C]">Requested</div>
-                                  <div className="font-mono text-sm font-semibold tabular-nums text-[#0B192C]">
-                                    {wp.totalRequestedLiters.toFixed(1)} L
-                                  </div>
-                                </div>
-                                <div>
-                                  <div className="text-[11px] text-[#5A6F8C]">Approved (Approver)</div>
-                                  <div className="font-mono text-sm font-semibold tabular-nums text-[#1B3B6F]">
-                                    {summary.approvedLiters.toFixed(1)} L
-                                  </div>
-                                </div>
-                                <div>
-                                  <div className="text-[11px] text-[#5A6F8C]">Actual Dispensed</div>
-                                  <div
-                                    className={`font-mono text-sm font-semibold tabular-nums ${
-                                      summary.dispensedLiters > 0
-                                        ? 'text-emerald-800'
-                                        : 'text-red-700'
-                                    }`}
-                                  >
-                                    {summary.dispensedLiters.toFixed(1)} L
-                                  </div>
-                                </div>
-                              </div>
-
-                              <span
-                                className={`text-[11px] font-bold uppercase tracking-wide whitespace-nowrap ${
-                                  wp.status === 'partially_approved'
-                                    ? 'text-[#1B3B6F]'
-                                    : 'text-emerald-800'
-                                }`}
-                              >
-                                {wp.status.replace(/_/g, ' ')}
-                              </span>
-
-                              {canPdf && (
-                                <button
-                                  type="button"
-                                  onClick={() => onPreviewPdf(wp, planTickets)}
-                                  className="inline-flex items-center gap-1 rounded-md border border-[#D5DCE6] bg-[#F3F5F8] px-2.5 py-1.5 text-xs font-semibold text-[#0B192C] hover:bg-[#E6EBF2] whitespace-nowrap"
-                                >
-                                  <FileDown className="h-3.5 w-3.5" />
-                                  <span>PDF</span>
-                                </button>
-                              )}
-
-                              {(canEdit || canDelete) && (
-                                <div className="flex items-center gap-1">
-                                  {canEdit && (
-                                    <button
-                                      type="button"
-                                      onClick={() => {
-                                        setEditingPlan(wp);
-                                        setEditProjectTitle(wp.projectTitle);
-                                        setEditDivisionHead(wp.divisionHead ?? '');
-                                        setEditUnitLead(wp.unitLead ?? '');
-                                        setEditSectionManager(wp.sectionManager ?? '');
-                                      }}
-                                      aria-label={`Edit work plan ${wp.controlNumber}`}
-                                      className="rounded border border-[#D5DCE6] p-1.5 text-[#334E73] hover:bg-[#F3F5F8]"
-                                    >
-                                      <Edit3 className="h-3.5 w-3.5" />
-                                    </button>
-                                  )}
-                                  {canDelete && (
-                                    <button
-                                      type="button"
-                                      onClick={() => onDeleteWorkPlan(wp)}
-                                      aria-label={`Delete work plan ${wp.controlNumber}`}
-                                      className="rounded border border-[#D5DCE6] p-1.5 text-red-700 hover:bg-red-50"
-                                    >
-                                      <Trash2 className="h-3.5 w-3.5" />
-                                    </button>
-                                  )}
-                                </div>
-                              )}
-                            </div>
-                          </div>
-
-                          {/* Expanded Approved Trip Tickets Matrix */}
-                          {isExpanded && (
-                            <div className="border-t border-[#D5DCE6] bg-[#F9FAFC] p-4 space-y-4">
-                              <div className="overflow-x-auto rounded-md border border-[#D5DCE6] bg-white">
-                                <table className="w-full text-left text-xs">
-                                  <thead className="border-b border-[#D5DCE6] bg-[#F3F5F8] text-[#334E73]">
-                                    <tr>
-                                      <th className="px-3 py-2.5 font-semibold">Ticket #</th>
-                                      <th className="px-3 py-2.5 font-semibold">Vehicle / Equipment</th>
-                                      <th className="px-3 py-2.5 font-semibold">Assigned Driver</th>
-                                      <th className="px-3 py-2.5 font-semibold">Purpose / Project & Destination</th>
-                                      <th className="px-3 py-2.5 font-semibold text-right">Requested</th>
-                                      <th className="px-3 py-2.5 font-semibold text-right">Approved (Approver)</th>
-                                      <th className="px-3 py-2.5 font-semibold text-right">Actual Fuel Dispensed</th>
-                                      <th className="px-3 py-2.5 font-semibold">Ticket State</th>
-                                    </tr>
-                                  </thead>
-                                  <tbody className="divide-y divide-[#E6EBF2]">
-                                    {planTickets.map((t) => {
-                                      const isUndispensedApproved =
-                                        !t.servedOnce &&
-                                        (t.status === 'approved' || t.status === 'reduced') &&
-                                        t.approvedLiters > 0;
-                                      return (
-                                        <tr
-                                          key={t.id}
-                                          className={
-                                            isUndispensedApproved
-                                              ? 'bg-red-50/40 hover:bg-red-50/70'
-                                              : 'hover:bg-[#F9FAFC]'
-                                          }
-                                        >
-                                          <td className="px-3 py-2.5 font-mono font-semibold text-[#0B192C] whitespace-nowrap">
-                                            {t.ticketNumber}
-                                          </td>
-                                          <td className="px-3 py-2.5">
-                                            <div className="font-mono font-semibold text-[#0B192C]">
-                                              {t.plateNumber}
-                                            </div>
-                                            <div className="text-[11px] text-[#5A6F8C]">
-                                              {t.vehicleLabel} · {t.fuelType.toUpperCase()}
-                                            </div>
-                                          </td>
-                                          <td className="px-3 py-2.5">
-                                            <div className="font-medium text-[#0B192C]">{t.driverName}</div>
-                                            {t.driverLicense && (
-                                              <div className="font-mono text-[11px] text-[#5A6F8C]">
-                                                Lic: {t.driverLicense}
-                                              </div>
-                                            )}
-                                          </td>
-                                          <td className="px-3 py-2.5">
-                                            <div className="font-medium text-[#0B192C]">
-                                              {t.purposeOrProject || t.projectTitle}
-                                            </div>
-                                            <div className="text-[11px] text-[#5A6F8C]">
-                                              {t.scheduledDate} · {t.destination}
-                                            </div>
-                                          </td>
-                                          <td className="px-3 py-2.5 text-right font-mono tabular-nums font-medium text-[#0B192C]">
-                                            {t.requestedLiters.toFixed(1)} L
-                                          </td>
-                                          <td className="px-3 py-2.5 text-right font-mono tabular-nums font-semibold text-[#1B3B6F]">
-                                            <div>{t.approvedLiters.toFixed(1)} L</div>
-                                            {t.status === 'reduced' && (
-                                              <div className="text-[10px] font-normal text-[#5A6F8C]">
-                                                Tabletop reduced
-                                              </div>
-                                            )}
-                                          </td>
-                                          <td className="px-3 py-2.5 text-right font-mono tabular-nums font-semibold">
-                                            {t.servedOnce ? (
-                                              <div className="text-emerald-800">
-                                                <div>{t.dispensedLiters.toFixed(1)} L</div>
-                                                {t.dispensedBy && (
-                                                  <div className="text-[10px] font-sans font-normal text-[#5A6F8C]">
-                                                    By {t.dispensedBy}
-                                                  </div>
-                                                )}
-                                                {t.forfeitedLiters > 0 && (
-                                                  <div className="text-[10px] text-red-700">
-                                                    -{t.forfeitedLiters.toFixed(1)} L void
-                                                  </div>
-                                                )}
-                                              </div>
-                                            ) : isUndispensedApproved ? (
-                                              <span className="text-red-700">
-                                                0.0 L (Undispensed)
-                                              </span>
-                                            ) : (
-                                              <span className="text-[#5A6F8C]">
-                                                {t.dispensedLiters.toFixed(1)} L
-                                              </span>
-                                            )}
-                                          </td>
-                                          <td className="px-3 py-2.5 whitespace-nowrap">
-                                            {isUndispensedApproved ? (
-                                              <span className="font-semibold text-red-700">
-                                                Undispensed · Approved
-                                              </span>
-                                            ) : (
-                                              <span className="font-medium text-emerald-800 capitalize">
-                                                {t.status}
-                                              </span>
-                                            )}
-                                          </td>
-                                        </tr>
-                                      );
-                                    })}
-                                  </tbody>
-                                </table>
-                              </div>
-
-                              <div className="grid grid-cols-1 gap-3 sm:grid-cols-3 rounded-md border border-[#D5DCE6] bg-white p-3 text-xs">
-                                <div>
-                                  <div className="text-[11px] text-[#5A6F8C]">Prepared by</div>
-                                  <div className="font-semibold text-[#0B192C]">{wp.preparedBy}</div>
-                                  {wp.preparedByDesignation && (
-                                    <div className="text-[11px] text-[#5A6F8C]">{wp.preparedByDesignation}</div>
-                                  )}
-                                </div>
-                                <div>
-                                  <div className="text-[11px] text-[#5A6F8C]">Reviewed by</div>
-                                  <div className="font-semibold text-[#0B192C]">{wp.reviewedBy}</div>
-                                  {wp.reviewedByDesignation && (
-                                    <div className="text-[11px] text-[#5A6F8C]">{wp.reviewedByDesignation}</div>
-                                  )}
-                                </div>
-                                <div>
-                                  <div className="text-[11px] text-[#5A6F8C]">Approved by (Authorized Approver)</div>
-                                  <div className="font-semibold text-[#0B192C]">{wp.approvedBy}</div>
-                                  {wp.approvedByDesignation && (
-                                    <div className="text-[11px] text-[#5A6F8C]">{wp.approvedByDesignation}</div>
-                                  )}
-                                </div>
-                              </div>
-                            </div>
-                          )}
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-              </section>
+                {(activeFolderTab === 'all' || activeFolderTab === 'pending_approval') &&
+                  renderFolderTableSection({
+                    folderKey: 'pending_approval',
+                    title: 'Pending Approval Folder',
+                    subtitle: 'Submitted work plans awaiting authorized tabletop assessment',
+                    rows: workProgramResult.pendingApproval,
+                    emptyMessage:
+                      'No pending approval work plans found for the selected filters.',
+                    icon: 'pending',
+                  })}
+              </div>
             )}
           </div>
         )}
@@ -1294,29 +1599,54 @@ export function WorkPlansView({
                 <h3 className="font-display text-sm font-bold text-[#0B192C] border-b border-[#E6EBF2] pb-1.5">
                   01. Department & Infrastructure Project Coverage
                 </h3>
-                <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4 items-end">
                   <div>
                     <label htmlFor="wp-dept" className="block text-xs font-semibold text-[#334E73] mb-1">
-                      Concerned Office / Department *
+                      Concerned Office / Dept *
                     </label>
                     <input
                       id="wp-dept"
                       type="text"
-                      list="wp-dept-list"
+                      list={isDepartmentLocked ? undefined : 'wp-dept-list'}
+                      readOnly={isDepartmentLocked}
                       required
-                      value={department}
-                      onChange={(e) => setDepartment(e.target.value)}
-                      className="w-full rounded-md border border-[#D5DCE6] bg-white px-3 py-2 text-xs text-[#0B192C]"
+                      value={isDepartmentLocked ? currentUser.department : department}
+                      onChange={(e) => {
+                        if (!isDepartmentLocked) setDepartment(e.target.value);
+                      }}
+                      className={`w-full rounded-md border border-[#D5DCE6] px-3 py-2 text-xs text-[#0B192C] ${
+                        isDepartmentLocked ? 'bg-[#F3F5F8] font-medium' : 'bg-white'
+                      }`}
                     />
-                    <datalist id="wp-dept-list">
-                      {BAIS_DEPARTMENTS.map((d) => (
-                        <option key={d} value={d} />
+                    {!isDepartmentLocked && (
+                      <datalist id="wp-dept-list">
+                        {BAIS_DEPARTMENTS.map((d) => (
+                          <option key={d} value={d} />
+                        ))}
+                      </datalist>
+                    )}
+                  </div>
+                  <div>
+                    <label htmlFor="wp-program-year" className="block text-xs font-semibold text-[#334E73] mb-1">
+                      Program Year *
+                    </label>
+                    <select
+                      id="wp-program-year"
+                      required
+                      value={requestYear}
+                      onChange={(e) => handleRequestYearChange(e.target.value)}
+                      className="w-full rounded-md border border-[#D5DCE6] bg-white px-3 py-2 font-mono text-xs font-semibold text-[#0B192C] focus:border-[#1B3B6F] focus:outline-none"
+                    >
+                      {yearOptions.map((yr) => (
+                        <option key={yr} value={yr}>
+                          {yr}
+                        </option>
                       ))}
-                    </datalist>
+                    </select>
                   </div>
                   <div>
                     <label htmlFor="wp-ctrl" className="block text-xs font-semibold text-[#334E73] mb-1">
-                      Pre-Assigned Sequential Work Plan No.
+                      Work Plan No. (Auto)
                     </label>
                     <input
                       id="wp-ctrl"
@@ -1334,7 +1664,7 @@ export function WorkPlansView({
                       id="wp-proj-code"
                       type="text"
                       required
-                      placeholder="e.g. INFRA-2026-022"
+                      placeholder={`e.g. INFRA-${requestYear}-022`}
                       value={projectCode}
                       onChange={(e) => setProjectCode(e.target.value)}
                       className="w-full rounded-md border border-[#D5DCE6] px-3 py-2 font-mono text-xs text-[#0B192C]"
@@ -1352,7 +1682,7 @@ export function WorkPlansView({
                       type="date"
                       required
                       value={weekStart}
-                      onChange={(e) => setWeekStart(e.target.value)}
+                      onChange={(e) => handleWeekStartChange(e.target.value)}
                       className="w-full rounded-md border border-[#D5DCE6] px-3 py-2 font-mono text-xs text-[#0B192C]"
                     />
                   </div>

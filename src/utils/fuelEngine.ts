@@ -8,7 +8,9 @@ import {
   FuelDepot,
   FuelType,
   InventoryLog,
+  NavSection,
   TripTicket,
+  TripTicketStatus,
   UserAccount,
   UserRole,
   WorkPlan,
@@ -432,15 +434,101 @@ export function buildDailyReconciliationReport(params: {
 export function generateNextWorkPlanNumber(existingPlans: WorkPlan[], year = new Date().getFullYear()): string {
   const prefix = `WP-${year}-`;
   let maxSeq = 0;
+  let plansInYearCount = 0;
   for (const plan of existingPlans) {
-    const match = plan.controlNumber.match(/(\d+)$/);
-    if (match && plan.controlNumber.startsWith(prefix)) {
-      const seq = Number(match[1]);
-      if (Number.isFinite(seq) && seq > maxSeq) maxSeq = seq;
+    if (plan.controlNumber.startsWith(prefix)) {
+      plansInYearCount += 1;
+      const match = plan.controlNumber.match(/(\d+)$/);
+      if (match) {
+        const seq = Number(match[1]);
+        if (Number.isFinite(seq) && seq > maxSeq) maxSeq = seq;
+      }
     }
   }
-  const next = Math.max(maxSeq, existingPlans.length) + 1;
+  const next = Math.max(maxSeq, plansInYearCount) + 1;
   return `${prefix}${String(next).padStart(4, '0')}`;
+}
+
+export function getDynamicProgressiveYearOptions(params?: {
+  workPlans?: Array<Pick<WorkPlan, 'controlNumber' | 'weekStart' | 'createdAt'>>;
+  tickets?: Array<Pick<TripTicket, 'scheduledDate' | 'createdAt'>>;
+  referenceYear?: number;
+  yearsAhead?: number;
+  extraYears?: Array<string | number>;
+  order?: 'asc' | 'desc';
+}): string[] {
+  const currentYear = params?.referenceYear ?? new Date().getFullYear();
+  const safeAhead = Math.max(1, Math.min(20, params?.yearsAhead ?? 5));
+  const yearSet = new Set<number>([currentYear]);
+
+  const tryAddYear = (raw?: string | number | null) => {
+    if (raw === undefined || raw === null) return;
+    const str = String(raw).trim();
+    if (/^\d{4}$/.test(str)) {
+      const y = Number(str);
+      if (y >= 2000 && y <= 2100) yearSet.add(y);
+    }
+  };
+
+  for (const wp of params?.workPlans ?? []) {
+    const wpCodeMatch = wp.controlNumber?.match(/^WP-(\d{4})-/);
+    if (wpCodeMatch) tryAddYear(wpCodeMatch[1]);
+    if (wp.weekStart) tryAddYear(wp.weekStart.slice(0, 4));
+    if (wp.createdAt) tryAddYear(wp.createdAt.slice(0, 4));
+  }
+
+  for (const t of params?.tickets ?? []) {
+    if (t.scheduledDate) tryAddYear(t.scheduledDate.slice(0, 4));
+    if (t.createdAt) tryAddYear(t.createdAt.slice(0, 4));
+  }
+
+  for (const extra of params?.extraYears ?? []) {
+    tryAddYear(extra);
+  }
+
+  let maxYear = currentYear;
+  for (const y of yearSet) {
+    if (y > maxYear) maxYear = y;
+  }
+
+  for (let y = currentYear; y <= maxYear + safeAhead; y++) {
+    yearSet.add(y);
+  }
+
+  const sorted = Array.from(yearSet).sort((a, b) =>
+    params?.order === 'desc' ? b - a : a - b
+  );
+  return sorted.map((y) => String(y));
+}
+
+export function shiftIsoDateToYear(isoDate: string, targetYear: string | number): string {
+  const yrStr = String(targetYear).trim();
+  if (!/^\d{4}$/.test(yrStr)) return isoDate;
+  const match = isoDate.trim().match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return `${yrStr}-01-01`;
+
+  const yearNum = Number(yrStr);
+  const monthNum = Number(match[2]);
+  const dayNum = Number(match[3]);
+  const maxDaysInMonth = new Date(Date.UTC(yearNum, monthNum, 0)).getUTCDate();
+  const clampedDay = Math.min(Math.max(1, dayNum), maxDaysInMonth);
+  return `${yrStr}-${String(monthNum).padStart(2, '0')}-${String(clampedDay).padStart(2, '0')}`;
+}
+
+export function addDaysIso(isoDate: string, days: number): string {
+  const match = isoDate.trim().match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return isoDate;
+  const dt = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]) + days));
+  return dt.toISOString().slice(0, 10);
+}
+
+export function replaceYearInProjectCode(code: string, targetYear: string | number): string {
+  const yrStr = String(targetYear).trim();
+  if (!/^\d{4}$/.test(yrStr)) return code;
+  if (/^([A-Za-z0-9]+-)\d{4}(-.*)?$/.test(code)) {
+    return code.replace(/^([A-Za-z0-9]+-)\d{4}(-.*)?$/, `$1${yrStr}$2`);
+  }
+  return code;
 }
 
 export function generateNextTripTicketNumbers(existingTickets: TripTicket[], count: number): string[] {
@@ -558,8 +646,54 @@ export function hashPassword(plain: string): string {
 }
 
 // RBAC Permission Helpers
+const ALL_NAV_SECTIONS: NavSection[] = [
+  'dashboard',
+  'fleet',
+  'work_plans',
+  'approvals',
+  'dispensing',
+  'inventory',
+  'users',
+  'reports',
+  'audit',
+];
+
+export function getAllowedNavSections(role: UserRole): NavSection[] {
+  switch (role) {
+    case 'admin':
+      return [...ALL_NAV_SECTIONS];
+    case 'department_head':
+    case 'requester':
+      return ['work_plans'];
+    case 'gso_head':
+    case 'gso_dispenser':
+      return ['dispensing', 'inventory'];
+    case 'approver':
+      return ['approvals'];
+    case 'auditor':
+      return ['dashboard'];
+    default:
+      return ['work_plans'];
+  }
+}
+
+export function canAccessNavSection(role: UserRole, section: NavSection): boolean {
+  return getAllowedNavSections(role).includes(section);
+}
+
+export function getDefaultNavSection(role: UserRole): NavSection {
+  const allowed = getAllowedNavSections(role);
+  return allowed[0] ?? 'work_plans';
+}
+
 export function hasCityWideAccess(role: UserRole): boolean {
-  return role === 'admin' || role === 'approver' || role === 'gso_dispenser' || role === 'auditor';
+  return (
+    role === 'admin' ||
+    role === 'approver' ||
+    role === 'gso_head' ||
+    role === 'gso_dispenser' ||
+    role === 'auditor'
+  );
 }
 
 export function canAccessDepartmentRecord(
@@ -595,6 +729,12 @@ export function canUserDeleteRecords(user: Pick<UserAccount, 'role' | 'canDelete
   return user.role === 'admin' || user.canDelete === true;
 }
 
+export function canUserSwitchToLive(
+  user: Pick<UserAccount, 'role' | 'canSwitchToLive'>
+): boolean {
+  return user.role === 'admin' || user.canSwitchToLive === true;
+}
+
 export function canPreviewAndDownloadPdf(role: UserRole): boolean {
   return role === 'admin' || role === 'approver' || role === 'auditor' || role === 'department_head' || role === 'requester';
 }
@@ -604,12 +744,13 @@ export function canPerformTabletopApproval(role: UserRole): boolean {
 }
 
 export function canDispenseAtGso(role: UserRole): boolean {
-  return role === 'admin' || role === 'gso_dispenser';
+  return role === 'admin' || role === 'gso_head' || role === 'gso_dispenser';
 }
 
 export function canPreviewDispensingFullRecord(role: UserRole): boolean {
   return (
     role === 'admin' ||
+    role === 'gso_head' ||
     role === 'gso_dispenser' ||
     role === 'approver' ||
     role === 'auditor'
@@ -619,6 +760,7 @@ export function canPreviewDispensingFullRecord(role: UserRole): boolean {
 export function canExportDispensingRecords(role: UserRole): boolean {
   return (
     role === 'admin' ||
+    role === 'gso_head' ||
     role === 'gso_dispenser' ||
     role === 'approver' ||
     role === 'auditor'
@@ -746,6 +888,255 @@ export function categorizeDepartmentWorkPlans(
   return { pending, approved };
 }
 
+export type WorkProgramFolderKey =
+  | 'approved_dispensed'
+  | 'pending_approval'
+  | 'approved_undispensed';
+
+export interface WorkProgramFilterCriteria {
+  searchQuery?: string;
+  ticketStatus?: TripTicketStatus | 'all';
+  workPlanId?: string;
+  month: string;
+  year: string;
+}
+
+export interface WorkProgramRowSummary {
+  workPlan: WorkPlan;
+  planTickets: TripTicket[];
+  folder: WorkProgramFolderKey;
+  ticketsApprovedCount: number;
+  ticketsDispensedCount: number;
+  pendingTicketCount: number;
+  undispensedTicketCount: number;
+  undispensedApprovedLiters: number;
+  hasUndispensedApproved: boolean;
+  totalDieselApproved: number;
+  totalDieselDispensed: number;
+  totalGasApproved: number;
+  totalGasDispensed: number;
+}
+
+export interface WorkProgramFilterValidation {
+  valid: boolean;
+  missingFields: Array<'month' | 'year'>;
+  error?: string;
+}
+
+export function validateWorkProgramMandatoryFilters(criteria: {
+  month?: string;
+  year?: string;
+}): WorkProgramFilterValidation {
+  const missingFields: Array<'month' | 'year'> = [];
+  if (!criteria.month || !/^(0[1-9]|1[0-2])$/.test(criteria.month.trim())) {
+    missingFields.push('month');
+  }
+  if (!criteria.year || !/^\d{4}$/.test(criteria.year.trim())) {
+    missingFields.push('year');
+  }
+
+  if (missingFields.length === 0) {
+    return { valid: true, missingFields: [] };
+  }
+
+  const label =
+    missingFields.length === 2
+      ? 'Month and Year'
+      : missingFields[0] === 'month'
+        ? 'Month'
+        : 'Year';
+
+  return {
+    valid: false,
+    missingFields,
+    error: `${label} ${missingFields.length === 2 ? 'are' : 'is'} mandatory to preview Work Program records.`,
+  };
+}
+
+export function summarizeWorkProgramRow(
+  wp: WorkPlan,
+  planTickets: TripTicket[]
+): WorkProgramRowSummary | null {
+  let ticketsApprovedCount = 0;
+  let ticketsDispensedCount = 0;
+  let pendingTicketCount = 0;
+  let undispensedTicketCount = 0;
+  let undispensedApprovedLiters = 0;
+  let totalDieselApproved = 0;
+  let totalDieselDispensed = 0;
+  let totalGasApproved = 0;
+  let totalGasDispensed = 0;
+
+  for (const t of planTickets) {
+    const isApprovedTicket =
+      t.approvedLiters > 0 ||
+      t.status === 'approved' ||
+      t.status === 'reduced' ||
+      t.status === 'dispensed' ||
+      t.status === 'forfeited';
+    if (isApprovedTicket) {
+      ticketsApprovedCount += 1;
+    }
+
+    const isDispensedTicket = t.status === 'dispensed' || (t.servedOnce && t.dispensedLiters > 0);
+    if (isDispensedTicket) {
+      ticketsDispensedCount += 1;
+    }
+
+    if (t.status === 'pending') {
+      pendingTicketCount += 1;
+    }
+
+    const isUndispensedApproved =
+      !t.servedOnce &&
+      (t.status === 'approved' || t.status === 'reduced') &&
+      t.approvedLiters > 0;
+    if (isUndispensedApproved) {
+      undispensedTicketCount += 1;
+      undispensedApprovedLiters += t.approvedLiters;
+    }
+
+    if (t.fuelType === 'diesel') {
+      totalDieselApproved += t.approvedLiters;
+      totalDieselDispensed += t.dispensedLiters;
+    } else {
+      totalGasApproved += t.approvedLiters;
+      totalGasDispensed += t.dispensedLiters;
+    }
+  }
+
+  let folder: WorkProgramFolderKey | null = null;
+  if (wp.status === 'pending_approval') {
+    folder = 'pending_approval';
+  } else if (
+    wp.status === 'approved' ||
+    wp.status === 'partially_approved' ||
+    wp.status === 'completed'
+  ) {
+    if (undispensedTicketCount > 0 || pendingTicketCount > 0) {
+      folder = 'approved_undispensed';
+    } else {
+      folder = 'approved_dispensed';
+    }
+  }
+
+  if (!folder) return null;
+
+  const round1 = (val: number) => Math.round(val * 10) / 10;
+
+  return {
+    workPlan: wp,
+    planTickets,
+    folder,
+    ticketsApprovedCount,
+    ticketsDispensedCount,
+    pendingTicketCount,
+    undispensedTicketCount,
+    undispensedApprovedLiters: round1(undispensedApprovedLiters),
+    hasUndispensedApproved: undispensedTicketCount > 0,
+    totalDieselApproved: round1(totalDieselApproved),
+    totalDieselDispensed: round1(totalDieselDispensed),
+    totalGasApproved: round1(totalGasApproved),
+    totalGasDispensed: round1(totalGasDispensed),
+  };
+}
+
+export function filterAndCategorizeWorkPrograms(
+  workPlans: WorkPlan[],
+  tickets: TripTicket[],
+  criteria: WorkProgramFilterCriteria
+): {
+  valid: boolean;
+  validationError?: string;
+  missingFields: Array<'month' | 'year'>;
+  approvedDispensed: WorkProgramRowSummary[];
+  pendingApproval: WorkProgramRowSummary[];
+  approvedWithUndispensed: WorkProgramRowSummary[];
+  totalCount: number;
+} {
+  const validation = validateWorkProgramMandatoryFilters(criteria);
+  if (!validation.valid) {
+    return {
+      valid: false,
+      validationError: validation.error,
+      missingFields: validation.missingFields,
+      approvedDispensed: [],
+      pendingApproval: [],
+      approvedWithUndispensed: [],
+      totalCount: 0,
+    };
+  }
+
+  const q = (criteria.searchQuery ?? '').trim().toLowerCase();
+  const wpFilter = criteria.workPlanId && criteria.workPlanId !== 'all' ? criteria.workPlanId : '';
+  const ticketStatusFilter =
+    criteria.ticketStatus && criteria.ticketStatus !== 'all' ? criteria.ticketStatus : '';
+
+  const sortedPlans = [...workPlans].sort((a, b) => {
+    const aMs = Date.parse(a.createdAt || a.weekStart || '');
+    const bMs = Date.parse(b.createdAt || b.weekStart || '');
+    if (!Number.isNaN(aMs) && !Number.isNaN(bMs) && bMs !== aMs) {
+      return bMs - aMs;
+    }
+    return b.controlNumber.localeCompare(a.controlNumber);
+  });
+
+  const approvedDispensed: WorkProgramRowSummary[] = [];
+  const pendingApproval: WorkProgramRowSummary[] = [];
+  const approvedWithUndispensed: WorkProgramRowSummary[] = [];
+
+  for (const wp of sortedPlans) {
+    if (wpFilter && wp.id !== wpFilter && wp.controlNumber !== wpFilter) {
+      continue;
+    }
+
+    const dateRef = wp.weekStart || wp.createdAt || '';
+    const yr = dateRef.slice(0, 4);
+    const mo = dateRef.slice(5, 7);
+    if (yr !== criteria.year || mo !== criteria.month) {
+      continue;
+    }
+
+    const planTickets = tickets.filter((t) => t.workPlanId === wp.id);
+
+    if (ticketStatusFilter && !planTickets.some((t) => t.status === ticketStatusFilter)) {
+      continue;
+    }
+
+    if (q) {
+      const ticketHay = planTickets
+        .map((t) => `${t.ticketNumber} ${t.plateNumber} ${t.driverName}`)
+        .join(' ');
+      const haystack =
+        `${wp.controlNumber} ${wp.projectTitle} ${wp.department} ${wp.projectCode} ${ticketHay}`.toLowerCase();
+      if (!haystack.includes(q)) {
+        continue;
+      }
+    }
+
+    const summary = summarizeWorkProgramRow(wp, planTickets);
+    if (!summary) continue;
+
+    if (summary.folder === 'approved_dispensed') {
+      approvedDispensed.push(summary);
+    } else if (summary.folder === 'pending_approval') {
+      pendingApproval.push(summary);
+    } else {
+      approvedWithUndispensed.push(summary);
+    }
+  }
+
+  return {
+    valid: true,
+    missingFields: [],
+    approvedDispensed,
+    pendingApproval,
+    approvedWithUndispensed,
+    totalCount:
+      approvedDispensed.length + pendingApproval.length + approvedWithUndispensed.length,
+  };
+}
+
 export function hasValidPumpReadingProof(photoDataUrl?: string | null): boolean {
   if (typeof photoDataUrl !== 'string') return false;
   const trimmed = photoDataUrl.trim();
@@ -825,7 +1216,7 @@ export function categorizeAndFilterDispensingTickets(
     if (fuelFilter && ticket.fuelType !== fuelFilter) return false;
     if (deptFilter && ticket.department.trim().toLowerCase() !== deptFilter) return false;
 
-    const dateRef = ticket.createdAt || ticket.scheduledDate || '';
+    const dateRef = ticket.scheduledDate || ticket.createdAt || '';
     const yr = dateRef.slice(0, 4);
     const mo = dateRef.slice(5, 7);
     if (yearFilter && yr !== yearFilter) return false;

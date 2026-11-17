@@ -1,10 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  addDaysIso,
   buildDailyReconciliationReport,
   buildDispensingCsvContent,
   calculateFuelLimit,
   canAccessDepartmentRecord,
+  canAccessNavSection,
+  canDispenseAtGso,
   canEditOrDeleteRecords,
   canExportDispensingRecords,
   canManageUsers,
@@ -12,6 +15,7 @@ import {
   canPreviewDispensingFullRecord,
   canUserDeleteRecords,
   canUserEditRecords,
+  canUserSwitchToLive,
   canViewAuditLogs,
   canViewDailyReconciliation,
   categorizeAndFilterDispensingTickets,
@@ -19,9 +23,13 @@ import {
   computeSingleDispenseOutcome,
   computeWorkPlanFuelTotals,
   evaluateTabletopApproval,
+  filterAndCategorizeWorkPrograms,
   filterVehiclesForTicket,
   generateNextTripTicketNumbers,
   generateNextWorkPlanNumber,
+  getAllowedNavSections,
+  getDefaultNavSection,
+  getDynamicProgressiveYearOptions,
   getMissingTicketMandatoryFields,
   getRemainingInactivityMs,
   hashPassword,
@@ -30,6 +38,9 @@ import {
   isSessionExpired,
   isWorkPlanInactive,
   parsePersistedSession,
+  replaceYearInProjectCode,
+  shiftIsoDateToYear,
+  validateWorkProgramMandatoryFilters,
 } from './fuelEngine';
 import { FleetVehicle, FuelDepot, InventoryLog, TripTicket, WorkPlan } from '../types/fuel';
 
@@ -714,4 +725,428 @@ test('10-minute inactivity window preserves session across refreshes within wind
   assert.equal(expiredRefresh.expired, true);
   assert.equal(expiredRefresh.session, null);
 });
+
+test('canUserSwitchToLive restricts live environment switching to admin or explicitly permitted users', () => {
+  assert.equal(canUserSwitchToLive({ role: 'admin', canSwitchToLive: false }), true);
+  assert.equal(canUserSwitchToLive({ role: 'approver', canSwitchToLive: false }), false);
+  assert.equal(canUserSwitchToLive({ role: 'gso_dispenser', canSwitchToLive: undefined }), false);
+  assert.equal(canUserSwitchToLive({ role: 'requester', canSwitchToLive: false }), false);
+  assert.equal(canUserSwitchToLive({ role: 'approver', canSwitchToLive: true }), true);
+  assert.equal(canUserSwitchToLive({ role: 'gso_dispenser', canSwitchToLive: true }), true);
+});
+
+test('role-based menu visibility, initial landing section, gso_head permissions, and department scoping', () => {
+  assert.deepEqual(getAllowedNavSections('department_head'), ['work_plans']);
+  assert.deepEqual(getAllowedNavSections('requester'), ['work_plans']);
+  assert.equal(getDefaultNavSection('department_head'), 'work_plans');
+  assert.equal(getDefaultNavSection('requester'), 'work_plans');
+
+  assert.deepEqual(getAllowedNavSections('gso_head'), ['dispensing', 'inventory']);
+  assert.deepEqual(getAllowedNavSections('gso_dispenser'), ['dispensing', 'inventory']);
+  assert.equal(getDefaultNavSection('gso_head'), 'dispensing');
+  assert.equal(getDefaultNavSection('gso_dispenser'), 'dispensing');
+
+  assert.deepEqual(getAllowedNavSections('approver'), ['approvals']);
+  assert.equal(getDefaultNavSection('approver'), 'approvals');
+
+  assert.deepEqual(getAllowedNavSections('admin'), [
+    'dashboard',
+    'fleet',
+    'work_plans',
+    'approvals',
+    'dispensing',
+    'inventory',
+    'users',
+    'reports',
+    'audit',
+  ]);
+  assert.equal(getDefaultNavSection('admin'), 'dashboard');
+
+  assert.equal(canAccessNavSection('department_head', 'dashboard'), false);
+  assert.equal(canAccessNavSection('department_head', 'work_plans'), true);
+  assert.equal(canAccessNavSection('gso_head', 'dispensing'), true);
+  assert.equal(canAccessNavSection('gso_head', 'inventory'), true);
+  assert.equal(canAccessNavSection('gso_head', 'approvals'), false);
+  assert.equal(canAccessNavSection('approver', 'approvals'), true);
+  assert.equal(canAccessNavSection('approver', 'dispensing'), false);
+
+  assert.equal(canDispenseAtGso('gso_head'), true);
+  assert.equal(canPreviewDispensingFullRecord('gso_head'), true);
+  assert.equal(canExportDispensingRecords('gso_head'), true);
+  assert.equal(
+    canAccessDepartmentRecord('department_head', 'City Engineering Office', 'City Health Office'),
+    false
+  );
+  assert.equal(
+    canAccessDepartmentRecord('department_head', 'City Engineering Office', 'City Engineering Office'),
+    true
+  );
+  assert.equal(
+    canAccessDepartmentRecord('gso_head', 'General Services Office (GSO)', 'City Engineering Office'),
+    true
+  );
+});
+
+test('filterAndCategorizeWorkPrograms routes 3 folders, computes Diesel/Gasoline metrics, and enforces mandatory Month/Year', () => {
+  const missingBoth = validateWorkProgramMandatoryFilters({ month: '', year: '' });
+  assert.equal(missingBoth.valid, false);
+  assert.deepEqual(missingBoth.missingFields, ['month', 'year']);
+
+  const missingMonth = validateWorkProgramMandatoryFilters({ month: '', year: '2026' });
+  assert.equal(missingMonth.valid, false);
+  assert.deepEqual(missingMonth.missingFields, ['month']);
+
+  const validDate = validateWorkProgramMandatoryFilters({ month: '11', year: '2026' });
+  assert.equal(validDate.valid, true);
+
+  const plans: WorkPlan[] = [
+    {
+      id: 'wp_disp_all',
+      controlNumber: 'WP-2026-0010',
+      department: 'CENRO',
+      projectTitle: 'Coastal Cleanup',
+      projectCode: 'ENRO-1',
+      weekStart: '2026-11-09',
+      weekEnd: '2026-11-15',
+      status: 'approved',
+      totalRequestedLiters: 90,
+      totalApprovedLiters: 85,
+      totalDispensedLiters: 80,
+      preparedBy: 'Gina',
+      reviewedBy: 'Arturo',
+      approvedBy: 'Roberto',
+      ownerId: 'u1',
+      createdAt: '2026-11-10T08:00:00Z',
+      updatedAt: '2026-11-12T08:00:00Z',
+    },
+    {
+      id: 'wp_undisp',
+      controlNumber: 'WP-2026-0011',
+      department: 'City Engineering Office',
+      projectTitle: 'Road Grading',
+      projectCode: 'ENG-1',
+      weekStart: '2026-11-09',
+      weekEnd: '2026-11-15',
+      status: 'partially_approved',
+      totalRequestedLiters: 150,
+      totalApprovedLiters: 120,
+      totalDispensedLiters: 50,
+      preparedBy: 'Clarissa',
+      reviewedBy: 'Noel',
+      approvedBy: 'Roberto',
+      ownerId: 'u2',
+      createdAt: '2026-11-11T08:00:00Z',
+      updatedAt: '2026-11-12T08:00:00Z',
+    },
+    {
+      id: 'wp_pending',
+      controlNumber: 'WP-2026-0012',
+      department: 'City Agriculture Office',
+      projectTitle: 'Seed Haul',
+      projectCode: 'AGRI-1',
+      weekStart: '2026-11-09',
+      weekEnd: '2026-11-15',
+      status: 'pending_approval',
+      totalRequestedLiters: 60,
+      totalApprovedLiters: 0,
+      totalDispensedLiters: 0,
+      preparedBy: 'Lucia',
+      reviewedBy: 'Tomas',
+      approvedBy: 'Roberto',
+      ownerId: 'u3',
+      createdAt: '2026-11-12T08:00:00Z',
+      updatedAt: '2026-11-12T08:00:00Z',
+    },
+    {
+      id: 'wp_sept',
+      controlNumber: 'WP-2026-0005',
+      department: 'City Health Office',
+      projectTitle: 'Sept Outreach',
+      projectCode: 'HLTH-1',
+      weekStart: '2026-09-20',
+      weekEnd: '2026-09-26',
+      status: 'pending_approval',
+      totalRequestedLiters: 40,
+      totalApprovedLiters: 0,
+      totalDispensedLiters: 0,
+      preparedBy: 'Marisol',
+      reviewedBy: 'Carmela',
+      approvedBy: 'Roberto',
+      ownerId: 'u4',
+      createdAt: '2026-09-20T08:00:00Z',
+      updatedAt: '2026-09-20T08:00:00Z',
+    },
+  ];
+
+  const tickets: TripTicket[] = [
+    {
+      id: 't1',
+      workPlanId: 'wp_disp_all',
+      ticketNumber: '0000101',
+      department: 'CENRO',
+      projectTitle: 'Coastal Cleanup',
+      vehicleId: 'v1',
+      plateNumber: 'CEN-1',
+      driverName: 'Nestor',
+      fuelType: 'diesel',
+      depotId: 'd1',
+      scheduledDate: '2026-11-10',
+      destination: 'Baywalk',
+      computedLimitLiters: 50,
+      requestedLiters: 50,
+      approvedLiters: 50,
+      dispensedLiters: 45,
+      forfeitedLiters: 5,
+      servedOnce: true,
+      status: 'dispensed',
+      ownerId: 'u1',
+      createdAt: '2026-11-10T08:00:00Z',
+      updatedAt: '2026-11-12T08:00:00Z',
+    },
+    {
+      id: 't2',
+      workPlanId: 'wp_disp_all',
+      ticketNumber: '0000102',
+      department: 'CENRO',
+      projectTitle: 'Coastal Cleanup',
+      vehicleId: 'v2',
+      plateNumber: 'GEN-1',
+      driverName: 'Luis',
+      fuelType: 'gasoline',
+      depotId: 'd1',
+      scheduledDate: '2026-11-10',
+      destination: 'Mangrove',
+      computedLimitLiters: 35,
+      requestedLiters: 40,
+      approvedLiters: 35,
+      dispensedLiters: 35,
+      forfeitedLiters: 0,
+      servedOnce: true,
+      status: 'dispensed',
+      ownerId: 'u1',
+      createdAt: '2026-11-10T08:00:00Z',
+      updatedAt: '2026-11-12T08:00:00Z',
+    },
+    {
+      id: 't3',
+      workPlanId: 'wp_undisp',
+      ticketNumber: '0000103',
+      department: 'City Engineering Office',
+      projectTitle: 'Road Grading',
+      vehicleId: 'v3',
+      plateNumber: 'SGV-1',
+      driverName: 'Ramon',
+      fuelType: 'diesel',
+      depotId: 'd1',
+      scheduledDate: '2026-11-11',
+      destination: 'Brgy. 1',
+      computedLimitLiters: 60,
+      requestedLiters: 60,
+      approvedLiters: 50,
+      dispensedLiters: 50,
+      forfeitedLiters: 0,
+      servedOnce: true,
+      status: 'dispensed',
+      ownerId: 'u2',
+      createdAt: '2026-11-11T08:00:00Z',
+      updatedAt: '2026-11-12T08:00:00Z',
+    },
+    {
+      id: 't4',
+      workPlanId: 'wp_undisp',
+      ticketNumber: '0000104',
+      department: 'City Engineering Office',
+      projectTitle: 'Road Grading',
+      vehicleId: 'v4',
+      plateNumber: 'HEQ-1',
+      driverName: 'Danilo',
+      fuelType: 'diesel',
+      depotId: 'd1',
+      scheduledDate: '2026-11-11',
+      destination: 'Brgy. 2',
+      computedLimitLiters: 90,
+      requestedLiters: 90,
+      approvedLiters: 70,
+      dispensedLiters: 0,
+      forfeitedLiters: 0,
+      servedOnce: false,
+      status: 'reduced',
+      ownerId: 'u2',
+      createdAt: '2026-11-11T08:00:00Z',
+      updatedAt: '2026-11-12T08:00:00Z',
+    },
+    {
+      id: 't5',
+      workPlanId: 'wp_pending',
+      ticketNumber: '0000105',
+      department: 'City Agriculture Office',
+      projectTitle: 'Seed Haul',
+      vehicleId: 'v5',
+      plateNumber: 'SHX-1',
+      driverName: 'Elena',
+      fuelType: 'diesel',
+      depotId: 'd1',
+      scheduledDate: '2026-11-12',
+      destination: 'Upland',
+      computedLimitLiters: 60,
+      requestedLiters: 60,
+      approvedLiters: 0,
+      dispensedLiters: 0,
+      forfeitedLiters: 0,
+      servedOnce: false,
+      status: 'pending',
+      ownerId: 'u3',
+      createdAt: '2026-11-12T08:00:00Z',
+      updatedAt: '2026-11-12T08:00:00Z',
+    },
+  ];
+
+  // Missing mandatory Month blocks results
+  const blocked = filterAndCategorizeWorkPrograms(plans, tickets, { month: '', year: '2026' });
+  assert.equal(blocked.valid, false);
+  assert.equal(blocked.totalCount, 0);
+
+  // Nov 2026 routes into all 3 folders accurately
+  const nov = filterAndCategorizeWorkPrograms(plans, tickets, { month: '11', year: '2026' });
+  assert.equal(nov.valid, true);
+  assert.equal(nov.approvedDispensed.length, 1);
+  assert.equal(nov.approvedWithUndispensed.length, 1);
+  assert.equal(nov.pendingApproval.length, 1);
+
+  const dispRow = nov.approvedDispensed[0];
+  assert.equal(dispRow.workPlan.controlNumber, 'WP-2026-0010');
+  assert.equal(dispRow.ticketsApprovedCount, 2);
+  assert.equal(dispRow.ticketsDispensedCount, 2);
+  assert.equal(dispRow.totalDieselApproved, 50);
+  assert.equal(dispRow.totalDieselDispensed, 45);
+  assert.equal(dispRow.totalGasApproved, 35);
+  assert.equal(dispRow.totalGasDispensed, 35);
+
+  const undispRow = nov.approvedWithUndispensed[0];
+  assert.equal(undispRow.workPlan.controlNumber, 'WP-2026-0011');
+  assert.equal(undispRow.ticketsApprovedCount, 2);
+  assert.equal(undispRow.ticketsDispensedCount, 1);
+  assert.equal(undispRow.totalDieselApproved, 120);
+  assert.equal(undispRow.totalDieselDispensed, 50);
+  assert.equal(undispRow.totalGasApproved, 0);
+  assert.equal(undispRow.totalGasDispensed, 0);
+
+  // Filter by Trip Ticket Status = 'reduced' narrows to WP-2026-0011 only
+  const reducedOnly = filterAndCategorizeWorkPrograms(plans, tickets, {
+    month: '11',
+    year: '2026',
+    ticketStatus: 'reduced',
+  });
+  assert.equal(reducedOnly.approvedDispensed.length, 0);
+  assert.equal(reducedOnly.approvedWithUndispensed.length, 1);
+  assert.equal(reducedOnly.pendingApproval.length, 0);
+
+  // Filter by specific Work Plan
+  const specificWp = filterAndCategorizeWorkPrograms(plans, tickets, {
+    month: '11',
+    year: '2026',
+    workPlanId: 'wp_disp_all',
+  });
+  assert.equal(specificWp.totalCount, 1);
+  assert.equal(specificWp.approvedDispensed[0].workPlan.controlNumber, 'WP-2026-0010');
+
+  // Sept 2026 shows WP-2026-0005 in Pending Approval
+  const sept = filterAndCategorizeWorkPrograms(plans, tickets, { month: '09', year: '2026' });
+  assert.equal(sept.pendingApproval.length, 1);
+  assert.equal(sept.pendingApproval[0].workPlan.controlNumber, 'WP-2026-0005');
+});
+
+test('dynamic progressive years support future work plan & trip ticket creation and filtering', () => {
+  const baseYears = getDynamicProgressiveYearOptions({
+    referenceYear: 2026,
+    yearsAhead: 5,
+    workPlans: [{ controlNumber: 'WP-2026-0001', weekStart: '2026-11-09', createdAt: '2026-11-09T08:00:00Z' }],
+    tickets: [{ scheduledDate: '2026-11-12', createdAt: '2026-11-09T08:00:00Z' }],
+  });
+  assert.deepEqual(baseYears, ['2026', '2027', '2028', '2029', '2030', '2031']);
+
+  // Progressive horizon expands dynamically when a later year record is added
+  const expandedYears = getDynamicProgressiveYearOptions({
+    referenceYear: 2026,
+    yearsAhead: 5,
+    workPlans: [{ controlNumber: 'WP-2030-0001', weekStart: '2030-03-10', createdAt: '2026-11-16T08:00:00Z' }],
+    tickets: [{ scheduledDate: '2031-01-15', createdAt: '2026-11-16T08:00:00Z' }],
+  });
+  assert.ok(expandedYears.includes('2031'));
+  assert.ok(expandedYears.includes('2036'));
+
+  // Per-year sequence restarts at 0001 for progressive years without colliding with 2026 plans
+  const existingPlans = [
+    { controlNumber: 'WP-2026-0001' },
+    { controlNumber: 'WP-2026-0002' },
+    { controlNumber: 'WP-2026-0003' },
+  ] as WorkPlan[];
+  assert.equal(generateNextWorkPlanNumber(existingPlans, 2026), 'WP-2026-0004');
+  assert.equal(generateNextWorkPlanNumber(existingPlans, 2027), 'WP-2027-0001');
+  assert.equal(
+    generateNextWorkPlanNumber([...existingPlans, { controlNumber: 'WP-2027-0001' } as WorkPlan], 2027),
+    'WP-2027-0002'
+  );
+
+  // Date & project code shifting handles leap-day clamping and progressive year tokens
+  assert.equal(shiftIsoDateToYear('2028-02-29', '2029'), '2029-02-28');
+  assert.equal(shiftIsoDateToYear('2026-11-16', '2027'), '2027-11-16');
+  assert.equal(addDaysIso('2027-12-28', 6), '2028-01-03');
+  assert.equal(replaceYearInProjectCode('INFRA-2026-014', '2028'), 'INFRA-2028-014');
+
+  // Work plan created in 2026 for progressive year 2027 appears under 2027 filter
+  const futurePlan: WorkPlan = {
+    id: 'wp_future_2027',
+    controlNumber: 'WP-2027-0001',
+    department: 'City Engineering Office',
+    projectTitle: '2027 Road Paving',
+    projectCode: 'INFRA-2027-001',
+    weekStart: '2027-02-01',
+    weekEnd: '2027-02-07',
+    status: 'pending_approval',
+    totalRequestedLiters: 40,
+    totalApprovedLiters: 0,
+    totalDispensedLiters: 0,
+    preparedBy: 'Clarissa',
+    reviewedBy: 'Noel',
+    approvedBy: 'Roberto',
+    ownerId: 'u1',
+    createdAt: '2026-11-16T01:00:00Z',
+    updatedAt: '2026-11-16T01:00:00Z',
+  };
+  const futureTicket: TripTicket = {
+    id: 'tt_future_2027',
+    workPlanId: 'wp_future_2027',
+    ticketNumber: '0000010',
+    department: 'City Engineering Office',
+    projectTitle: '2027 Road Paving',
+    vehicleId: 'v1',
+    plateNumber: 'SGV-042',
+    driverName: 'Ramon',
+    fuelType: 'diesel',
+    depotId: 'd1',
+    scheduledDate: '2027-02-02',
+    destination: 'Brgy. 1',
+    computedLimitLiters: 40,
+    requestedLiters: 40,
+    approvedLiters: 0,
+    dispensedLiters: 0,
+    forfeitedLiters: 0,
+    servedOnce: false,
+    status: 'pending',
+    ownerId: 'u1',
+    createdAt: '2026-11-16T01:00:00Z',
+    updatedAt: '2026-11-16T01:00:00Z',
+  };
+  const filtered2027 = filterAndCategorizeWorkPrograms([futurePlan], [futureTicket], {
+    month: '02',
+    year: '2027',
+  });
+  assert.equal(filtered2027.valid, true);
+  assert.equal(filtered2027.pendingApproval.length, 1);
+  assert.equal(filtered2027.pendingApproval[0].workPlan.controlNumber, 'WP-2027-0001');
+});
+
+
+
 

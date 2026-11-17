@@ -55,7 +55,9 @@ import {
   evaluateTabletopApproval,
   generateNextTripTicketNumbers,
   generateNextWorkPlanNumber,
+  getDefaultNavSection,
   getRemainingInactivityMs,
+  hasCityWideAccess,
   hashPassword,
   hasValidPumpReadingProof,
   INACTIVITY_TIMEOUT_MS,
@@ -423,8 +425,12 @@ export function useFuelStore() {
           }
           if (resolvedProfile) {
             const nowMs = Date.now();
+            const defaultSection = getDefaultNavSection(resolvedProfile.role);
             lastActivityAtRef.current = nowMs;
             lastActivityWriteRef.current = nowMs;
+            if (!activeSectionRef.current) {
+              activeSectionRef.current = defaultSection;
+            }
             setSessionExpiredNotice(null);
             setLiveUserProfile(resolvedProfile);
             setAuthenticatedUser(resolvedProfile);
@@ -435,7 +441,7 @@ export function useFuelStore() {
               envMode: 'live',
               sandboxActiveRole: resolvedProfile.role,
               sandboxActiveDepartment: resolvedProfile.department,
-              activeSection: activeSectionRef.current || 'dashboard',
+              activeSection: activeSectionRef.current || defaultSection,
               lastActivityAt: nowMs,
             });
           }
@@ -452,16 +458,23 @@ export function useFuelStore() {
 
   // Real-time Firestore listeners when authenticated in Live mode
   useEffect(() => {
-    if (!authReady || !firebaseUser || envMode !== 'live') return;
+    if (!authReady || !firebaseUser || !liveUserProfile || envMode !== 'live') return;
 
     const envPrefix = `environments/live`;
     const unsubs: Array<() => void> = [];
+    const cityWide = hasCityWideAccess(liveUserProfile.role);
 
     const attach = <T,>(
       colName: keyof LocalSnapshotState,
-      firestoreColPath: string
+      firestoreColPath: string,
+      filterField?: string,
+      filterValue?: string
     ) => {
-      const ref = collection(db, firestoreColPath);
+      const baseRef = collection(db, firestoreColPath);
+      const ref =
+        filterField && filterValue !== undefined
+          ? query(baseRef, where(filterField, '==', filterValue))
+          : baseRef;
       const unsub = onSnapshot(
         ref,
         (snapshot) => {
@@ -480,20 +493,37 @@ export function useFuelStore() {
     };
 
     attach<FuelDepot>('depots', `${envPrefix}/depots`);
-    attach<FleetVehicle>('vehicles', `${envPrefix}/vehicles`);
-    attach<WorkPlan>('workPlans', `${envPrefix}/workPlans`);
-    attach<TripTicket>('tripTickets', `${envPrefix}/tripTickets`);
-    attach<InventoryLog>('inventoryLogs', `${envPrefix}/inventoryLogs`);
-    attach<AuditLog>('auditLogs', `${envPrefix}/auditLogs`);
+    attach<FleetVehicle>(
+      'vehicles',
+      `${envPrefix}/vehicles`,
+      cityWide ? undefined : 'office',
+      cityWide ? undefined : liveUserProfile.department
+    );
+    attach<WorkPlan>(
+      'workPlans',
+      `${envPrefix}/workPlans`,
+      cityWide ? undefined : 'department',
+      cityWide ? undefined : liveUserProfile.department
+    );
+    attach<TripTicket>(
+      'tripTickets',
+      `${envPrefix}/tripTickets`,
+      cityWide ? undefined : 'department',
+      cityWide ? undefined : liveUserProfile.department
+    );
+    if (cityWide) {
+      attach<InventoryLog>('inventoryLogs', `${envPrefix}/inventoryLogs`);
+    }
 
-    if (liveUserProfile?.role === 'admin' || firebaseUser.email === BOOTSTRAPPED_ADMIN_EMAIL) {
+    if (liveUserProfile.role === 'admin' || firebaseUser.email === BOOTSTRAPPED_ADMIN_EMAIL) {
+      attach<AuditLog>('auditLogs', `${envPrefix}/auditLogs`);
       attach<UserAccount>('users', 'users');
     }
 
     return () => {
       unsubs.forEach((u) => u());
     };
-  }, [authReady, firebaseUser, envMode, liveUserProfile?.role]);
+  }, [authReady, firebaseUser, envMode, liveUserProfile]);
 
   // Flush offline sync queue automatically when online & authenticated in Live mode
   const flushSyncQueue = useCallback(async () => {
@@ -549,6 +579,7 @@ export function useFuelStore() {
           displayName: `${authenticatedUser.displayName} (${sandboxActiveRole.replace(/_/g, ' ')})`,
           role: sandboxActiveRole,
           department: sandboxActiveDepartment,
+          canSwitchToLive: false,
         };
       }
       return authenticatedUser;
@@ -725,25 +756,27 @@ export function useFuelStore() {
       }
 
       const nowMs = Date.now();
+      const defaultSection = getDefaultNavSection(matched.role);
       lastActivityAtRef.current = nowMs;
       lastActivityWriteRef.current = nowMs;
-      activeSectionRef.current = 'dashboard';
+      activeSectionRef.current = defaultSection;
       setSessionExpiredNotice(null);
+      setEnvMode('sandbox');
       setAuthenticatedUser(matched);
       setSandboxActiveRole(matched.role);
       setSandboxActiveDepartment(matched.department);
       writeCachedAuthProfile(matched);
       writePersistedSession({
         uid: matched.uid,
-        envMode,
+        envMode: 'sandbox',
         sandboxActiveRole: matched.role,
         sandboxActiveDepartment: matched.department,
-        activeSection: 'dashboard',
+        activeSection: defaultSection,
         lastActivityAt: nowMs,
       });
       return { ok: true, user: matched };
     },
-    [sandboxState.users, liveState.users, envMode]
+    [sandboxState.users, liveState.users]
   );
 
   const logout = useCallback(async () => {
@@ -955,15 +988,27 @@ export function useFuelStore() {
 
       const now = new Date().toISOString();
       const wpId = makeId('wp');
-      const sequentialControlNo = generateNextWorkPlanNumber(activeData.workPlans);
+      const explicitYearMatch = planInput.controlNumber?.match(/^WP-(\d{4})-/);
+      const weekStartYearMatch = planInput.weekStart?.match(/^(\d{4})-/);
+      const targetYear = explicitYearMatch
+        ? Number(explicitYearMatch[1])
+        : weekStartYearMatch
+          ? Number(weekStartYearMatch[1])
+          : new Date().getFullYear();
+      const sequentialControlNo = generateNextWorkPlanNumber(activeData.workPlans, targetYear);
       const sequentialTicketNos = generateNextTripTicketNumbers(
         activeData.tripTickets,
         ticketDrafts.length
       );
       const totalRequested = ticketDrafts.reduce((sum, t) => sum + t.requestedLiters, 0);
 
+      const effectiveDepartment = hasCityWideAccess(currentUser.role)
+        ? planInput.department.trim()
+        : currentUser.department.trim();
+
       const newPlan: WorkPlan = {
         ...planInput,
+        department: effectiveDepartment,
         controlNumber: sequentialControlNo,
         id: wpId,
         status: 'pending_approval',
@@ -986,7 +1031,7 @@ export function useFuelStore() {
           id: ttId,
           workPlanId: wpId,
           ticketNumber: sequentialTicketNos[i],
-          department: planInput.department,
+          department: effectiveDepartment,
           projectTitle: planInput.projectTitle,
           approvedLiters: 0,
           dispensedLiters: 0,
@@ -1009,7 +1054,15 @@ export function useFuelStore() {
       );
       return { workPlan: newPlan, tickets: createdTickets };
     },
-    [activeData.workPlans, activeData.tripTickets, currentUser.uid, persistMutation, appendAudit]
+    [
+      activeData.workPlans,
+      activeData.tripTickets,
+      currentUser.uid,
+      currentUser.role,
+      currentUser.department,
+      persistMutation,
+      appendAudit,
+    ]
   );
 
   // 2. Interactive Tabletop Approval with Reduction Latitude
@@ -1382,6 +1435,7 @@ export function useFuelStore() {
       positionTitle: string;
       canEdit: boolean;
       canDelete: boolean;
+      canSwitchToLive: boolean;
     }) => {
       const now = new Date().toISOString();
       const cleanUsername = input.username.trim().toLowerCase();
@@ -1398,6 +1452,7 @@ export function useFuelStore() {
         positionTitle: input.positionTitle.trim(),
         canEdit: input.role === 'admin' ? true : input.canEdit,
         canDelete: input.role === 'admin' ? true : input.canDelete,
+        canSwitchToLive: input.role === 'admin' ? true : input.canSwitchToLive,
         active: true,
         createdBy: currentUser.uid,
         createdAt: now,
@@ -1427,7 +1482,7 @@ export function useFuelStore() {
         'USER_CREATED',
         'user',
         uid,
-        `Created user ${userDoc.username} (${userDoc.email}) with role ${userDoc.role}, edit=${userDoc.canEdit}, delete=${userDoc.canDelete}, dept=${userDoc.department}.`
+        `Created user ${userDoc.username} (${userDoc.email}) with role ${userDoc.role}, edit=${userDoc.canEdit}, delete=${userDoc.canDelete}, liveSwitch=${userDoc.canSwitchToLive}, dept=${userDoc.department}.`
       );
     },
     [currentUser.uid, envMode, firebaseUser, effectiveOnline, persistMutation, appendAudit]
@@ -1446,6 +1501,7 @@ export function useFuelStore() {
         positionTitle: string;
         canEdit: boolean;
         canDelete: boolean;
+        canSwitchToLive: boolean;
       }
     ) => {
       const now = new Date().toISOString();
@@ -1458,6 +1514,7 @@ export function useFuelStore() {
         positionTitle: updates.positionTitle.trim(),
         canEdit: updates.role === 'admin' ? true : updates.canEdit,
         canDelete: updates.role === 'admin' ? true : updates.canDelete,
+        canSwitchToLive: updates.role === 'admin' ? true : updates.canSwitchToLive,
         updatedAt: now,
       };
       if (updates.password && updates.password.trim().length > 0) {

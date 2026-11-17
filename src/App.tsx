@@ -16,9 +16,10 @@ import { WorkPlansView } from './components/WorkPlansView';
 import { useFuelStore } from './hooks/useFuelStore';
 import {
   buildDailyReconciliationReport,
+  canAccessNavSection,
   canManageUsers,
-  canViewAuditLogs,
-  canViewDailyReconciliation,
+  canUserSwitchToLive,
+  getDefaultNavSection,
 } from './utils/fuelEngine';
 import {
   GeneratedPdfResult,
@@ -40,11 +41,17 @@ const VALID_SECTIONS: NavSection[] = [
 
 export default function App() {
   const store = useFuelStore();
-  const [activeSection, setActiveSection] = useState<NavSection>(() =>
-    store.initialSection && VALID_SECTIONS.includes(store.initialSection as NavSection)
-      ? (store.initialSection as NavSection)
-      : 'dashboard'
-  );
+  const [activeSection, setActiveSection] = useState<NavSection>(() => {
+    const candidate = store.initialSection as NavSection | undefined;
+    if (
+      candidate &&
+      VALID_SECTIONS.includes(candidate) &&
+      canAccessNavSection(store.currentUser.role, candidate)
+    ) {
+      return candidate;
+    }
+    return getDefaultNavSection(store.currentUser.role);
+  });
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [newWorkPlanOpen, setNewWorkPlanOpen] = useState(false);
   const [purgeConfirmOpen, setPurgeConfirmOpen] = useState(false);
@@ -82,6 +89,7 @@ export default function App() {
     store.authenticatedUser?.role === 'admin' ||
       (store.envMode === 'live' && store.currentUser.role === 'admin')
   );
+  const canSwitchEnvironment = canUserSwitchToLive(store.currentUser);
 
   const handleGoogleSignIn = async () => {
     setAuthError(null);
@@ -130,8 +138,10 @@ export default function App() {
     const signedOutNow = prev.isAuthenticated && !store.isAuthenticated;
 
     if (signedInNow || switchedUser) {
-      // Direct every user to the Dashboard upon sign-in and mount a clean session
-      setActiveSection('dashboard');
+      // Direct user to their role's default initial module upon sign-in
+      const defaultSection = getDefaultNavSection(store.currentUser.role);
+      setActiveSection(defaultSection);
+      store.persistActiveSection(defaultSection);
       setMobileNavOpen(false);
       setNewWorkPlanOpen(false);
       setPurgeConfirmOpen(false);
@@ -152,7 +162,14 @@ export default function App() {
     }
 
     prevAuthRef.current = { isAuthenticated: store.isAuthenticated, uid: activeUid };
-  }, [store.isAuthenticated, activeUid, handleClosePdf, clearDomInputsAndSession]);
+  }, [
+    store.isAuthenticated,
+    store.currentUser.role,
+    store.persistActiveSection,
+    activeUid,
+    handleClosePdf,
+    clearDomInputsAndSession,
+  ]);
 
   const handleSignOut = useCallback(async () => {
     clearDomInputsAndSession();
@@ -168,19 +185,10 @@ export default function App() {
   }, [clearDomInputsAndSession, handleClosePdf, store]);
 
   const handleSelectSection = (sec: NavSection) => {
-    if (sec === 'users' && !canManageUsers(store.currentUser.role)) {
-      setActiveSection('dashboard');
-      store.persistActiveSection('dashboard');
-      return;
-    }
-    if (sec === 'reports' && !canViewDailyReconciliation(store.currentUser.role)) {
-      setActiveSection('dashboard');
-      store.persistActiveSection('dashboard');
-      return;
-    }
-    if (sec === 'audit' && !canViewAuditLogs(store.currentUser.role)) {
-      setActiveSection('dashboard');
-      store.persistActiveSection('dashboard');
+    if (!canAccessNavSection(store.currentUser.role, sec)) {
+      const fallback = getDefaultNavSection(store.currentUser.role);
+      setActiveSection(fallback);
+      store.persistActiveSection(fallback);
       return;
     }
     setActiveSection(sec);
@@ -192,8 +200,6 @@ export default function App() {
     return (
       <LoginView
         key={`login_${sessionNonce}`}
-        envMode={store.envMode}
-        onChangeEnvMode={store.setEnvMode}
         sessionExpiredNotice={store.sessionExpiredNotice}
         onCredentialLogin={store.loginWithCredentials}
         onGoogleSignIn={async () => {
@@ -203,10 +209,15 @@ export default function App() {
     );
   }
 
+  const resolvedSection: NavSection = canAccessNavSection(store.currentUser.role, activeSection)
+    ? activeSection
+    : getDefaultNavSection(store.currentUser.role);
+  const canCreateWorkPlan = canAccessNavSection(store.currentUser.role, 'work_plans');
+
   return (
     <div key={`app_${sessionNonce}`} className="min-h-screen flex bg-[#F3F5F8] text-[#0B192C]">
       <SidebarNav
-        activeSection={activeSection}
+        activeSection={resolvedSection}
         onSelectSection={handleSelectSection}
         currentUser={store.currentUser}
         isActualAdmin={isActualAdmin}
@@ -214,13 +225,9 @@ export default function App() {
         sandboxRole={store.sandboxActiveRole}
         onChangeSandboxRole={(role) => {
           store.setSandboxActiveRole(role);
-          if (
-            role !== 'admin' &&
-            (activeSection === 'users' || activeSection === 'reports' || activeSection === 'audit')
-          ) {
-            setActiveSection('dashboard');
-            store.persistActiveSection('dashboard');
-          }
+          const nextDefault = getDefaultNavSection(role);
+          setActiveSection(nextDefault);
+          store.persistActiveSection(nextDefault);
         }}
         sandboxDepartment={store.sandboxActiveDepartment}
         onChangeSandboxDepartment={store.setSandboxActiveDepartment}
@@ -235,17 +242,16 @@ export default function App() {
 
       <div className="flex-1 flex flex-col min-w-0">
         <TopHeader
-          activeSection={activeSection}
+          activeSection={resolvedSection}
           envMode={store.envMode}
+          canSwitchEnvironment={canSwitchEnvironment}
           onChangeEnvMode={(mode) => {
+            if (mode === 'live' && !canSwitchEnvironment) return;
             store.setEnvMode(mode);
-            if (
-              (activeSection === 'users' && !canManageUsers(store.currentUser.role)) ||
-              (activeSection === 'reports' && !canViewDailyReconciliation(store.currentUser.role)) ||
-              (activeSection === 'audit' && !canViewAuditLogs(store.currentUser.role))
-            ) {
-              setActiveSection('dashboard');
-              store.persistActiveSection('dashboard');
+            if (!canAccessNavSection(store.currentUser.role, resolvedSection)) {
+              const fallback = getDefaultNavSection(store.currentUser.role);
+              setActiveSection(fallback);
+              store.persistActiveSection(fallback);
             }
           }}
           isOnline={store.isOnline}
@@ -254,11 +260,13 @@ export default function App() {
           syncQueueCount={store.syncQueue.length}
           onFlushSyncQueue={store.flushSyncQueue}
           isActualAdmin={isActualAdmin}
+          canCreateWorkPlan={canCreateWorkPlan}
           firebaseUser={store.firebaseUser}
           onSignIn={handleGoogleSignIn}
           onSignOut={handleSignOut}
           onOpenMobileNav={() => setMobileNavOpen(true)}
           onOpenNewWorkPlan={() => {
+            if (!canCreateWorkPlan) return;
             setActiveSection('work_plans');
             store.persistActiveSection('work_plans');
             setNewWorkPlanOpen(true);
@@ -339,7 +347,7 @@ export default function App() {
 
         {/* Main Active Content Viewport */}
         <main className="flex-1 p-4 lg:p-6 max-w-[1440px] w-full mx-auto">
-          {activeSection === 'dashboard' && (
+          {resolvedSection === 'dashboard' && (
             <DashboardView
               workPlans={store.visibleWorkPlans}
               tickets={store.visibleTickets}
@@ -350,7 +358,7 @@ export default function App() {
             />
           )}
 
-          {activeSection === 'fleet' && (
+          {resolvedSection === 'fleet' && (
             <FleetRegistryView
               vehicles={store.visibleVehicles}
               currentUser={store.currentUser}
@@ -359,7 +367,7 @@ export default function App() {
             />
           )}
 
-          {activeSection === 'work_plans' && (
+          {resolvedSection === 'work_plans' && (
             <WorkPlansView
               workPlans={store.visibleWorkPlans}
               allWorkPlans={store.data.workPlans}
@@ -378,7 +386,7 @@ export default function App() {
             />
           )}
 
-          {activeSection === 'approvals' && (
+          {resolvedSection === 'approvals' && (
             <ApprovalsView
               workPlans={store.visibleWorkPlans}
               tickets={store.visibleTickets}
@@ -387,7 +395,7 @@ export default function App() {
             />
           )}
 
-          {activeSection === 'dispensing' && (
+          {resolvedSection === 'dispensing' && (
             <DispensingView
               tickets={store.visibleTickets}
               workPlans={store.visibleWorkPlans}
@@ -397,7 +405,7 @@ export default function App() {
             />
           )}
 
-          {activeSection === 'inventory' && (
+          {resolvedSection === 'inventory' && (
             <DepotInventoryView
               depots={store.data.depots}
               inventoryLogs={store.data.inventoryLogs}
@@ -407,7 +415,7 @@ export default function App() {
             />
           )}
 
-          {activeSection === 'users' && (
+          {resolvedSection === 'users' && (
             <UsersAdminView
               users={store.data.users}
               currentUser={store.currentUser}
@@ -418,7 +426,7 @@ export default function App() {
             />
           )}
 
-          {activeSection === 'reports' && (
+          {resolvedSection === 'reports' && (
             <ReportsView
               reportDate={reportDate}
               onChangeReportDate={setReportDate}
@@ -436,7 +444,7 @@ export default function App() {
             />
           )}
 
-          {activeSection === 'audit' && (
+          {resolvedSection === 'audit' && (
             <AuditLogsView logs={store.data.auditLogs} currentUser={store.currentUser} />
           )}
         </main>

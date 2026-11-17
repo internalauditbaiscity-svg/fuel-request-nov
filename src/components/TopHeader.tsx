@@ -15,7 +15,7 @@ const SECTION_TITLES: Record<NavSection, string> = {
   dashboard: 'Dashboard',
   fleet: 'Fleet Registry',
   work_plans: 'Department Request',
-  approvals: 'Request Approval',
+  approvals: 'Fuel Request Approval',
   dispensing: 'GSO Fuel Dispensing',
   inventory: 'Depot Inventory & Logs',
   users: 'User Creation & RBAC',
@@ -26,6 +26,7 @@ const SECTION_TITLES: Record<NavSection, string> = {
 interface TopHeaderProps {
   activeSection: NavSection;
   envMode: EnvironmentMode;
+  canSwitchEnvironment: boolean;
   onChangeEnvMode: (mode: EnvironmentMode) => void;
   isOnline: boolean;
   simulatedOffline: boolean;
@@ -33,6 +34,7 @@ interface TopHeaderProps {
   syncQueueCount: number;
   onFlushSyncQueue: () => void;
   isActualAdmin: boolean;
+  canCreateWorkPlan: boolean;
   firebaseUser: FirebaseUser | null;
   onSignIn: () => void;
   onSignOut: () => void;
@@ -44,6 +46,7 @@ interface TopHeaderProps {
 export function TopHeader({
   activeSection,
   envMode,
+  canSwitchEnvironment,
   onChangeEnvMode,
   isOnline,
   simulatedOffline,
@@ -51,6 +54,7 @@ export function TopHeader({
   syncQueueCount,
   onFlushSyncQueue,
   isActualAdmin,
+  canCreateWorkPlan,
   onSignOut,
   onOpenMobileNav,
   onOpenNewWorkPlan,
@@ -76,35 +80,38 @@ export function TopHeader({
 
         {/* Zone 2 & 3: Single-row Operational Controls + Primary CTA */}
         <div className="flex items-center gap-2 shrink-0">
-          {/* Live / Sandbox Segmented Switch */}
-          <div
-            role="group"
-            aria-label="Database environment"
-            className="flex items-center rounded-md border border-[#D5DCE6] bg-[#F3F5F8] p-0.5 shrink-0"
-          >
-            <button
-              type="button"
-              onClick={() => onChangeEnvMode('sandbox')}
-              className={`px-2 sm:px-2.5 py-1 text-xs font-semibold rounded transition-colors whitespace-nowrap shrink-0 ${
-                envMode === 'sandbox'
-                  ? 'bg-[#0B192C] text-white'
-                  : 'text-[#334E73] hover:text-[#0B192C]'
-              }`}
+          {/* Live / Sandbox Segmented Switch (Admin or explicitly permitted users only) */}
+          {canSwitchEnvironment && (
+            <div
+              role="group"
+              aria-label="Database environment"
+              data-testid="env-mode-switch"
+              className="flex items-center rounded-md border border-[#D5DCE6] bg-[#F3F5F8] p-0.5 shrink-0"
             >
-              Sandbox
-            </button>
-            <button
-              type="button"
-              onClick={() => onChangeEnvMode('live')}
-              className={`px-2 sm:px-2.5 py-1 text-xs font-semibold rounded transition-colors whitespace-nowrap shrink-0 ${
-                envMode === 'live'
-                  ? 'bg-[#1B3B6F] text-white'
-                  : 'text-[#334E73] hover:text-[#0B192C]'
-              }`}
-            >
-              Live
-            </button>
-          </div>
+              <button
+                type="button"
+                onClick={() => onChangeEnvMode('sandbox')}
+                className={`px-2 sm:px-2.5 py-1 text-xs font-semibold rounded transition-colors whitespace-nowrap shrink-0 ${
+                  envMode === 'sandbox'
+                    ? 'bg-[#0B192C] text-white'
+                    : 'text-[#334E73] hover:text-[#0B192C]'
+                }`}
+              >
+                Sandbox
+              </button>
+              <button
+                type="button"
+                onClick={() => onChangeEnvMode('live')}
+                className={`px-2 sm:px-2.5 py-1 text-xs font-semibold rounded transition-colors whitespace-nowrap shrink-0 ${
+                  envMode === 'live'
+                    ? 'bg-[#1B3B6F] text-white'
+                    : 'text-[#334E73] hover:text-[#0B192C]'
+                }`}
+              >
+                Live
+              </button>
+            </div>
+          )}
 
           {/* Sandbox Purge Button (Admin Desktop/Tablet) */}
           {envMode === 'sandbox' && isActualAdmin && (
@@ -164,16 +171,18 @@ export function TopHeader({
             <span className="hidden lg:inline">Sign Out</span>
           </button>
 
-          {/* Primary CTA */}
-          <button
-            type="button"
-            onClick={onOpenNewWorkPlan}
-            className="inline-flex items-center gap-1.5 rounded-md bg-[#0B192C] px-3 py-1.5 text-xs font-semibold text-white hover:bg-[#1B3B6F] transition-colors whitespace-nowrap shrink-0 min-h-[36px]"
-          >
-            <Plus className="h-4 w-4" />
-            <span className="hidden sm:inline">New Work Plan</span>
-            <span className="sm:hidden">New</span>
-          </button>
+          {/* Primary CTA (Department Request roles & Admin only) */}
+          {canCreateWorkPlan && (
+            <button
+              type="button"
+              onClick={onOpenNewWorkPlan}
+              className="inline-flex items-center gap-1.5 rounded-md bg-[#0B192C] px-3 py-1.5 text-xs font-semibold text-white hover:bg-[#1B3B6F] transition-colors whitespace-nowrap shrink-0 min-h-[36px]"
+            >
+              <Plus className="h-4 w-4" />
+              <span className="hidden sm:inline">New Work Plan</span>
+              <span className="sm:hidden">New</span>
+            </button>
+          )}
         </div>
       </div>
     </header>

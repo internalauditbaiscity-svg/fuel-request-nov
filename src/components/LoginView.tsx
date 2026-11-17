@@ -1,10 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Building2, Lock, LogIn, ShieldCheck, User } from 'lucide-react';
-import { EnvironmentMode } from '../types/fuel';
 
 interface LoginViewProps {
-  envMode: EnvironmentMode;
-  onChangeEnvMode: (mode: EnvironmentMode) => void;
   sessionExpiredNotice?: string | null;
   onCredentialLogin: (
     username: string,
@@ -14,8 +11,6 @@ interface LoginViewProps {
 }
 
 export function LoginView({
-  envMode,
-  onChangeEnvMode,
   sessionExpiredNotice,
   onCredentialLogin,
   onGoogleSignIn,
@@ -111,35 +106,6 @@ export function LoginView({
             <div className="flex items-center gap-2 text-xs font-semibold text-[#334E73]">
               <ShieldCheck className="h-4 w-4 text-[#1B3B6F]" />
               <span>Authorized User Authentication</span>
-            </div>
-
-            <div
-              role="group"
-              aria-label="Database environment"
-              className="flex items-center rounded-md border border-[#D5DCE6] bg-[#F3F5F8] p-0.5"
-            >
-              <button
-                type="button"
-                onClick={() => onChangeEnvMode('sandbox')}
-                className={`px-2.5 py-1 text-[11px] font-semibold rounded transition-colors ${
-                  envMode === 'sandbox'
-                    ? 'bg-[#0B192C] text-white'
-                    : 'text-[#334E73] hover:text-[#0B192C]'
-                }`}
-              >
-                Sandbox
-              </button>
-              <button
-                type="button"
-                onClick={() => onChangeEnvMode('live')}
-                className={`px-2.5 py-1 text-[11px] font-semibold rounded transition-colors ${
-                  envMode === 'live'
-                    ? 'bg-[#1B3B6F] text-white'
-                    : 'text-[#334E73] hover:text-[#0B192C]'
-                }`}
-              >
-                Live
-              </button>
             </div>
           </div>
 
@@ -239,31 +205,6 @@ export function LoginView({
             <LogIn className="h-4 w-4 text-[#1B3B6F]" />
             <span>{googleBusy ? 'Connecting to Google...' : 'Sign In with Google (Live Cloud)'}</span>
           </button>
-
-          {envMode === 'sandbox' && (
-            <div className="rounded-md border border-[#D5DCE6] bg-[#F9FAFC] p-3 text-[11px] text-[#334E73] space-y-1.5">
-              <div className="flex items-center justify-between">
-                <span className="font-semibold text-[#0B192C]">Sandbox Evaluation Accounts</span>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setUsername('admin');
-                    setPassword('BaisAdmin2026!');
-                    setError(null);
-                  }}
-                  className="font-semibold text-[#1B3B6F] hover:underline"
-                >
-                  Use Admin Credentials
-                </button>
-              </div>
-              <div className="grid grid-cols-2 gap-x-3 gap-y-0.5 font-mono text-[10px]">
-                <span>admin / BaisAdmin2026!</span>
-                <span>approver / BaisApprove2026!</span>
-                <span>gso_depot / BaisGso2026!</span>
-                <span>eng_head / BaisEng2026!</span>
-              </div>
-            </div>
-          )}
         </div>
       </div>
     </div>

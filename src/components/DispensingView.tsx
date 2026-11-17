@@ -21,6 +21,7 @@ import {
   canPreviewDispensingFullRecord,
   categorizeAndFilterDispensingTickets,
   DispensingTicketViewItem,
+  getDynamicProgressiveYearOptions,
   hasValidPumpReadingProof,
 } from '../utils/fuelEngine';
 import { generateDispensingLedgerPdf } from '../utils/pdfGenerator';
@@ -160,15 +161,12 @@ export function DispensingView({
   }, [tickets]);
 
   const yearOptions = useMemo(() => {
-    const set = new Set<string>();
-    tickets.forEach((t) => {
-      if (t.servedOnce || ((t.status === 'approved' || t.status === 'reduced') && t.approvedLiters > 0)) {
-        const yr = (t.createdAt || t.scheduledDate || '').slice(0, 4);
-        if (yr) set.add(yr);
-      }
+    return getDynamicProgressiveYearOptions({
+      workPlans,
+      tickets,
+      order: 'asc',
     });
-    return Array.from(set).sort().reverse();
-  }, [tickets]);
+  }, [workPlans, tickets]);
 
   const { approved, dispensed, totalApprovedCount, totalDispensedCount } = useMemo(
     () =>

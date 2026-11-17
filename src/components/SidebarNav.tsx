@@ -16,26 +16,14 @@ import {
 import {
   BAIS_DEPARTMENTS,
   EnvironmentMode,
+  NavSection,
   ROLE_LABELS,
   UserAccount,
   UserRole,
 } from '../types/fuel';
-import {
-  canManageUsers,
-  canViewAuditLogs,
-  canViewDailyReconciliation,
-} from '../utils/fuelEngine';
+import { canAccessNavSection } from '../utils/fuelEngine';
 
-export type NavSection =
-  | 'dashboard'
-  | 'fleet'
-  | 'work_plans'
-  | 'approvals'
-  | 'dispensing'
-  | 'inventory'
-  | 'users'
-  | 'reports'
-  | 'audit';
+export type { NavSection } from '../types/fuel';
 
 interface SidebarNavProps {
   activeSection: NavSection;
@@ -86,57 +74,57 @@ export function SidebarNav({
       label: 'Dashboard',
       icon: LayoutDashboard,
       badge: alertCount > 0 ? alertCount : undefined,
-      visible: true,
+      visible: canAccessNavSection(currentUser.role, 'dashboard'),
     },
     {
       id: 'fleet',
       label: 'Fleet Registry',
       icon: Truck,
-      visible: true,
+      visible: canAccessNavSection(currentUser.role, 'fleet'),
     },
     {
       id: 'work_plans',
       label: 'Department Request',
       icon: FileSpreadsheet,
-      visible: true,
+      visible: canAccessNavSection(currentUser.role, 'work_plans'),
     },
     {
       id: 'approvals',
-      label: 'Request Approval',
+      label: 'Fuel Request Approval',
       icon: ClipboardCheck,
       badge: pendingApprovalCount > 0 ? pendingApprovalCount : undefined,
-      visible: true,
+      visible: canAccessNavSection(currentUser.role, 'approvals'),
     },
     {
       id: 'dispensing',
       label: 'GSO Fuel Dispensing',
       icon: Fuel,
       badge: readyToDispenseCount > 0 ? readyToDispenseCount : undefined,
-      visible: true,
+      visible: canAccessNavSection(currentUser.role, 'dispensing'),
     },
     {
       id: 'inventory',
       label: 'Depot Inventory & Logs',
       icon: Database,
-      visible: true,
+      visible: canAccessNavSection(currentUser.role, 'inventory'),
     },
     {
       id: 'users',
       label: 'User Creation & RBAC',
       icon: Users,
-      visible: canManageUsers(currentUser.role),
+      visible: canAccessNavSection(currentUser.role, 'users'),
     },
     {
       id: 'reports',
       label: 'Daily Reconciliation',
       icon: Fuel,
-      visible: canViewDailyReconciliation(currentUser.role),
+      visible: canAccessNavSection(currentUser.role, 'reports'),
     },
     {
       id: 'audit',
       label: 'Audit Logs',
       icon: History,
-      visible: canViewAuditLogs(currentUser.role),
+      visible: canAccessNavSection(currentUser.role, 'audit'),
     },
   ];
 

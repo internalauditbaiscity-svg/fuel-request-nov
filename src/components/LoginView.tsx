@@ -7,7 +7,7 @@ interface LoginViewProps {
   onCredentialLogin: (
     username: string,
     password: string
-  ) => { ok: boolean; error?: string };
+  ) => Promise<{ ok: boolean; error?: string }> | { ok: boolean; error?: string };
   onGoogleSignIn: () => Promise<void>;
 }
 
@@ -20,6 +20,7 @@ export function LoginView({
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
+  const [credentialBusy, setCredentialBusy] = useState(false);
   const [googleBusy, setGoogleBusy] = useState(false);
   const displayedError = error || externalError || null;
 
@@ -59,16 +60,24 @@ export function LoginView({
     };
   }, [clearCredentialInputs]);
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (credentialBusy || googleBusy) return;
     setError(null);
-    const res = onCredentialLogin(username, password);
-    if (!res.ok) {
-      setError(res.error || 'Authentication failed.');
-      return;
+    setCredentialBusy(true);
+    try {
+      const res = await onCredentialLogin(username, password);
+      if (!res.ok) {
+        setError(res.error || 'Authentication failed.');
+        return;
+      }
+      // Clear last inputted credentials immediately once verification closes
+      clearCredentialInputs();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Authentication failed.');
+    } finally {
+      setCredentialBusy(false);
     }
-    // Clear last inputted credentials immediately once verification closes
-    clearCredentialInputs();
   };
 
   const handleGoogle = async () => {
@@ -184,10 +193,11 @@ export function LoginView({
 
             <button
               type="submit"
-              className="w-full flex items-center justify-center gap-2 rounded-md bg-[#0B192C] px-4 py-2.5 text-sm font-semibold text-white hover:bg-[#1B3B6F] transition-colors"
+              disabled={credentialBusy || googleBusy}
+              className="w-full flex items-center justify-center gap-2 rounded-md bg-[#0B192C] px-4 py-2.5 text-sm font-semibold text-white hover:bg-[#1B3B6F] disabled:opacity-50 transition-colors"
             >
               <LogIn className="h-4 w-4" />
-              <span>Sign In to System</span>
+              <span>{credentialBusy ? 'Verifying Credentials...' : 'Sign In to System'}</span>
             </button>
           </form>
 

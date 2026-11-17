@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   addDaysIso,
   authenticateLocalUserCredentials,
+  buildCredentialLoginPayloadsFromUser,
   buildDailyReconciliationReport,
   buildDispensingCsvContent,
   buildInvitePayloadFromUser,
@@ -23,6 +24,7 @@ import {
   categorizeAndFilterApprovals,
   categorizeAndFilterDispensingTickets,
   categorizeDepartmentWorkPlans,
+  computeCredentialProofId,
   computeSingleDispenseOutcome,
   computeWorkPlanFuelTotals,
   deduplicateUsersByEmail,
@@ -1641,6 +1643,73 @@ test('resolveEffectiveEnvironmentAfterGoogleAuth keeps Sandbox when linking for 
     'live'
   );
 });
+
+test('computeCredentialProofId and buildCredentialLoginPayloadsFromUser produce proof-keyed docs without passwordHash and strip leading @', () => {
+  const passHash = hashPassword('BaisTest2026!');
+  const proofPlain = computeCredentialProofId('jdelacruz', passHash);
+  const proofWithAt = computeCredentialProofId('  @JDelaCruz  ', passHash);
+  const proofEmail = computeCredentialProofId('juan.delacruz@baiscity.gov.ph', passHash);
+  const proofWrongPass = computeCredentialProofId('jdelacruz', hashPassword('WrongPass'));
+
+  assert.match(proofPlain, /^[a-f0-9]{64}$/);
+  assert.equal(proofPlain, proofWithAt);
+  assert.notEqual(proofPlain, proofEmail);
+  assert.notEqual(proofPlain, proofWrongPass);
+
+  const user: UserAccount = {
+    uid: 'juan_delacruz_baiscity_gov_ph',
+    username: '@JDelaCruz',
+    passwordHash: passHash,
+    email: 'Juan.DelaCruz@baiscity.gov.ph',
+    displayName: 'Juan Dela Cruz',
+    role: 'department_head',
+    department: 'City Engineering Office',
+    positionTitle: 'Division Head',
+    canEdit: true,
+    canDelete: false,
+    canSwitchToLive: false,
+    active: true,
+    createdBy: 'fb_admin_uid',
+    createdAt: '2026-11-17T00:00:00Z',
+    updatedAt: '2026-11-17T00:00:00Z',
+  };
+
+  const payloads = buildCredentialLoginPayloadsFromUser(user, 'fb_admin_uid');
+  assert.equal(payloads.length, 2);
+  assert.equal(payloads[0].id, proofPlain);
+  assert.equal(payloads[1].id, proofEmail);
+  for (const p of payloads) {
+    assert.equal('passwordHash' in p, false);
+    assert.equal(p.username, 'jdelacruz');
+    assert.equal(p.email, 'juan.delacruz@baiscity.gov.ph');
+    assert.equal(p.role, 'department_head');
+    assert.equal(p.active, true);
+  }
+
+  // Leading @ accepted by authenticateLocalUserCredentials
+  const authAt = authenticateLocalUserCredentials({
+    sandboxUsers: [user],
+    identifier: '@jdelacruz',
+    password: 'BaisTest2026!',
+  });
+  assert.equal(authAt.ok, true);
+  assert.equal(authAt.user?.uid, 'juan_delacruz_baiscity_gov_ph');
+
+  // Deduplication preserves username & passwordHash when real Firebase UID lacks them
+  const placeholderWithPass: UserAccount = { ...user, username: 'jdelacruz' };
+  const fbDocWithoutPass: UserAccount = {
+    ...user,
+    uid: 'fb_uid_juan',
+    username: undefined,
+    passwordHash: undefined,
+  };
+  const deduped = deduplicateUsersByEmail([placeholderWithPass, fbDocWithoutPass]);
+  assert.equal(deduped.length, 1);
+  assert.equal(deduped[0].uid, 'fb_uid_juan');
+  assert.equal(deduped[0].username, 'jdelacruz');
+  assert.equal(deduped[0].passwordHash, passHash);
+});
+
 
 
 

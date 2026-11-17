@@ -19,6 +19,10 @@ service cloud.firestore {
       return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
     }
 
+    function isValidProofId(id) {
+      return id is string && id.size() == 64 && id.matches('^[a-f0-9]{64}$');
+    }
+
     function incoming() {
       return request.resource.data;
     }
@@ -282,6 +286,26 @@ service cloud.firestore {
         data.createdAt is string && data.createdAt.size() >= 10 && data.createdAt.size() <= 64;
     }
 
+    function isValidCredentialLogin(data) {
+      return data.keys().hasAll(['id', 'uid', 'email', 'displayName', 'role', 'department', 'active', 'createdBy', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['id', 'uid', 'username', 'email', 'displayName', 'role', 'department', 'positionTitle', 'canEdit', 'canDelete', 'canSwitchToLive', 'active', 'createdBy', 'createdAt', 'updatedAt']) &&
+        isValidProofId(data.id) &&
+        isValidId(data.uid) &&
+        (!('username' in data) || (data.username is string && data.username.size() >= 2 && data.username.size() <= 64)) &&
+        data.email is string && data.email.size() >= 3 && data.email.size() <= 254 &&
+        data.displayName is string && data.displayName.size() >= 2 && data.displayName.size() <= 120 &&
+        data.role in ['admin', 'approver', 'gso_head', 'gso_dispenser', 'department_head', 'requester', 'auditor'] &&
+        data.department is string && data.department.size() >= 2 && data.department.size() <= 120 &&
+        (!('positionTitle' in data) || (data.positionTitle is string && data.positionTitle.size() <= 120)) &&
+        (!('canEdit' in data) || data.canEdit is bool) &&
+        (!('canDelete' in data) || data.canDelete is bool) &&
+        (!('canSwitchToLive' in data) || data.canSwitchToLive is bool) &&
+        data.active is bool &&
+        data.createdBy is string && data.createdBy.size() >= 1 && data.createdBy.size() <= 128 &&
+        data.createdAt is string && data.createdAt.size() >= 10 && data.createdAt.size() <= 64 &&
+        data.updatedAt is string && data.updatedAt.size() >= 10 && data.updatedAt.size() <= 64;
+    }
+
     function matchesProvisionedRecord(incomingData, sourceData) {
       return sourceData.active == true &&
         sourceData.email is string &&
@@ -381,6 +405,15 @@ service cloud.firestore {
       allow update: if isValidId(userId) && isAdmin() && isValidUserAccount(incoming()) &&
         incoming().uid == existing().uid && incoming().createdAt == existing().createdAt;
       allow delete: if isValidId(userId) && isAdmin();
+    }
+
+    // Proof-Keyed Credential Verification (Single-doc get by 64-hex SHA-256 proof; admin-only writes; no non-admin listing)
+    match /credentialLogins/{proofId} {
+      allow get: if isValidProofId(proofId);
+      allow list: if isAdmin();
+      allow create: if isValidProofId(proofId) && isAdmin() && isValidCredentialLogin(incoming()) && incoming().id == proofId;
+      allow update: if isValidProofId(proofId) && isAdmin() && isValidCredentialLogin(incoming()) && incoming().id == existing().id;
+      allow delete: if isValidProofId(proofId) && isAdmin();
     }
 
     // Environment-partitioned operational collections (live vs sandbox)

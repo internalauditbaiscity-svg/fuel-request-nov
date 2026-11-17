@@ -218,6 +218,29 @@
         "createdAt": { "type": "string", "format": "date-time", "maxLength": 64 }
       },
       "required": ["id", "email", "displayName", "role", "department", "active", "createdBy", "createdAt"]
+    },
+    "CredentialLogin": {
+      "title": "CredentialLogin",
+      "description": "Cryptographic proof-keyed login lookup record (no passwordHash stored; 64-hex SHA-256 proof ID required)",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[a-f0-9]{64}$" },
+        "uid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "username": { "type": "string", "minLength": 2, "maxLength": 64 },
+        "email": { "type": "string", "format": "email", "maxLength": 254 },
+        "displayName": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "role": { "type": "string", "enum": ["admin", "approver", "gso_head", "gso_dispenser", "department_head", "requester", "auditor"] },
+        "department": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "positionTitle": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "canEdit": { "type": "boolean" },
+        "canDelete": { "type": "boolean" },
+        "canSwitchToLive": { "type": "boolean" },
+        "active": { "type": "boolean" },
+        "createdBy": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "createdAt": { "type": "string", "format": "date-time", "maxLength": 64 },
+        "updatedAt": { "type": "string", "format": "date-time", "maxLength": 64 }
+      },
+      "required": ["id", "uid", "email", "displayName", "role", "department", "active", "createdBy", "createdAt", "updatedAt"]
     }
   },
   "firestore": {
@@ -232,6 +255,10 @@
     "/invites/{inviteId}": {
       "schema": { "$ref": "#/entities/UserInvite" },
       "description": "Admin-provisioned user role assignments awaiting first sign-in"
+    },
+    "/credentialLogins/{proofId}": {
+      "schema": { "$ref": "#/entities/CredentialLogin" },
+      "description": "SHA-256 credential-proof lookup records enabling cross-device username/password authentication without exposing user lists"
     },
     "/environments/{envId}/vehicles/{vehicleId}": {
       "schema": { "$ref": "#/entities/FleetVehicle" },

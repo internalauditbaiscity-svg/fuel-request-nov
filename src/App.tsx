@@ -441,6 +441,8 @@ export default function App() {
             <UsersAdminView
               users={store.data.users}
               currentUser={store.currentUser}
+              firebaseUser={store.firebaseUser}
+              onConnectGoogleForSync={handleConnectGoogleForSync}
               onCreateUser={store.createUserAccount}
               onUpdateUser={store.updateUserAccount}
               onDeleteUser={store.deleteUserAccount}

@@ -52,8 +52,10 @@ import {
 } from '../types/fuel';
 import {
   authenticateLocalUserCredentials,
+  buildCredentialLoginPayloadsFromUser,
   buildInvitePayloadFromUser,
   canAccessDepartmentRecord,
+  computeCredentialProofId,
   computeSingleDispenseOutcome,
   deduplicateUsersByEmail,
   evaluateTabletopApproval,
@@ -68,6 +70,7 @@ import {
   isSessionExpired,
   MAX_TICKETS_PER_WORKPLAN,
   mergeClaimedUserProfile,
+  normalizeUsernameInput,
   parsePersistedSession,
   PersistedSessionState,
   prepareFirestoreRecordPayload,
@@ -595,8 +598,41 @@ export function useFuelStore() {
     return () => unsub();
   }, []);
 
+  const syncCredentialLoginDocs = useCallback(
+    async (
+      user: UserAccount,
+      actorUid: string,
+      previousUser?: UserAccount | null
+    ): Promise<number> => {
+      let written = 0;
+      const payloads = buildCredentialLoginPayloadsFromUser(user, actorUid);
+      const nextProofIds = new Set(payloads.map((p) => p.id));
+
+      if (previousUser && previousUser.passwordHash) {
+        const oldPayloads = buildCredentialLoginPayloadsFromUser(previousUser, actorUid);
+        for (const oldPayload of oldPayloads) {
+          if (!nextProofIds.has(oldPayload.id)) {
+            await deleteDoc(doc(db, 'credentialLogins', oldPayload.id)).catch(() => {});
+          }
+        }
+      }
+
+      for (const credPayload of payloads) {
+        await setDoc(doc(db, 'credentialLogins', credPayload.id), credPayload, { merge: true });
+        written += 1;
+      }
+      return written;
+    },
+    []
+  );
+
   const syncUserAndInviteDoc = useCallback(
-    async (user: UserAccount, actorUid: string, isCreate: boolean) => {
+    async (
+      user: UserAccount,
+      actorUid: string,
+      isCreate: boolean,
+      previousUser?: UserAccount | null
+    ) => {
       const sanitizedUser = prepareFirestoreRecordPayload(
         user as unknown as Record<string, unknown>,
         actorUid,
@@ -607,8 +643,9 @@ export function useFuelStore() {
       if (invitePayload && typeof invitePayload.id === 'string') {
         await setDoc(doc(db, 'invites', invitePayload.id), invitePayload, { merge: true });
       }
+      await syncCredentialLoginDocs(user, actorUid, previousUser);
     },
-    []
+    [syncCredentialLoginDocs]
   );
 
   // Flush offline/unauthenticated sync queue automatically when online & authenticated
@@ -632,13 +669,12 @@ export function useFuelStore() {
           });
           await setDoc(docRef, payload);
           if (item.collection === 'users') {
-            const invitePayload = buildInvitePayloadFromUser(
-              item.payload as unknown as UserAccount,
-              firebaseUser.uid
-            );
+            const userObj = item.payload as unknown as UserAccount;
+            const invitePayload = buildInvitePayloadFromUser(userObj, firebaseUser.uid);
             if (invitePayload && typeof invitePayload.id === 'string') {
               await setDoc(doc(db, 'invites', invitePayload.id), invitePayload, { merge: true });
             }
+            await syncCredentialLoginDocs(userObj, firebaseUser.uid);
           }
         } else if (item.operation === 'update' && item.payload) {
           const payload = prepareFirestoreRecordPayload(item.payload, firebaseUser.uid, {
@@ -672,13 +708,15 @@ export function useFuelStore() {
             }
           }
           if (item.collection === 'users') {
-            const mergedUser = liveStateRef.current.users.find((u) => u.uid === item.docId) ??
+            const mergedUser =
+              liveStateRef.current.users.find((u) => u.uid === item.docId) ??
               sandboxStateRef.current.users.find((u) => u.uid === item.docId);
             if (mergedUser) {
               const invitePayload = buildInvitePayloadFromUser(mergedUser, firebaseUser.uid);
               if (invitePayload && typeof invitePayload.id === 'string') {
                 await setDoc(doc(db, 'invites', invitePayload.id), invitePayload, { merge: true });
               }
+              await syncCredentialLoginDocs(mergedUser, firebaseUser.uid);
             }
           }
         } else if (item.operation === 'delete') {
@@ -696,7 +734,7 @@ export function useFuelStore() {
       setSyncNotice(`Synced ${syncedCount} queued record${syncedCount > 1 ? 's' : ''} to Firebase Cloud.`);
       setTimeout(() => setSyncNotice(null), 4000);
     }
-  }, [effectiveOnline, firebaseUser]);
+  }, [effectiveOnline, firebaseUser, syncCredentialLoginDocs]);
 
   // Reconcile local AI Studio records (Sandbox/Live transactions + Users) with Firestore
   const reconcileEnvironmentToCloud = useCallback(
@@ -720,6 +758,7 @@ export function useFuelStore() {
         invSnap,
         auditSnap,
         usersSnap,
+        credLoginsSnap,
       ] = await Promise.all([
         getDocs(collection(db, `${envPrefix}/depots`)),
         getDocs(collection(db, `${envPrefix}/vehicles`)),
@@ -728,6 +767,7 @@ export function useFuelStore() {
         getDocs(collection(db, `${envPrefix}/inventoryLogs`)),
         getDocs(collection(db, `${envPrefix}/auditLogs`)),
         getDocs(collection(db, 'users')),
+        getDocs(collection(db, 'credentialLogins')).catch(() => null),
       ]);
 
       const cloudDepots = depotsSnap.docs.map((d) => d.data() as FuelDepot);
@@ -737,6 +777,13 @@ export function useFuelStore() {
       const cloudInv = invSnap.docs.map((d) => d.data() as InventoryLog);
       const cloudAudit = auditSnap.docs.map((d) => d.data() as AuditLog);
       const cloudUsers = usersSnap.docs.map((d) => d.data() as UserAccount);
+      const existingCredLogins = new Map<string, { active?: boolean; updatedAt?: string }>();
+      if (credLoginsSnap) {
+        for (const d of credLoginsSnap.docs) {
+          const data = d.data() as { active?: boolean; updatedAt?: string };
+          existingCredLogins.set(d.id, data);
+        }
+      }
 
       const sandboxEmpty =
         targetEnv === 'sandbox' &&
@@ -827,7 +874,7 @@ export function useFuelStore() {
 
       let pushedCount = 0;
 
-      // 1. Sync Users & Invites first
+      // 1. Sync Users, Invites & CredentialLogin proof docs first
       for (const usr of usersRec.toCreate) {
         try {
           await syncUserAndInviteDoc(usr, fbUser.uid, true);
@@ -842,10 +889,36 @@ export function useFuelStore() {
           const mergedUsr: UserAccount = cloudExisting
             ? { ...usr, createdAt: cloudExisting.createdAt }
             : usr;
-          await syncUserAndInviteDoc(mergedUsr, fbUser.uid, false);
+          await syncUserAndInviteDoc(mergedUsr, fbUser.uid, false, cloudExisting);
           pushedCount += 1;
         } catch (err) {
           console.warn('User update sync skipped:', usr.uid, err);
+        }
+      }
+
+      const mergedUsers = deduplicateUsersByEmail(usersRec.merged);
+
+      // Backfill any existing Firestore /users missing /credentialLogins/{proofId} docs
+      for (const usr of mergedUsers) {
+        if (!usr.passwordHash) continue;
+        const expectedPayloads = buildCredentialLoginPayloadsFromUser(usr, fbUser.uid);
+        for (const credPayload of expectedPayloads) {
+          const existingCred = existingCredLogins.get(credPayload.id);
+          const needsWrite =
+            !existingCred ||
+            existingCred.active !== (credPayload.active as boolean) ||
+            (typeof credPayload.updatedAt === 'string' &&
+              (!existingCred.updatedAt || credPayload.updatedAt > existingCred.updatedAt));
+          if (needsWrite) {
+            try {
+              await setDoc(doc(db, 'credentialLogins', credPayload.id), credPayload, {
+                merge: true,
+              });
+              pushedCount += 1;
+            } catch (err) {
+              console.warn('CredentialLogin backfill skipped:', usr.uid, err);
+            }
+          }
         }
       }
 
@@ -887,7 +960,6 @@ export function useFuelStore() {
       await pushEnvItems('inventoryLogs', invRec.toUpdate, false);
       await pushEnvItems('auditLogs', auditRec.toCreate, true);
 
-      const mergedUsers = deduplicateUsersByEmail(usersRec.merged);
       const nextState: LocalSnapshotState = {
         users: mergedUsers,
         depots: depotsRec.merged,
@@ -1287,23 +1359,89 @@ export function useFuelStore() {
     }
   }, [envMode, firebaseUser, liveUserProfile, flushSyncQueue, reconcileEnvironmentToCloud]);
 
-  // Credential Authentication (Username/Email & Password assigned by Administrator)
+  // Credential Authentication (Username/Email & Password assigned by Administrator, Local + Cross-Device Cloud Proof)
   const loginWithCredentials = useCallback(
-    (username: string, password: string): { ok: boolean; user?: UserAccount; error?: string } => {
+    async (
+      username: string,
+      password: string
+    ): Promise<{ ok: boolean; user?: UserAccount; error?: string }> => {
       setGoogleAuthError(null);
-      const result = authenticateLocalUserCredentials({
-        liveUsers: liveState.users,
-        sandboxUsers: sandboxState.users,
+      const localResult = authenticateLocalUserCredentials({
+        liveUsers: liveStateRef.current.users,
+        sandboxUsers: sandboxStateRef.current.users,
         seedUsers: SEED_USERS,
         identifier: username,
         password,
       });
 
-      if (!result.ok || !result.user) {
-        return result;
+      let matched: UserAccount | undefined = localResult.ok ? localResult.user : undefined;
+
+      // Cross-device fallback: look up SHA-256 proof-keyed credential record in Firestore
+      if (!matched && effectiveOnline) {
+        const cleanId = normalizeUsernameInput(username);
+        if (cleanId && password) {
+          const passwordHash = hashPassword(password);
+          const proofId = computeCredentialProofId(cleanId, passwordHash);
+          if (proofId) {
+            try {
+              const credSnap = await getDoc(doc(db, 'credentialLogins', proofId));
+              if (credSnap.exists()) {
+                const cred = credSnap.data() as Partial<UserAccount> & { uid: string };
+                if (cred.active === false) {
+                  return {
+                    ok: false,
+                    error: 'This user account is suspended. Contact your Administrator.',
+                  };
+                }
+                const cloudMatched: UserAccount = {
+                  uid: cred.uid,
+                  username:
+                    (cred.username && normalizeUsernameInput(cred.username)) ||
+                    normalizeEmailToId(cred.email || cleanId).slice(0, 64),
+                  passwordHash,
+                  email: (cred.email || `${cleanId}@baiscity.gov.ph`).trim().toLowerCase(),
+                  displayName: cred.displayName || cleanId,
+                  role: cred.role ?? 'requester',
+                  department: cred.department || 'City Engineering Office',
+                  positionTitle: cred.positionTitle,
+                  canEdit: cred.role === 'admin' ? true : Boolean(cred.canEdit),
+                  canDelete: cred.role === 'admin' ? true : Boolean(cred.canDelete),
+                  canSwitchToLive: cred.role === 'admin' ? true : Boolean(cred.canSwitchToLive),
+                  active: true,
+                  createdBy: cred.createdBy || 'admin',
+                  createdAt: cred.createdAt || new Date().toISOString(),
+                  updatedAt: cred.updatedAt || new Date().toISOString(),
+                };
+                const upsertCredUser = (prev: LocalSnapshotState): LocalSnapshotState => {
+                  const cleanEmail = cloudMatched.email.trim().toLowerCase();
+                  const others = prev.users.filter(
+                    (u) => u.uid !== cloudMatched.uid && u.email.trim().toLowerCase() !== cleanEmail
+                  );
+                  return { ...prev, users: [cloudMatched, ...others] };
+                };
+                setSandboxState((prev) => {
+                  const next = upsertCredUser(prev);
+                  saveLocalState(SANDBOX_STORAGE_KEY, next);
+                  return next;
+                });
+                setLiveState((prev) => {
+                  const next = upsertCredUser(prev);
+                  saveLocalState(LIVE_CACHE_STORAGE_KEY, next);
+                  return next;
+                });
+                matched = cloudMatched;
+              }
+            } catch (err) {
+              console.warn('Cloud credential proof lookup failed:', err);
+            }
+          }
+        }
       }
 
-      const matched = result.user;
+      if (!matched) {
+        return localResult;
+      }
+
       const nowMs = Date.now();
       const defaultSection = getDefaultNavSection(matched.role);
       lastActivityAtRef.current = nowMs;
@@ -1325,7 +1463,7 @@ export function useFuelStore() {
       });
       return { ok: true, user: matched };
     },
-    [sandboxState.users, liveState.users]
+    [effectiveOnline]
   );
 
   const logout = useCallback(async () => {
@@ -1975,7 +2113,7 @@ export function useFuelStore() {
     [persistMutation, appendAudit]
   );
 
-  // 6. Admin User Creation, Edit, Delete & RBAC Management (Always synced to /users + /invites regardless of Sandbox/Live)
+  // 6. Admin User Creation, Edit, Delete & RBAC Management (Always synced to /users + /invites + /credentialLogins)
   const createUserAccount = useCallback(
     async (input: {
       username: string;
@@ -1990,13 +2128,31 @@ export function useFuelStore() {
       canSwitchToLive: boolean;
     }) => {
       const now = new Date().toISOString();
-      const cleanUsername = input.username.trim().toLowerCase();
+      const cleanUsername = normalizeUsernameInput(input.username).slice(0, 64);
+      if (cleanUsername.length < 2) {
+        throw new Error('User Account Name must be at least 2 characters.');
+      }
+      if (!input.password || input.password.length < 6) {
+        throw new Error('Assigned Password must be at least 6 characters.');
+      }
+      const cleanDisplayName = input.displayName.trim().slice(0, 120);
+      if (cleanDisplayName.length < 2) {
+        throw new Error('Full Name must be at least 2 characters.');
+      }
+      const cleanDepartment = input.department.trim().slice(0, 120);
+      if (cleanDepartment.length < 2) {
+        throw new Error('Department Concerned must be at least 2 characters.');
+      }
+
       const cleanEmail = input.email.trim().toLowerCase() || `${cleanUsername}@baiscity.gov.ph`;
       const emailKey = normalizeEmailToId(cleanEmail || cleanUsername) || makeId('usr');
-      const existingByEmail = deduplicateUsersByEmail([
+      const allKnownUsers = deduplicateUsersByEmail([
         ...liveStateRef.current.users,
         ...sandboxStateRef.current.users,
-      ]).find((u) => u.email.trim().toLowerCase() === cleanEmail);
+      ]);
+      const existingByEmail = allKnownUsers.find(
+        (u) => u.email.trim().toLowerCase() === cleanEmail
+      );
 
       const targetUid = existingByEmail ? existingByEmail.uid : emailKey;
       const userDoc: UserAccount = {
@@ -2004,10 +2160,10 @@ export function useFuelStore() {
         username: cleanUsername,
         passwordHash: hashPassword(input.password),
         email: cleanEmail,
-        displayName: input.displayName.trim(),
+        displayName: cleanDisplayName,
         role: input.role,
-        department: input.department.trim(),
-        positionTitle: input.positionTitle.trim() || 'Staff',
+        department: cleanDepartment,
+        positionTitle: input.positionTitle.trim().slice(0, 120) || 'Staff',
         canEdit: input.role === 'admin' ? true : input.canEdit,
         canDelete: input.role === 'admin' ? true : input.canDelete,
         canSwitchToLive: input.role === 'admin' ? true : input.canSwitchToLive,
@@ -2027,6 +2183,11 @@ export function useFuelStore() {
             console.warn('Invite write skipped:', err);
           }
         }
+        try {
+          await syncCredentialLoginDocs(userDoc, firebaseUser.uid, existingByEmail);
+        } catch (err) {
+          console.warn('CredentialLogin write skipped:', err);
+        }
       }
 
       await appendAudit(
@@ -2036,7 +2197,14 @@ export function useFuelStore() {
         `Created user ${userDoc.username} (${userDoc.email}) with role ${userDoc.role}, edit=${userDoc.canEdit}, delete=${userDoc.canDelete}, liveSwitch=${userDoc.canSwitchToLive}, dept=${userDoc.department}.`
       );
     },
-    [currentUser.uid, firebaseUser, effectiveOnline, persistMutation, appendAudit]
+    [
+      currentUser.uid,
+      firebaseUser,
+      effectiveOnline,
+      persistMutation,
+      syncCredentialLoginDocs,
+      appendAudit,
+    ]
   );
 
   const updateUserAccount = useCallback(
@@ -2057,14 +2225,34 @@ export function useFuelStore() {
     ) => {
       const now = new Date().toISOString();
       const cleanEmail = updates.email.trim().toLowerCase();
-      const cleanUsername = updates.username.trim().toLowerCase();
+      const cleanUsername = normalizeUsernameInput(updates.username).slice(0, 64);
+      if (cleanUsername.length < 2) {
+        throw new Error('User Account Name must be at least 2 characters.');
+      }
+      if (updates.password && updates.password.trim().length > 0 && updates.password.length < 6) {
+        throw new Error('Reset Password must be at least 6 characters.');
+      }
+      const cleanDisplayName = updates.displayName.trim().slice(0, 120);
+      if (cleanDisplayName.length < 2) {
+        throw new Error('Full Name must be at least 2 characters.');
+      }
+      const cleanDepartment = updates.department.trim().slice(0, 120);
+      if (cleanDepartment.length < 2) {
+        throw new Error('Department Concerned must be at least 2 characters.');
+      }
+
+      const previousUser =
+        liveStateRef.current.users.find((u) => u.uid === uid) ??
+        sandboxStateRef.current.users.find((u) => u.uid === uid) ??
+        null;
+
       const payload: Record<string, unknown> = {
         username: cleanUsername,
         email: cleanEmail,
-        displayName: updates.displayName.trim(),
+        displayName: cleanDisplayName,
         role: updates.role,
-        department: updates.department.trim(),
-        positionTitle: updates.positionTitle.trim() || 'Staff',
+        department: cleanDepartment,
+        positionTitle: updates.positionTitle.trim().slice(0, 120) || 'Staff',
         canEdit: updates.role === 'admin' ? true : updates.canEdit,
         canDelete: updates.role === 'admin' ? true : updates.canDelete,
         canSwitchToLive: updates.role === 'admin' ? true : updates.canSwitchToLive,
@@ -2077,9 +2265,6 @@ export function useFuelStore() {
       await persistMutation('users', uid, 'update', payload);
 
       if (firebaseUser && effectiveOnline && cleanEmail) {
-        const existingUser =
-          liveStateRef.current.users.find((u) => u.uid === uid) ??
-          sandboxStateRef.current.users.find((u) => u.uid === uid);
         const mergedUser: UserAccount = {
           uid,
           email: cleanEmail,
@@ -2087,7 +2272,7 @@ export function useFuelStore() {
           passwordHash:
             typeof payload.passwordHash === 'string'
               ? payload.passwordHash
-              : existingUser?.passwordHash,
+              : previousUser?.passwordHash,
           displayName: String(payload.displayName),
           role: updates.role,
           department: String(payload.department),
@@ -2095,9 +2280,9 @@ export function useFuelStore() {
           canEdit: Boolean(payload.canEdit),
           canDelete: Boolean(payload.canDelete),
           canSwitchToLive: Boolean(payload.canSwitchToLive),
-          active: existingUser?.active ?? true,
-          createdBy: existingUser?.createdBy || firebaseUser.uid,
-          createdAt: existingUser?.createdAt || now,
+          active: previousUser?.active ?? true,
+          createdBy: previousUser?.createdBy || firebaseUser.uid,
+          createdAt: previousUser?.createdAt || now,
           updatedAt: now,
         };
         const invitePayload = buildInvitePayloadFromUser(mergedUser, firebaseUser.uid);
@@ -2107,6 +2292,11 @@ export function useFuelStore() {
           } catch (err) {
             console.warn('Invite sync on user update skipped:', err);
           }
+        }
+        try {
+          await syncCredentialLoginDocs(mergedUser, firebaseUser.uid, previousUser);
+        } catch (err) {
+          console.warn('CredentialLogin sync on user update skipped:', err);
         }
       }
 
@@ -2121,7 +2311,14 @@ export function useFuelStore() {
         `Admin updated user ${String(payload.username)} (${String(payload.department)}).`
       );
     },
-    [authenticatedUser?.uid, firebaseUser, effectiveOnline, persistMutation, appendAudit]
+    [
+      authenticatedUser?.uid,
+      firebaseUser,
+      effectiveOnline,
+      persistMutation,
+      syncCredentialLoginDocs,
+      appendAudit,
+    ]
   );
 
   const deleteUserAccount = useCallback(
@@ -2134,6 +2331,12 @@ export function useFuelStore() {
             await deleteDoc(doc(db, 'users', emailId)).catch(() => {});
           }
           await deleteDoc(doc(db, 'invites', emailId)).catch(() => {});
+        }
+        if (user.passwordHash) {
+          const oldPayloads = buildCredentialLoginPayloadsFromUser(user, firebaseUser.uid);
+          for (const credPayload of oldPayloads) {
+            await deleteDoc(doc(db, 'credentialLogins', credPayload.id)).catch(() => {});
+          }
         }
       }
       await appendAudit(
@@ -2150,20 +2353,19 @@ export function useFuelStore() {
     async (user: UserAccount) => {
       const nextActive = !user.active;
       const now = new Date().toISOString();
+      const updatedUser: UserAccount = { ...user, active: nextActive, updatedAt: now };
       await persistMutation('users', user.uid, 'update', {
         active: nextActive,
         updatedAt: now,
       });
       if (firebaseUser && effectiveOnline) {
-        const invitePayload = buildInvitePayloadFromUser(
-          { ...user, active: nextActive, updatedAt: now },
-          firebaseUser.uid
-        );
+        const invitePayload = buildInvitePayloadFromUser(updatedUser, firebaseUser.uid);
         if (invitePayload && typeof invitePayload.id === 'string') {
           await setDoc(doc(db, 'invites', invitePayload.id), invitePayload, { merge: true }).catch(
             () => {}
           );
         }
+        await syncCredentialLoginDocs(updatedUser, firebaseUser.uid).catch(() => {});
         const emailId = normalizeEmailToId(user.email);
         if (emailId && emailId !== user.uid) {
           await updateDoc(doc(db, 'users', emailId), {
@@ -2179,7 +2381,7 @@ export function useFuelStore() {
         `Set user ${user.username || user.email} active status to ${nextActive}.`
       );
     },
-    [firebaseUser, effectiveOnline, persistMutation, appendAudit]
+    [firebaseUser, effectiveOnline, persistMutation, syncCredentialLoginDocs, appendAudit]
   );
 
   // 7. Purge Sandbox Records & Re-seed Sandbox (Synchronized to Firestore environments/sandbox)

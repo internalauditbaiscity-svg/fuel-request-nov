@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Edit3, ShieldAlert, Trash2, UserPlus, X } from 'lucide-react';
+import { CheckCircle2, Edit3, LogIn, ShieldAlert, Trash2, UserPlus, X } from 'lucide-react';
 import {
   BAIS_DEPARTMENTS,
   ROLE_LABELS,
@@ -12,6 +12,8 @@ import { RecordsPreviewGate } from './RecordsPreviewGate';
 interface UsersAdminViewProps {
   users: UserAccount[];
   currentUser: UserAccount;
+  firebaseUser?: { email?: string | null } | null;
+  onConnectGoogleForSync?: () => Promise<void>;
   onCreateUser: (input: {
     username: string;
     password: string;
@@ -46,6 +48,8 @@ interface UsersAdminViewProps {
 export function UsersAdminView({
   users,
   currentUser,
+  firebaseUser,
+  onConnectGoogleForSync,
   onCreateUser,
   onUpdateUser,
   onDeleteUser,
@@ -66,6 +70,8 @@ export function UsersAdminView({
   const [canDelete, setCanDelete] = useState(false);
   const [canSwitchToLive, setCanSwitchToLive] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const [formError, setFormError] = useState<string | null>(null);
+  const [actionNotice, setActionNotice] = useState<string | null>(null);
 
   // Edit modal state
   const [editingUser, setEditingUser] = useState<UserAccount | null>(null);
@@ -79,6 +85,8 @@ export function UsersAdminView({
   const [editCanEdit, setEditCanEdit] = useState(false);
   const [editCanDelete, setEditCanDelete] = useState(false);
   const [editCanSwitchToLive, setEditCanSwitchToLive] = useState(false);
+  const [editError, setEditError] = useState<string | null>(null);
+  const [editSubmitting, setEditSubmitting] = useState(false);
 
   if (!isAdmin) {
     return (
@@ -93,13 +101,16 @@ export function UsersAdminView({
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!username.trim() || !password.trim() || !displayName.trim() || !department.trim()) return;
+    setFormError(null);
+    setActionNotice(null);
+    const cleanUsername = username.trim().replace(/^@+/, '');
+    if (!cleanUsername || !password.trim() || !displayName.trim() || !department.trim()) return;
     setSubmitting(true);
     try {
       await onCreateUser({
-        username: username.trim(),
+        username: cleanUsername,
         password: password,
-        email: email.trim() || `${username.trim().toLowerCase()}@baiscity.gov.ph`,
+        email: email.trim() || `${cleanUsername.toLowerCase()}@baiscity.gov.ph`,
         displayName: displayName.trim(),
         role,
         department: department.trim(),
@@ -108,6 +119,11 @@ export function UsersAdminView({
         canDelete: role === 'admin' ? true : canDelete,
         canSwitchToLive: role === 'admin' ? true : canSwitchToLive,
       });
+      setActionNotice(
+        firebaseUser
+          ? `User account "${cleanUsername.toLowerCase()}" provisioned and synced to Cloud for cross-device sign-in.`
+          : `User account "${cleanUsername.toLowerCase()}" created on this browser. Click "Sign In with Google to Sync" so it can log in on other browsers or devices.`
+      );
       setUsername('');
       setPassword('');
       setEmail('');
@@ -117,12 +133,15 @@ export function UsersAdminView({
       setCanEdit(false);
       setCanDelete(false);
       setCanSwitchToLive(false);
+    } catch (err) {
+      setFormError(err instanceof Error ? err.message : 'Unable to create user account.');
     } finally {
       setSubmitting(false);
     }
   };
 
   const openEditModal = (u: UserAccount) => {
+    setEditError(null);
     setEditingUser(u);
     setEditUsername(u.username || u.email.split('@')[0]);
     setEditPassword('');
@@ -138,6 +157,7 @@ export function UsersAdminView({
 
   const closeEditModal = () => {
     setEditingUser(null);
+    setEditError(null);
     setEditUsername('');
     setEditPassword('');
     setEditEmail('');
@@ -154,31 +174,91 @@ export function UsersAdminView({
     if (!editingUser || !editUsername.trim() || !editDisplayName.trim() || !editDepartment.trim()) {
       return;
     }
-    await onUpdateUser(editingUser.uid, {
-      username: editUsername.trim(),
-      password: editPassword.trim() || undefined,
-      email: editEmail.trim(),
-      displayName: editDisplayName.trim(),
-      role: editRole,
-      department: editDepartment.trim(),
-      positionTitle: editPositionTitle.trim() || ROLE_LABELS[editRole],
-      canEdit: editRole === 'admin' ? true : editCanEdit,
-      canDelete: editRole === 'admin' ? true : editCanDelete,
-      canSwitchToLive: editRole === 'admin' ? true : editCanSwitchToLive,
-    });
-    closeEditModal();
+    setEditError(null);
+    setEditSubmitting(true);
+    try {
+      const cleanEditUsername = editUsername.trim().replace(/^@+/, '');
+      await onUpdateUser(editingUser.uid, {
+        username: cleanEditUsername,
+        password: editPassword.trim() || undefined,
+        email: editEmail.trim(),
+        displayName: editDisplayName.trim(),
+        role: editRole,
+        department: editDepartment.trim(),
+        positionTitle: editPositionTitle.trim() || ROLE_LABELS[editRole],
+        canEdit: editRole === 'admin' ? true : editCanEdit,
+        canDelete: editRole === 'admin' ? true : editCanDelete,
+        canSwitchToLive: editRole === 'admin' ? true : editCanSwitchToLive,
+      });
+      setActionNotice(
+        firebaseUser
+          ? `Updated "${cleanEditUsername.toLowerCase()}" and synced credentials to Cloud.`
+          : `Updated "${cleanEditUsername.toLowerCase()}" locally. Click "Sign In with Google to Sync" to push changes to other devices.`
+      );
+      closeEditModal();
+    } catch (err) {
+      setEditError(err instanceof Error ? err.message : 'Unable to save user changes.');
+    } finally {
+      setEditSubmitting(false);
+    }
   };
 
   return (
     <div className="space-y-6">
       {/* User Creation Form */}
       <section className="rounded-lg border border-[#D5DCE6] bg-white p-5 space-y-4">
-        <div className="flex items-center gap-2 border-b border-[#E6EBF2] pb-3">
-          <UserPlus className="h-4 w-4 text-[#1B3B6F]" />
-          <h2 className="font-display text-sm font-bold text-[#0B192C]">
-            Create Departmental User, Credentials & RBAC Permissions
-          </h2>
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#E6EBF2] pb-3">
+          <div className="flex items-center gap-2">
+            <UserPlus className="h-4 w-4 text-[#1B3B6F]" />
+            <h2 className="font-display text-sm font-bold text-[#0B192C]">
+              Create Departmental User, Credentials & RBAC Permissions
+            </h2>
+          </div>
+          {firebaseUser ? (
+            <span className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-emerald-800">
+              <CheckCircle2 className="h-3.5 w-3.5" />
+              <span>Cloud Credential Sync Active</span>
+            </span>
+          ) : (
+            onConnectGoogleForSync && (
+              <button
+                type="button"
+                onClick={onConnectGoogleForSync}
+                className="inline-flex items-center gap-1.5 rounded border border-[#1B3B6F] bg-[#EEF2F8] px-3 py-1 text-[11px] font-semibold text-[#0B192C] hover:bg-[#DCE4F0]"
+              >
+                <LogIn className="h-3 w-3 text-[#1B3B6F]" />
+                <span>Sign In with Google to Sync Cross-Device</span>
+              </button>
+            )
+          )}
         </div>
+
+        {!firebaseUser && (
+          <div
+            role="status"
+            className="rounded-md border border-amber-300 bg-amber-50 px-3.5 py-2.5 text-xs text-amber-950"
+          >
+            <strong>Local Browser Mode:</strong> Credentials created while signed in locally work immediately on this browser, and synchronize across other browsers or devices once you click <strong>Sign In with Google to Sync</strong>.
+          </div>
+        )}
+
+        {formError && (
+          <div
+            role="alert"
+            className="rounded-md border border-red-300 bg-red-50 px-3.5 py-2.5 text-xs font-medium text-red-900"
+          >
+            {formError}
+          </div>
+        )}
+
+        {actionNotice && !formError && (
+          <div
+            role="status"
+            className="rounded-md border border-emerald-300 bg-emerald-50 px-3.5 py-2.5 text-xs font-medium text-emerald-900"
+          >
+            {actionNotice}
+          </div>
+        )}
 
         <form onSubmit={handleSubmit} autoComplete="off" className="space-y-4">
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
@@ -462,6 +542,14 @@ export function UsersAdminView({
               </button>
             </div>
             <div className="p-5 grid grid-cols-1 gap-3 sm:grid-cols-2 text-xs">
+              {editError && (
+                <div
+                  role="alert"
+                  className="sm:col-span-2 rounded border border-red-300 bg-red-50 px-3 py-2 text-xs font-medium text-red-900"
+                >
+                  {editError}
+                </div>
+              )}
               <div>
                 <label className="block font-semibold text-[#334E73] mb-1">Full Name *</label>
                 <input
@@ -587,9 +675,10 @@ export function UsersAdminView({
               </button>
               <button
                 type="submit"
-                className="rounded bg-[#0B192C] px-4 py-2 text-xs font-semibold text-white hover:bg-[#1B3B6F]"
+                disabled={editSubmitting}
+                className="rounded bg-[#0B192C] px-4 py-2 text-xs font-semibold text-white hover:bg-[#1B3B6F] disabled:opacity-50"
               >
-                Save User Changes
+                {editSubmitting ? 'Saving...' : 'Save User Changes'}
               </button>
             </div>
           </form>

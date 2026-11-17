@@ -8,6 +8,7 @@
 5. **Single-Dispense Terminal Lock**: Once a `TripTicket` transitions to `dispensed` (`servedOnce == true`), non-admin users cannot re-dispense or alter dispensed/forfeited liters.
 6. **GSO Adjustment Verification**: Inventory shrinkage/overage adjustments can only be marked `verified` by an `admin` or `gso_dispenser` with a non-empty `digitalVerificationCode`.
 7. **Live Data Deletion Protection**: Deleting records in `live` environment is strictly restricted to `isAdmin()`. Sandbox purge (`sandbox` environment deletes) is permitted to `isAdmin()` (or authenticated operators in `sandbox`).
+8. **Proof-Keyed Cross-Device Credential Verification**: `/credentialLogins/{proofId}` allows `get` only with an exact 64-hex SHA-256 proof ID derived from `identifier + passwordHash`, excludes `passwordHash` from the document schema, forbids non-admin `list`, and restricts `create`/`update`/`delete` strictly to `isAdmin()`.
 
 ## 2. The "Dirty Dozen" Adversarial Payloads (Must Return PERMISSION_DENIED)
 1. **Unauthenticated Read/Write**: Any request with `request.auth == null` on `/environments/live/workPlans/wp1`.

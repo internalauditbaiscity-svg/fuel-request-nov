@@ -682,8 +682,8 @@ export function computeWorkPlanFuelTotals(tickets: TripTicket[]): {
   };
 }
 
-// Synchronous deterministic SHA-256 hex digest for credential verification (browser & Node safe)
-export function hashPassword(plain: string): string {
+// Synchronous deterministic SHA-256 hex digest (browser & Node safe)
+export function sha256Hex(plain: string): string {
   const utf8 = unescape(encodeURIComponent(plain));
   const words: number[] = [];
   for (let i = 0; i < utf8.length; i++) {
@@ -745,6 +745,10 @@ export function hashPassword(plain: string): string {
   }
 
   return H.map((x) => (x >>> 0).toString(16).padStart(8, '0')).join('');
+}
+
+export function hashPassword(plain: string): string {
+  return sha256Hex(plain);
 }
 
 // RBAC Permission Helpers
@@ -1539,6 +1543,74 @@ export function stripUndefinedFields<T extends Record<string, unknown>>(obj: T):
   return cleaned;
 }
 
+export function normalizeUsernameInput(raw: string): string {
+  return raw.trim().toLowerCase().replace(/^@+/, '');
+}
+
+export function computeCredentialProofId(identifier: string, passwordHash: string): string {
+  const cleanId = normalizeUsernameInput(identifier);
+  const cleanHash = (passwordHash || '').trim().toLowerCase();
+  if (!cleanId || !cleanHash) return '';
+  return sha256Hex(`bais_cred_v1:${cleanId}:${cleanHash}`);
+}
+
+export function buildCredentialLoginPayloadsFromUser(
+  user: UserAccount,
+  actorUid: string
+): Array<Record<string, unknown> & { id: string }> {
+  const cleanHash = (user.passwordHash || '').trim().toLowerCase();
+  const cleanEmail = (user.email || '').trim().toLowerCase().slice(0, 254);
+  const cleanUid = (user.uid || '').trim();
+  if (!cleanHash || !cleanUid || cleanEmail.length < 3) return [];
+
+  const cleanUsername = normalizeUsernameInput(user.username || '').slice(0, 64);
+  const isAdminRole = user.role === 'admin';
+  const nowIso = new Date().toISOString();
+  const rawDisplay = (user.displayName || cleanEmail).trim().slice(0, 120);
+  const safeDisplay = rawDisplay.length >= 2 ? rawDisplay : 'City Staff';
+  const rawDept = (user.department || 'City Engineering Office').trim().slice(0, 120);
+  const safeDept = rawDept.length >= 2 ? rawDept : 'City Engineering Office';
+  const rawPos = (user.positionTitle || '').trim().slice(0, 120);
+  const createdAt =
+    user.createdAt && user.createdAt.length >= 10 ? user.createdAt.slice(0, 64) : nowIso;
+  const updatedAt =
+    user.updatedAt && user.updatedAt.length >= 10 ? user.updatedAt.slice(0, 64) : createdAt;
+
+  const identifiers: string[] = [];
+  if (cleanUsername.length >= 2) identifiers.push(cleanUsername);
+  identifiers.push(cleanEmail);
+
+  const seenProofs = new Set<string>();
+  const results: Array<Record<string, unknown> & { id: string }> = [];
+
+  for (const ident of identifiers) {
+    const proofId = computeCredentialProofId(ident, cleanHash);
+    if (!proofId || seenProofs.has(proofId)) continue;
+    seenProofs.add(proofId);
+
+    const payload: Record<string, unknown> & { id: string } = {
+      id: proofId,
+      uid: cleanUid,
+      ...(cleanUsername.length >= 2 ? { username: cleanUsername } : {}),
+      email: cleanEmail,
+      displayName: safeDisplay,
+      role: user.role,
+      department: safeDept,
+      ...(rawPos.length > 0 ? { positionTitle: rawPos } : {}),
+      canEdit: isAdminRole ? true : Boolean(user.canEdit),
+      canDelete: isAdminRole ? true : Boolean(user.canDelete),
+      canSwitchToLive: isAdminRole ? true : Boolean(user.canSwitchToLive),
+      active: user.active !== false,
+      createdBy: (user.createdBy || actorUid || 'admin').slice(0, 128),
+      createdAt,
+      updatedAt,
+    };
+    results.push(stripUndefinedFields(payload) as Record<string, unknown> & { id: string });
+  }
+
+  return results;
+}
+
 export interface CredentialAuthResult {
   ok: boolean;
   user?: UserAccount;
@@ -1552,7 +1624,7 @@ export function authenticateLocalUserCredentials(params: {
   identifier: string;
   password: string;
 }): CredentialAuthResult {
-  const cleanId = params.identifier.trim().toLowerCase();
+  const cleanId = normalizeUsernameInput(params.identifier);
   if (!cleanId || !params.password) {
     return { ok: false, error: 'Enter both Account Name and Password.' };
   }
@@ -1565,7 +1637,7 @@ export function authenticateLocalUserCredentials(params: {
 
   const matchingAccounts = orderedPool.filter(
     (u) =>
-      (u.username && u.username.trim().toLowerCase() === cleanId) ||
+      (u.username && normalizeUsernameInput(u.username) === cleanId) ||
       u.email.trim().toLowerCase() === cleanId
   );
 
@@ -1573,7 +1645,7 @@ export function authenticateLocalUserCredentials(params: {
     return {
       ok: false,
       error:
-        'Account Name not recognized on this device. If you are using a different Gmail account or Live Cloud profile, click "Sign In with Google (Live Cloud)" below or contact your Administrator.',
+        'Account Name not recognized or credentials have not been synced to Cloud yet. Verify the account name, ask your Administrator to sync via Google, or click "Sign In with Google (Live Cloud)" below.',
     };
   }
 
@@ -1641,7 +1713,7 @@ export function mergeClaimedUserProfile(params: {
     const isAdminRole = role === 'admin';
     return {
       uid: params.uid,
-      username: (src.username || emailId).trim().toLowerCase().slice(0, 64),
+      username: normalizeUsernameInput(src.username || emailId).slice(0, 64),
       ...(src.passwordHash ? { passwordHash: src.passwordHash } : {}),
       email: cleanEmail,
       displayName: (src.displayName || params.displayName || cleanEmail).trim().slice(0, 120) || 'City Staff',
@@ -1676,6 +1748,14 @@ export function mergeClaimedUserProfile(params: {
   };
 }
 
+function mergeUserCredentials(preferred: UserAccount, secondary: UserAccount): UserAccount {
+  return {
+    ...preferred,
+    username: preferred.username || secondary.username,
+    passwordHash: preferred.passwordHash || secondary.passwordHash,
+  };
+}
+
 export function deduplicateUsersByEmail(users: UserAccount[]): UserAccount[] {
   const byEmail = new Map<string, UserAccount>();
   for (const user of users) {
@@ -1694,11 +1774,13 @@ export function deduplicateUsersByEmail(users: UserAccount[]): UserAccount[] {
     const currentIsPlaceholder = user.uid === emailPlaceholderId;
 
     if (existingIsPlaceholder && !currentIsPlaceholder) {
-      byEmail.set(key, user);
+      byEmail.set(key, mergeUserCredentials(user, existing));
     } else if (!existingIsPlaceholder && currentIsPlaceholder) {
-      continue;
+      byEmail.set(key, mergeUserCredentials(existing, user));
     } else if ((user.updatedAt || '') > (existing.updatedAt || '')) {
-      byEmail.set(key, user);
+      byEmail.set(key, mergeUserCredentials(user, existing));
+    } else {
+      byEmail.set(key, mergeUserCredentials(existing, user));
     }
   }
   return Array.from(byEmail.values());
@@ -1711,17 +1793,20 @@ export function buildInvitePayloadFromUser(
   const cleanEmail = (user.email || '').trim().toLowerCase();
   const inviteId = normalizeEmailToId(cleanEmail);
   if (!inviteId || cleanEmail.length < 3) return null;
-  const cleanUsername = (user.username || '').trim().toLowerCase();
+  const cleanUsername = normalizeUsernameInput(user.username || '').slice(0, 64);
   const isAdminRole = user.role === 'admin';
+  const rawDisplay = (user.displayName || cleanEmail).trim().slice(0, 120);
+  const rawDept = (user.department || 'City Engineering Office').trim().slice(0, 120);
+  const rawPos = (user.positionTitle || '').trim().slice(0, 120);
   const payload: Record<string, unknown> = {
     id: inviteId,
     email: cleanEmail.slice(0, 254),
-    ...(cleanUsername.length >= 2 ? { username: cleanUsername.slice(0, 64) } : {}),
+    ...(cleanUsername.length >= 2 ? { username: cleanUsername } : {}),
     ...(user.passwordHash ? { passwordHash: user.passwordHash.slice(0, 128) } : {}),
-    displayName: (user.displayName || cleanEmail).trim().slice(0, 120) || 'City Staff',
+    displayName: rawDisplay.length >= 2 ? rawDisplay : 'City Staff',
     role: user.role,
-    department: (user.department || 'City Engineering Office').trim().slice(0, 120),
-    positionTitle: (user.positionTitle || 'Staff').trim().slice(0, 120),
+    department: rawDept.length >= 2 ? rawDept : 'City Engineering Office',
+    ...(rawPos.length > 0 ? { positionTitle: rawPos } : {}),
     canEdit: isAdminRole ? true : Boolean(user.canEdit),
     canDelete: isAdminRole ? true : Boolean(user.canDelete),
     canSwitchToLive: isAdminRole ? true : Boolean(user.canSwitchToLive),
@@ -1740,17 +1825,32 @@ export function prepareFirestoreRecordPayload<T extends Record<string, unknown>>
   const cleaned = stripUndefinedFields(record);
 
   if (options?.collection === 'users') {
-    if (typeof cleaned.username === 'string' && cleaned.username.trim().length < 2) {
-      delete cleaned.username;
+    if (typeof cleaned.username === 'string') {
+      const normalized = normalizeUsernameInput(cleaned.username).slice(0, 64);
+      if (normalized.length < 2) {
+        delete cleaned.username;
+      } else {
+        cleaned.username = normalized;
+      }
     }
     if (typeof cleaned.email === 'string') {
       cleaned.email = cleaned.email.trim().toLowerCase().slice(0, 254);
     }
     if (typeof cleaned.displayName === 'string') {
-      cleaned.displayName = cleaned.displayName.trim().slice(0, 120);
+      const trimmedDisplay = cleaned.displayName.trim().slice(0, 120);
+      cleaned.displayName = trimmedDisplay.length >= 2 ? trimmedDisplay : 'City Staff';
     }
     if (typeof cleaned.department === 'string') {
-      cleaned.department = cleaned.department.trim().slice(0, 120);
+      const trimmedDept = cleaned.department.trim().slice(0, 120);
+      cleaned.department = trimmedDept.length >= 2 ? trimmedDept : 'City Engineering Office';
+    }
+    if (typeof cleaned.positionTitle === 'string') {
+      const trimmedPos = cleaned.positionTitle.trim().slice(0, 120);
+      if (!trimmedPos) {
+        delete cleaned.positionTitle;
+      } else {
+        cleaned.positionTitle = trimmedPos;
+      }
     }
     return cleaned;
   }

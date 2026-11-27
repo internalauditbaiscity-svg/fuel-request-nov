@@ -1,22 +1,25 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { AlertTriangle, CheckCircle2, Database, LogIn, RefreshCw, Trash2 } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, RefreshCw, Trash2 } from 'lucide-react';
 import { ApprovalsView } from './components/ApprovalsView';
 import { AuditLogsView } from './components/AuditLogsView';
 import { DashboardView } from './components/DashboardView';
 import { DepotInventoryView } from './components/DepotInventoryView';
 import { DispensingView } from './components/DispensingView';
-import { FleetRegistryView } from './components/FleetRegistryView';
 import { LoginView } from './components/LoginView';
+import { MasterRegistriesView } from './components/MasterRegistriesView';
 import { PdfPreviewModal } from './components/PdfPreviewModal';
+import { ReportUtilitiesModal } from './components/ReportUtilitiesModal';
 import { ReportsView } from './components/ReportsView';
 import { NavSection, SidebarNav } from './components/SidebarNav';
 import { TopHeader } from './components/TopHeader';
 import { UsersAdminView } from './components/UsersAdminView';
 import { WorkPlansView } from './components/WorkPlansView';
+import { useEscapeClose } from './hooks/useEscapeClose';
 import { useFuelStore } from './hooks/useFuelStore';
 import {
   buildDailyReconciliationReport,
   canAccessNavSection,
+  canManageReportUtilities,
   canManageUsers,
   canUserSwitchToLive,
   getDefaultNavSection,
@@ -29,7 +32,7 @@ import {
 
 const VALID_SECTIONS: NavSection[] = [
   'dashboard',
-  'fleet',
+  'registries',
   'work_plans',
   'approvals',
   'dispensing',
@@ -39,26 +42,30 @@ const VALID_SECTIONS: NavSection[] = [
   'audit',
 ];
 
+function normalizePersistedSection(raw: string | undefined): NavSection | undefined {
+  if (!raw) return undefined;
+  if (raw === 'fleet' || raw === 'pmc_projects') return 'registries';
+  return VALID_SECTIONS.includes(raw as NavSection) ? (raw as NavSection) : undefined;
+}
+
 export default function App() {
   const store = useFuelStore();
   const [activeSection, setActiveSection] = useState<NavSection>(() => {
-    const candidate = store.initialSection as NavSection | undefined;
-    if (
-      candidate &&
-      VALID_SECTIONS.includes(candidate) &&
-      canAccessNavSection(store.currentUser.role, candidate)
-    ) {
+    const candidate = normalizePersistedSection(store.initialSection);
+    if (candidate && canAccessNavSection(store.currentUser.role, candidate)) {
       return candidate;
     }
     return getDefaultNavSection(store.currentUser.role);
   });
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [newWorkPlanOpen, setNewWorkPlanOpen] = useState(false);
+  const [reportUtilitiesOpen, setReportUtilitiesOpen] = useState(false);
   const [purgeConfirmOpen, setPurgeConfirmOpen] = useState(false);
   const [reportDate, setReportDate] = useState<string>('');
   const [activePdf, setActivePdf] = useState<GeneratedPdfResult | null>(null);
-  const [authError, setAuthError] = useState<string | null>(null);
   const [sessionNonce, setSessionNonce] = useState(0);
+
+  useEscapeClose(purgeConfirmOpen, () => setPurgeConfirmOpen(false), 3);
 
   const reconciliation = useMemo(
     () =>
@@ -89,25 +96,8 @@ export default function App() {
     store.authenticatedUser?.role === 'admin' ||
       (store.envMode === 'live' && store.currentUser.role === 'admin')
   );
+  const canEditReportUtilities = canManageReportUtilities(store.currentUser.role);
   const canSwitchEnvironment = canUserSwitchToLive(store.currentUser);
-
-  const handleGoogleSignIn = async () => {
-    setAuthError(null);
-    try {
-      await store.signInWithGoogle();
-    } catch (err) {
-      setAuthError(err instanceof Error ? err.message : 'Google Sign-In failed.');
-    }
-  };
-
-  const handleConnectGoogleForSync = async () => {
-    setAuthError(null);
-    try {
-      await store.connectGoogleForSync();
-    } catch (err) {
-      setAuthError(err instanceof Error ? err.message : 'Google Sign-In failed.');
-    }
-  };
 
   const handleClosePdf = useCallback(() => {
     setActivePdf((prev) => {
@@ -153,9 +143,9 @@ export default function App() {
       store.persistActiveSection(defaultSection);
       setMobileNavOpen(false);
       setNewWorkPlanOpen(false);
+      setReportUtilitiesOpen(false);
       setPurgeConfirmOpen(false);
       setReportDate('');
-      setAuthError(null);
       handleClosePdf();
       setSessionNonce((n) => n + 1);
     } else if (signedOutNow) {
@@ -163,9 +153,9 @@ export default function App() {
       setActiveSection('dashboard');
       setMobileNavOpen(false);
       setNewWorkPlanOpen(false);
+      setReportUtilitiesOpen(false);
       setPurgeConfirmOpen(false);
       setReportDate('');
-      setAuthError(null);
       handleClosePdf();
       setSessionNonce((n) => n + 1);
     }
@@ -185,9 +175,9 @@ export default function App() {
     setActiveSection('dashboard');
     setMobileNavOpen(false);
     setNewWorkPlanOpen(false);
+    setReportUtilitiesOpen(false);
     setPurgeConfirmOpen(false);
     setReportDate('');
-    setAuthError(null);
     handleClosePdf();
     await store.logout();
     setSessionNonce((n) => n + 1);
@@ -240,7 +230,11 @@ export default function App() {
           store.persistActiveSection(nextDefault);
         }}
         sandboxDepartment={store.sandboxActiveDepartment}
+        sandboxDepartmentOptions={store.sandboxPreviewDepartmentOptions}
         onChangeSandboxDepartment={store.setSandboxActiveDepartment}
+        sandboxMatchingUsers={store.sandboxPreviewMatchingUsers}
+        selectedSandboxUserUid={store.selectedSandboxUserUid}
+        onChangeSelectedSandboxUserUid={store.setSelectedSandboxUserUid}
         onRequestPurgeSandbox={() => setPurgeConfirmOpen(true)}
         onSignOut={handleSignOut}
         pendingApprovalCount={pendingApprovalCount}
@@ -267,12 +261,9 @@ export default function App() {
           isOnline={store.isOnline}
           simulatedOffline={store.simulatedOffline}
           onToggleSimulatedOffline={() => store.setSimulatedOffline((v) => !v)}
-          syncQueueCount={store.syncQueue.length}
-          onFlushSyncQueue={store.firebaseUser ? store.reconcileNow : handleConnectGoogleForSync}
           isActualAdmin={isActualAdmin}
+          canManageReportUtilities={canEditReportUtilities}
           canCreateWorkPlan={canCreateWorkPlan}
-          firebaseUser={store.firebaseUser}
-          onSignIn={handleGoogleSignIn}
           onSignOut={handleSignOut}
           onOpenMobileNav={() => setMobileNavOpen(true)}
           onOpenNewWorkPlan={() => {
@@ -281,91 +272,69 @@ export default function App() {
             store.persistActiveSection('work_plans');
             setNewWorkPlanOpen(true);
           }}
+          onOpenReportUtilities={() => {
+            if (!canEditReportUtilities) return;
+            setReportUtilitiesOpen(true);
+          }}
           onRequestPurgeSandbox={() => setPurgeConfirmOpen(true)}
         />
 
-        {/* Contextual Environment / Sync / Auth Banners */}
-        <div className="px-4 pt-4 lg:px-6 space-y-2.5 max-w-[1440px] w-full mx-auto">
-          {store.syncNotice && (
-            <div className="flex items-center justify-between gap-2 rounded-md border border-[#C5D1E3] bg-[#EEF2F8] px-4 py-2.5 text-xs font-medium text-[#0B192C]">
-              <span className="flex items-center gap-2">
-                <CheckCircle2 className="h-4 w-4 text-[#1B3B6F] shrink-0" />
-                <span>{store.syncNotice}</span>
-              </span>
-            </div>
-          )}
-
-          {authError && (
-            <div className="rounded-md border border-red-300 bg-red-50 px-4 py-2.5 text-xs font-medium text-red-900">
-              {authError}
-            </div>
-          )}
-
-          {store.envMode === 'sandbox' && store.data.workPlans.length === 0 && store.data.vehicles.length === 0 && (
-            <div className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-[#D5DCE6] bg-white px-4 py-2.5 text-xs">
-              <span className="text-[#334E73]">
-                Sandbox practice database is currently purged. Start entering clean test records or restore Bais City sample records.
-              </span>
-              <button
-                type="button"
-                onClick={store.restoreSandboxDemoData}
-                className="inline-flex items-center gap-1.5 rounded border border-[#D5DCE6] bg-[#F3F5F8] px-3 py-1.5 text-xs font-semibold text-[#0B192C] hover:bg-[#E6EBF2]"
-              >
-                <RefreshCw className="h-3.5 w-3.5" />
-                <span>Restore Sample Data</span>
-              </button>
-            </div>
-          )}
-
-          {!store.firebaseUser &&
-            (store.envMode === 'live' || isActualAdmin || store.syncQueue.length > 0) && (
-              <div
-                data-testid="cloud-sync-banner"
-                className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-[#1B3B6F] bg-white px-4 py-3 text-xs"
-              >
-                <div className="flex items-center gap-2.5">
-                  <Database className="h-4 w-4 text-[#1B3B6F] shrink-0" />
-                  {store.envMode === 'live' ? (
-                    <span>
-                      <strong>Live Cloud Database Selected:</strong> Sign in with Google to synchronize real-time records with Firebase Firestore. Offline entries will queue until authenticated.
-                    </span>
-                  ) : (
-                    <span>
-                      <strong>Cloud Sync Standby (Sandbox):</strong> Transactions and user credentials created here synchronize with the deployed web app once linked via Google.
-                    </span>
-                  )}
-                </div>
-                <button
-                  type="button"
-                  onClick={handleConnectGoogleForSync}
-                  className="inline-flex items-center gap-1.5 rounded-md bg-[#0B192C] px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-[#1B3B6F] whitespace-nowrap"
-                >
-                  <LogIn className="h-3.5 w-3.5" />
-                  <span>
-                    {store.envMode === 'sandbox' ? 'Sign In with Google to Sync' : 'Sign In with Google'}
-                  </span>
-                </button>
-              </div>
-            )}
-
-          {store.envMode === 'live' &&
-            store.firebaseUser &&
+        {/* Contextual Environment / Sync Banners */}
+        {(Boolean(store.syncNotice) ||
+          (store.envMode === 'sandbox' &&
+            store.data.workPlans.length === 0 &&
+            store.data.vehicles.length === 0) ||
+          (store.envMode === 'live' &&
+            Boolean(store.firebaseUser) &&
             canManageUsers(store.currentUser.role) &&
-            store.data.depots.length === 0 && (
-              <div className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-[#D5DCE6] bg-white px-4 py-2.5 text-xs">
-                <span className="text-[#334E73]">
-                  Live Cloud Firestore is ready. Initialize baseline Bais City GSO Depots and Fleet units?
+            store.data.depots.length === 0)) && (
+          <div className="px-4 pt-4 lg:px-6 space-y-2.5 max-w-[1440px] w-full mx-auto">
+            {store.syncNotice && (
+              <div className="flex items-center justify-between gap-2 rounded-md border border-[#C5D1E3] bg-[#EEF2F8] px-4 py-2.5 text-xs font-medium text-[#0B192C]">
+                <span className="flex items-center gap-2">
+                  <CheckCircle2 className="h-4 w-4 text-[#1B3B6F] shrink-0" />
+                  <span>{store.syncNotice}</span>
                 </span>
-                <button
-                  type="button"
-                  onClick={store.seedLiveBaselineData}
-                  className="rounded-md bg-[#1B3B6F] px-3 py-1.5 text-xs font-semibold text-white hover:bg-[#0B192C] whitespace-nowrap"
-                >
-                  Initialize Live Baseline
-                </button>
               </div>
             )}
-        </div>
+
+            {store.envMode === 'sandbox' &&
+              store.data.workPlans.length === 0 &&
+              store.data.vehicles.length === 0 && (
+                <div className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-[#D5DCE6] bg-white px-4 py-2.5 text-xs">
+                  <span className="text-[#334E73]">
+                    Sandbox practice database is currently purged. Start entering clean test records or restore Bais City sample records.
+                  </span>
+                  <button
+                    type="button"
+                    onClick={store.restoreSandboxDemoData}
+                    className="inline-flex items-center gap-1.5 rounded border border-[#D5DCE6] bg-[#F3F5F8] px-3 py-1.5 text-xs font-semibold text-[#0B192C] hover:bg-[#E6EBF2]"
+                  >
+                    <RefreshCw className="h-3.5 w-3.5" />
+                    <span>Restore Sample Data</span>
+                  </button>
+                </div>
+              )}
+
+            {store.envMode === 'live' &&
+              store.firebaseUser &&
+              canManageUsers(store.currentUser.role) &&
+              store.data.depots.length === 0 && (
+                <div className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-[#D5DCE6] bg-white px-4 py-2.5 text-xs">
+                  <span className="text-[#334E73]">
+                    Live Cloud Firestore is ready. Initialize baseline Bais City GSO Depots and Fleet units?
+                  </span>
+                  <button
+                    type="button"
+                    onClick={store.seedLiveBaselineData}
+                    className="rounded-md bg-[#1B3B6F] px-3 py-1.5 text-xs font-semibold text-white hover:bg-[#0B192C] whitespace-nowrap"
+                  >
+                    Initialize Live Baseline
+                  </button>
+                </div>
+              )}
+          </div>
+        )}
 
         {/* Main Active Content Viewport */}
         <main className="flex-1 p-4 lg:p-6 max-w-[1440px] w-full mx-auto">
@@ -373,6 +342,7 @@ export default function App() {
             <DashboardView
               workPlans={store.visibleWorkPlans}
               tickets={store.visibleTickets}
+              vehicles={store.data.vehicles}
               depots={store.data.depots}
               reconciliation={reconciliation}
               currentUser={store.currentUser}
@@ -380,12 +350,24 @@ export default function App() {
             />
           )}
 
-          {resolvedSection === 'fleet' && (
-            <FleetRegistryView
-              vehicles={store.visibleVehicles}
+          {resolvedSection === 'registries' && (
+            <MasterRegistriesView
               currentUser={store.currentUser}
+              visibleVehicles={store.visibleVehicles}
               onSaveVehicle={store.saveVehicle}
               onDeleteVehicle={store.deleteVehicle}
+              pmcProjects={store.data.pmcProjects}
+              allTickets={store.data.tripTickets}
+              allWorkPlans={store.data.workPlans}
+              allVehicles={store.data.vehicles}
+              inventoryLogs={store.data.inventoryLogs}
+              depots={store.data.depots}
+              onSavePmcProject={store.savePmcProject}
+              onDeletePmcProject={store.deletePmcProject}
+              storageTanks={store.data.storageTanks}
+              onSaveDepotInfo={store.saveDepotInfo}
+              onSaveStorageTank={store.saveStorageTank}
+              onDeleteStorageTank={store.deleteStorageTank}
             />
           )}
 
@@ -395,14 +377,21 @@ export default function App() {
               allWorkPlans={store.data.workPlans}
               tickets={store.visibleTickets}
               allTickets={store.data.tripTickets}
-              vehicles={store.visibleVehicles}
+              vehicles={store.data.vehicles}
               depots={store.data.depots}
+              pmcProjects={store.data.pmcProjects}
+              inventoryLogs={store.data.inventoryLogs}
               currentUser={store.currentUser}
+              reportUtilities={store.reportUtilities}
               isModalOpen={newWorkPlanOpen}
               onOpenModal={() => setNewWorkPlanOpen(true)}
               onCloseModal={() => setNewWorkPlanOpen(false)}
               onCreateWorkPlan={store.createWorkPlanWithTickets}
-              onPreviewPdf={(wp, planTickets) => setActivePdf(generateWorkPlanPdf(wp, planTickets))}
+              onPreviewPdf={(wp, planTickets) =>
+                setActivePdf(
+                  generateWorkPlanPdf(wp, planTickets, store.reportUtilities, store.data.vehicles)
+                )
+              }
               onUpdateWorkPlanAdmin={store.updateWorkPlanAdmin}
               onDeleteWorkPlan={store.deleteWorkPlan}
             />
@@ -412,7 +401,9 @@ export default function App() {
             <ApprovalsView
               workPlans={store.visibleWorkPlans}
               tickets={store.visibleTickets}
+              vehicles={store.data.vehicles}
               currentUser={store.currentUser}
+              reportUtilities={store.reportUtilities}
               onSubmitApproval={store.submitTabletopApproval}
             />
           )}
@@ -421,28 +412,39 @@ export default function App() {
             <DispensingView
               tickets={store.visibleTickets}
               workPlans={store.visibleWorkPlans}
+              vehicles={store.data.vehicles}
               depots={store.data.depots}
+              storageTanks={store.data.storageTanks}
+              inventoryLogs={store.data.inventoryLogs}
               currentUser={store.currentUser}
+              reportUtilities={store.reportUtilities}
               onDispenseTicket={store.dispenseTripTicket}
+              onPreviewPdf={(pdf) => setActivePdf(pdf)}
             />
           )}
 
           {resolvedSection === 'inventory' && (
             <DepotInventoryView
               depots={store.data.depots}
+              storageTanks={store.data.storageTanks}
               inventoryLogs={store.data.inventoryLogs}
+              tickets={store.data.tripTickets}
+              workPlans={store.data.workPlans}
               currentUser={store.currentUser}
+              isOnline={store.isOnline}
+              syncQueueCount={store.syncQueue.length}
               onRecordTransaction={store.recordDepotTransaction}
               onVerifyPending={store.verifyPendingAdjustment}
+              onRecordTankDip={store.recordTankDipReading}
             />
           )}
 
           {resolvedSection === 'users' && (
             <UsersAdminView
               users={store.data.users}
+              vehicles={store.data.vehicles}
               currentUser={store.currentUser}
               firebaseUser={store.firebaseUser}
-              onConnectGoogleForSync={handleConnectGoogleForSync}
               onCreateUser={store.createUserAccount}
               onUpdateUser={store.updateUserAccount}
               onDeleteUser={store.deleteUserAccount}
@@ -456,12 +458,30 @@ export default function App() {
               onChangeReportDate={setReportDate}
               report={reconciliation}
               depots={store.data.depots}
+              vehicles={store.data.vehicles}
               currentUser={store.currentUser}
+              reportUtilities={store.reportUtilities}
+              onOpenReportUtilities={() => {
+                if (!canEditReportUtilities) return;
+                setReportUtilitiesOpen(true);
+              }}
               onPreviewDailyPdf={() =>
-                setActivePdf(generateDailyReconciliationPdf(reconciliation, store.data.depots))
+                setActivePdf(
+                  generateDailyReconciliationPdf(
+                    reconciliation,
+                    store.data.depots,
+                    store.reportUtilities,
+                    store.data.vehicles
+                  )
+                )
               }
               onDownloadDailyPdf={() => {
-                const res = generateDailyReconciliationPdf(reconciliation, store.data.depots);
+                const res = generateDailyReconciliationPdf(
+                  reconciliation,
+                  store.data.depots,
+                  store.reportUtilities,
+                  store.data.vehicles
+                );
                 res.doc.save(res.filename);
                 URL.revokeObjectURL(res.blobUrl);
               }}
@@ -469,7 +489,11 @@ export default function App() {
           )}
 
           {resolvedSection === 'audit' && (
-            <AuditLogsView logs={store.data.auditLogs} currentUser={store.currentUser} />
+            <AuditLogsView
+              logs={store.data.auditLogs}
+              vehicles={store.data.vehicles}
+              currentUser={store.currentUser}
+            />
           )}
         </main>
       </div>
@@ -483,18 +507,28 @@ export default function App() {
           aria-label="Confirm Sandbox Purge"
         >
           <div className="w-full max-w-md rounded-lg border border-[#D5DCE6] bg-white p-5 space-y-4">
-            <div className="flex items-start gap-3">
-              <div className="rounded-md bg-red-50 p-2 text-red-700 shrink-0">
-                <AlertTriangle className="h-5 w-5" />
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex items-start gap-3 min-w-0">
+                <div className="rounded-md bg-red-50 p-2 text-red-700 shrink-0">
+                  <AlertTriangle className="h-5 w-5" />
+                </div>
+                <div className="space-y-1">
+                  <h2 className="font-display text-base font-bold text-[#0B192C]">
+                    Purge Sandbox Practice Records?
+                  </h2>
+                  <p className="text-xs text-[#5A6F8C] leading-relaxed">
+                    This will delete all practice Work Plans, Trip Tickets, Fleet Units, and Inventory Logs inside the <strong>Sandbox</strong> database. Your <strong>Live Cloud</strong> database remains untouched.
+                  </p>
+                </div>
               </div>
-              <div className="space-y-1">
-                <h2 className="font-display text-base font-bold text-[#0B192C]">
-                  Purge Sandbox Practice Records?
-                </h2>
-                <p className="text-xs text-[#5A6F8C] leading-relaxed">
-                  This will delete all practice Work Plans, Trip Tickets, Fleet Units, and Inventory Logs inside the <strong>Sandbox</strong> database. Your <strong>Live Cloud</strong> database remains untouched.
-                </p>
-              </div>
+              <button
+                type="button"
+                onClick={() => setPurgeConfirmOpen(false)}
+                aria-label="Close sandbox purge dialog"
+                className="inline-flex items-center justify-center rounded-md bg-[#0B192C] px-3 py-1.5 text-xs font-semibold text-white hover:bg-[#1B3B6F] transition-colors whitespace-nowrap shrink-0"
+              >
+                Close
+              </button>
             </div>
             <div className="flex justify-end gap-2 pt-2 border-t border-[#E6EBF2]">
               <button
@@ -518,6 +552,16 @@ export default function App() {
             </div>
           </div>
         </div>
+      )}
+
+      {/* Report Utilities Modal (System Administrator only) */}
+      {canEditReportUtilities && (
+        <ReportUtilitiesModal
+          isOpen={reportUtilitiesOpen}
+          config={store.reportUtilities}
+          onClose={() => setReportUtilitiesOpen(false)}
+          onSave={store.saveReportUtilitiesConfig}
+        />
       )}
 
       {/* PDF Preview Modal */}

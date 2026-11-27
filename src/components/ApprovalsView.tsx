@@ -7,29 +7,50 @@ import {
   FileCheck2,
   FolderCheck,
   ShieldAlert,
-  X,
 } from 'lucide-react';
-import { TripTicket, UserAccount, WorkPlan } from '../types/fuel';
+import { FleetVehicle, ReportUtilitiesConfig, TripTicket, UserAccount, WorkPlan } from '../types/fuel';
 import {
   ApprovalFolderKey,
   canPerformTabletopApproval,
   categorizeAndFilterApprovals,
   computeWorkPlanFuelTotals,
   evaluateTabletopApproval,
+  formatDepartmentWithMnemonic,
+  formatWorkPlanPreparedTimestamp,
+  getActiveReportUtilityKeys,
+  getDepartmentMnemonic,
   getDynamicProgressiveYearOptions,
+  getLocalIsoDate,
+  getVehicleClassificationLabel,
+  getWorkPlanDisplayLabel,
+  getWorkPlanVehicleClassifications,
+  shouldDisplayWorkPlanSignOffs,
 } from '../utils/fuelEngine';
+import { useEscapeClose } from '../hooks/useEscapeClose';
 import { RecordsPreviewGate } from './RecordsPreviewGate';
 
 interface ApprovalsViewProps {
   workPlans: WorkPlan[];
   tickets: TripTicket[];
+  vehicles: FleetVehicle[];
   currentUser: UserAccount;
+  reportUtilities?: ReportUtilitiesConfig;
   onSubmitApproval: (
     workPlan: WorkPlan,
     adjustments: Array<{ ticket: TripTicket; proposedLiters: number; reason: string }>,
     approverNote: string
   ) => Promise<void>;
 }
+
+const APPROVALS_PREVIEW_COL_LABELS: Record<string, string> = {
+  department: 'Dept',
+  workPlanNo: 'WP No',
+  datePrepared: 'Prepared',
+  vehicleClassification: 'Veh Class',
+  ticketCount: 'Tickets',
+  totalDiesel: 'Diesel',
+  totalGasoline: 'Gas',
+};
 
 const MONTH_OPTIONS = [
   { value: 'all', label: 'All Months' },
@@ -50,10 +71,16 @@ const MONTH_OPTIONS = [
 export function ApprovalsView({
   workPlans,
   tickets,
+  vehicles,
   currentUser,
+  reportUtilities,
   onSubmitApproval,
 }: ApprovalsViewProps) {
   const canApprove = canPerformTabletopApproval(currentUser.role);
+  const activePreviewCols = useMemo(
+    () => getActiveReportUtilityKeys(reportUtilities, 'approvals_preview'),
+    [reportUtilities]
+  );
   const [previewOpen, setPreviewOpen] = useState(false);
   const [folderTab, setFolderTab] = useState<ApprovalFolderKey>('for_approval');
   const [departmentFilter, setDepartmentFilter] = useState('all');
@@ -117,6 +144,8 @@ export function ApprovalsView({
     [filteredPlans, selectedPlanId]
   );
 
+  useEscapeClose(Boolean(previewOpen && selectedPlan), () => setSelectedPlanId(null), 2);
+
   const getTicketProposed = (ticket: TripTicket) =>
     draftAmounts[ticket.id] !== undefined ? draftAmounts[ticket.id] : ticket.requestedLiters;
 
@@ -148,11 +177,11 @@ export function ApprovalsView({
       )}
 
       {/* Left: Filter Sequence (Department, Month, Year) | Right: 4 Approval Folders */}
-      <div className="rounded-lg border border-[#D5DCE6] bg-white p-4">
-        <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
+      <div className="rounded-lg border border-[#D5DCE6] bg-white p-3">
+        <div className="flex flex-col gap-2.5 xl:flex-row xl:items-center xl:justify-between">
           <div
             data-testid="approvals-filters"
-            className="flex flex-wrap items-center gap-2 text-xs"
+            className="flex flex-wrap items-center gap-1.5 text-xs"
           >
             <select
               id="approvals-filter-department"
@@ -162,12 +191,12 @@ export function ApprovalsView({
                 setDepartmentFilter(e.target.value);
                 setSelectedPlanId(null);
               }}
-              className="max-w-[215px] rounded-md border border-[#D5DCE6] bg-[#F9FAFC] px-2.5 py-2 text-xs text-[#0B192C] focus:border-[#1B3B6F] focus:bg-white focus:outline-none"
+              className="max-w-[190px] rounded-md border border-[#D5DCE6] bg-[#F9FAFC] px-2 py-1.5 text-xs text-[#0B192C] focus:border-[#1B3B6F] focus:bg-white focus:outline-none"
             >
-              <option value="all">All Departments</option>
+              <option value="all">All Depts</option>
               {departmentOptions.map((dept) => (
                 <option key={dept} value={dept}>
-                  {dept}
+                  {formatDepartmentWithMnemonic(dept, vehicles)}
                 </option>
               ))}
             </select>
@@ -180,7 +209,7 @@ export function ApprovalsView({
                 setMonthFilter(e.target.value);
                 setSelectedPlanId(null);
               }}
-              className="rounded-md border border-[#D5DCE6] bg-[#F9FAFC] px-2.5 py-2 text-xs text-[#0B192C] focus:border-[#1B3B6F] focus:bg-white focus:outline-none"
+              className="rounded-md border border-[#D5DCE6] bg-[#F9FAFC] px-2 py-1.5 text-xs text-[#0B192C] focus:border-[#1B3B6F] focus:bg-white focus:outline-none"
             >
               {MONTH_OPTIONS.map((m) => (
                 <option key={m.value} value={m.value}>
@@ -197,7 +226,7 @@ export function ApprovalsView({
                 setYearFilter(e.target.value);
                 setSelectedPlanId(null);
               }}
-              className="rounded-md border border-[#D5DCE6] bg-[#F9FAFC] px-2.5 py-2 font-mono text-xs text-[#0B192C] focus:border-[#1B3B6F] focus:bg-white focus:outline-none"
+              className="rounded-md border border-[#D5DCE6] bg-[#F9FAFC] px-2 py-1.5 font-mono text-xs text-[#0B192C] focus:border-[#1B3B6F] focus:bg-white focus:outline-none"
             >
               <option value="all">All Years</option>
               {yearOptions.map((yr) => (
@@ -212,31 +241,31 @@ export function ApprovalsView({
             data-testid="approvals-folders"
             role="tablist"
             aria-label="Approval Status Folders"
-            className="flex flex-wrap items-center gap-1.5 xl:justify-end"
+            className="flex items-center gap-1 overflow-x-auto xl:justify-end"
           >
             {(
               [
                 {
                   id: 'for_approval',
-                  label: 'For Approval',
+                  label: 'For Appr',
                   count: approvalFolders.forApproval.length,
                   Icon: Clock,
                 },
                 {
                   id: 'partially_approved',
-                  label: 'Partially Approved',
+                  label: 'Partial',
                   count: approvalFolders.partiallyApproved.length,
                   Icon: FileCheck2,
                 },
                 {
                   id: 'fully_approved',
-                  label: 'Fully Approved',
+                  label: 'Approved',
                   count: approvalFolders.fullyApproved.length,
                   Icon: FolderCheck,
                 },
                 {
                   id: 'inactive',
-                  label: 'Inactive Folder',
+                  label: 'Inactive',
                   count: approvalFolders.inactive.length,
                   Icon: Archive,
                 },
@@ -252,13 +281,13 @@ export function ApprovalsView({
                   setFolderTab(id);
                   setSelectedPlanId(null);
                 }}
-                className={`inline-flex items-center gap-1.5 rounded-md px-2.5 py-2 text-xs font-semibold transition-colors whitespace-nowrap ${
+                className={`inline-flex items-center gap-1 rounded px-2.5 py-1.5 text-[11px] font-semibold transition-colors whitespace-nowrap shrink-0 ${
                   folderTab === id
                     ? 'bg-[#0B192C] text-white'
                     : 'bg-[#F3F5F8] text-[#334E73] hover:bg-[#E6EBF2]'
                 }`}
               >
-                <Icon className="h-3.5 w-3.5 shrink-0" />
+                <Icon className="h-3 w-3 shrink-0" />
                 <span>
                   {label} ({count})
                 </span>
@@ -268,44 +297,49 @@ export function ApprovalsView({
         </div>
       </div>
 
-      {/* Preview-Gated Collapsed 5-Column Tabular Display */}
+      {/* Preview-Gated Tabular Summary Display */}
       <RecordsPreviewGate
         title={`Tabletop Approval — ${activeFolderLabel}`}
-        description="Click Preview to load the collapsed 5-column work plan summary table. Select any row to inspect trip tickets, reduce fuel requests, and approve."
+        description="Tap any row to inspect trip tickets, adjust approved liters, and approve."
         recordCount={filteredPlans.length}
         previewOpen={previewOpen}
         onTogglePreview={setPreviewOpen}
         buttonLabel="Preview Work Plans"
       >
         {filteredPlans.length === 0 ? (
-          <div className="rounded-lg border border-[#D5DCE6] bg-white p-10 text-center space-y-2">
-            <CheckCircle2 className="mx-auto h-8 w-8 text-emerald-700" />
-            <h2 className="font-display text-base font-bold text-[#0B192C]">
+          <div className="rounded-lg border border-[#D5DCE6] bg-white p-4 text-center space-y-1">
+            <CheckCircle2 className="mx-auto h-6 w-6 text-emerald-700" />
+            <h2 className="font-display text-xs sm:text-sm font-bold text-[#0B192C]">
               No Work Plans in {activeFolderLabel}
             </h2>
-            <p className="text-xs text-[#5A6F8C]">
-              Adjust your Department, Month, or Year filters to inspect other submissions.
-            </p>
           </div>
         ) : (
-          <div className="space-y-4">
-            {/* Strictly 5-Column Collapsed Tabular Display */}
+          <div className="space-y-3">
+            {/* Tabletop Summary Table with Date Prepared Timestamp & Vehicle Classification */}
             <div className="rounded-lg border border-[#D5DCE6] bg-white overflow-hidden">
               <div className="overflow-x-auto">
-                <table className="w-full text-left text-xs">
-                  <thead className="border-b border-[#D5DCE6] bg-[#F3F5F8] text-[#334E73]">
+                <table className="w-full text-left text-[11px] sm:text-xs" data-testid="approvals-preview-table">
+                  <thead className="border-b border-[#CBD5E1] bg-[#EEF2F8] text-[#1E3A5F]">
                     <tr>
-                      <th className="px-4 py-3 font-semibold">Department</th>
-                      <th className="px-4 py-3 font-semibold">Workplan No</th>
-                      <th className="px-4 py-3 font-semibold text-right">No of Trip Tickets</th>
-                      <th className="px-4 py-3 font-semibold text-right">Total Diesel</th>
-                      <th className="px-4 py-3 font-semibold text-right">Total Gasoline</th>
+                      {activePreviewCols.map((colKey) => (
+                        <th
+                          key={colKey}
+                          data-col-key={colKey}
+                          className="px-2 py-2 sm:px-2.5 text-center align-middle text-[10px] sm:text-[11px] font-bold tracking-wide leading-tight whitespace-nowrap"
+                        >
+                          {APPROVALS_PREVIEW_COL_LABELS[colKey] ?? colKey}
+                        </th>
+                      ))}
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-[#E6EBF2]">
                     {filteredPlans.map((plan) => {
                       const planTickets = tickets.filter((t) => t.workPlanId === plan.id);
                       const totals = computeWorkPlanFuelTotals(planTickets);
+                      const preparedTimestamp = formatWorkPlanPreparedTimestamp(plan);
+                      const classifications = getWorkPlanVehicleClassifications(planTickets, vehicles);
+                      const planDisplayLabel = getWorkPlanDisplayLabel(plan);
+                      const planTestKey = plan.controlNumber || plan.id;
                       const isSelected = selectedPlanId === plan.id;
 
                       return (
@@ -316,21 +350,92 @@ export function ApprovalsView({
                             isSelected ? 'bg-[#EEF2F8]' : 'hover:bg-[#F9FAFC]'
                           }`}
                         >
-                          <td className="px-4 py-3 font-medium text-[#0B192C]">
-                            {plan.department}
-                          </td>
-                          <td className="px-4 py-3 font-mono font-bold text-[#1B3B6F] whitespace-nowrap">
-                            {plan.controlNumber}
-                          </td>
-                          <td className="px-4 py-3 text-right font-mono tabular-nums text-[#0B192C]">
-                            {totals.ticketCount}
-                          </td>
-                          <td className="px-4 py-3 text-right font-mono tabular-nums font-semibold text-[#0B192C]">
-                            {totals.totalDiesel.toFixed(1)} L
-                          </td>
-                          <td className="px-4 py-3 text-right font-mono tabular-nums font-semibold text-[#1B3B6F]">
-                            {totals.totalGasoline.toFixed(1)} L
-                          </td>
+                          {activePreviewCols.map((colKey) => {
+                            switch (colKey) {
+                              case 'department':
+                                return (
+                                  <td
+                                    key={colKey}
+                                    title={plan.department}
+                                    className="px-2 py-2 sm:px-3 font-mono font-bold text-[#0B192C] whitespace-nowrap"
+                                  >
+                                    {getDepartmentMnemonic(plan.department, vehicles)}
+                                  </td>
+                                );
+                              case 'workPlanNo':
+                                return (
+                                  <td
+                                    key={colKey}
+                                    className="px-2 py-2 sm:px-3 font-mono font-bold text-[#1B3B6F] whitespace-nowrap"
+                                    data-testid={`approvals-row-wp-${planTestKey}`}
+                                  >
+                                    {planDisplayLabel}
+                                  </td>
+                                );
+                              case 'datePrepared':
+                                return (
+                                  <td
+                                    key={colKey}
+                                    className="px-2 py-2 sm:px-3 font-mono text-[10px] sm:text-[11px] text-[#334E73] whitespace-nowrap"
+                                    data-testid={`approvals-row-prepared-${planTestKey}`}
+                                  >
+                                    {preparedTimestamp}
+                                  </td>
+                                );
+                              case 'vehicleClassification':
+                                return (
+                                  <td
+                                    key={colKey}
+                                    className="px-2 py-2 sm:px-3 text-[#0B192C]"
+                                    data-testid={`approvals-row-classification-${planTestKey}`}
+                                  >
+                                    {classifications.length > 0 ? (
+                                      <div className="flex flex-wrap gap-1">
+                                        {classifications.map((cls) => (
+                                          <span
+                                            key={cls}
+                                            className="inline-block rounded border border-[#D5DCE6] bg-[#F3F5F8] px-1.5 py-0.5 text-[10px] sm:text-[11px] font-medium text-[#1E3A5F]"
+                                          >
+                                            {cls}
+                                          </span>
+                                        ))}
+                                      </div>
+                                    ) : (
+                                      <span className="text-[#5A6F8C]">Unclassified</span>
+                                    )}
+                                  </td>
+                                );
+                              case 'ticketCount':
+                                return (
+                                  <td
+                                    key={colKey}
+                                    className="px-2 py-2 sm:px-3 text-right font-mono tabular-nums text-[#0B192C]"
+                                  >
+                                    {totals.ticketCount}
+                                  </td>
+                                );
+                              case 'totalDiesel':
+                                return (
+                                  <td
+                                    key={colKey}
+                                    className="px-2 py-2 sm:px-3 text-right font-mono tabular-nums font-semibold text-[#0B192C] whitespace-nowrap"
+                                  >
+                                    {totals.totalDiesel.toFixed(1)} L
+                                  </td>
+                                );
+                              case 'totalGasoline':
+                                return (
+                                  <td
+                                    key={colKey}
+                                    className="px-2 py-2 sm:px-3 text-right font-mono tabular-nums font-semibold text-[#1B3B6F] whitespace-nowrap"
+                                  >
+                                    {totals.totalGasoline.toFixed(1)} L
+                                  </td>
+                                );
+                              default:
+                                return null;
+                            }
+                          })}
                         </tr>
                       );
                     })}
@@ -339,9 +444,15 @@ export function ApprovalsView({
               </div>
             </div>
 
-            {/* Selected Work Plan Detailed Tabletop Review & Approval Panel */}
+            {/* Selected Work Plan Detailed Tabletop Review & Approval Panel (Mobile-Compact Floating Window) */}
             {selectedPlan && (
-              <section className="rounded-lg border border-[#1B3B6F] bg-white overflow-hidden">
+              <div
+                className="fixed inset-0 z-[45] flex items-center justify-center bg-[#0B192C]/60 p-2 sm:p-4"
+                role="dialog"
+                aria-modal="true"
+                aria-label={`Tabletop Review ${getWorkPlanDisplayLabel(selectedPlan)}`}
+              >
+                <section className="max-h-[88vh] w-full max-w-[96vw] sm:max-w-xl md:max-w-2xl overflow-y-auto rounded-lg border border-[#1B3B6F] bg-white shadow-2xl">
                 {(() => {
                   const planTickets = tickets.filter((t) => t.workPlanId === selectedPlan.id);
                   const isPending = selectedPlan.status === 'pending_approval';
@@ -350,65 +461,84 @@ export function ApprovalsView({
                     0
                   );
                   const reductionTotal = Math.max(0, selectedPlan.totalRequestedLiters - proposedTotal);
+                  const selectedDisplayLabel = getWorkPlanDisplayLabel(selectedPlan);
 
                   return (
                     <>
-                      <div className="flex flex-col gap-3 border-b border-[#D5DCE6] bg-[#F9FAFC] px-5 py-4 lg:flex-row lg:items-center lg:justify-between">
-                        <div className="space-y-1">
-                          <div className="flex flex-wrap items-center gap-2 text-xs text-[#5A6F8C]">
-                            <span className="font-mono font-bold text-[#1B3B6F]">
-                              {selectedPlan.controlNumber}
-                            </span>
-                            <span aria-hidden="true">·</span>
-                            <span className="font-medium text-[#0B192C]">
-                              {selectedPlan.department}
-                            </span>
-                            <span aria-hidden="true">·</span>
-                            <span className="font-mono">
-                              {selectedPlan.weekStart} to {selectedPlan.weekEnd}
-                            </span>
-                            <span aria-hidden="true">·</span>
-                            <span className="uppercase font-bold text-[#0B192C]">
-                              {selectedPlan.status.replace(/_/g, ' ')}
-                            </span>
+                      <div className="border-b border-[#D5DCE6] bg-[#F9FAFC] px-3 py-2.5 sm:px-4 sm:py-3 space-y-2">
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="min-w-0 flex-1">
+                            <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[11px] text-[#5A6F8C]">
+                              <span
+                                data-testid="approvals-review-workplan-label"
+                                className="font-mono font-bold text-[#1B3B6F]"
+                              >
+                                {selectedDisplayLabel}
+                              </span>
+                              <span aria-hidden="true">·</span>
+                              <span
+                                className="font-mono font-bold text-[#0B192C]"
+                                title={selectedPlan.department}
+                              >
+                                {getDepartmentMnemonic(selectedPlan.department, vehicles)}
+                              </span>
+                              <span aria-hidden="true">·</span>
+                              <span className="uppercase font-bold text-[#0B192C] text-[10px]">
+                                {selectedPlan.status.replace(/_/g, ' ')}
+                              </span>
+                            </div>
+                            <h2 className="mt-0.5 font-display text-xs sm:text-sm font-bold text-[#0B192C] truncate">
+                              {selectedPlan.projectTitle}
+                            </h2>
+                            <div className="text-[10px] sm:text-[11px] text-[#5A6F8C]">
+                              Prepared:{' '}
+                              <span
+                                data-testid="approvals-review-prepared-timestamp"
+                                className="font-mono font-semibold text-[#1B3B6F]"
+                              >
+                                {formatWorkPlanPreparedTimestamp(selectedPlan)}
+                              </span>
+                              {shouldDisplayWorkPlanSignOffs(selectedPlan) && (
+                                <span className="hidden sm:inline">
+                                  {' '}· By: {selectedPlan.preparedBy}
+                                </span>
+                              )}{' '}
+                              · Appr Date:{' '}
+                              <span className="font-mono font-semibold text-[#1B3B6F]">{getLocalIsoDate()}</span>
+                            </div>
                           </div>
-                          <h2 className="font-display text-base font-bold text-[#0B192C]">
-                            {selectedPlan.projectTitle}
-                          </h2>
-                          <div className="text-xs text-[#5A6F8C]">
-                            Prepared by: {selectedPlan.preparedBy} ({selectedPlan.preparedByDesignation || 'Staff'}) ·
-                            Reviewed by: {selectedPlan.reviewedBy} ({selectedPlan.reviewedByDesignation || 'Reviewer'}) ·
-                            Division Head: {selectedPlan.divisionHead}
-                          </div>
-                        </div>
 
-                        <div className="flex items-center gap-4 shrink-0">
-                          <div className="text-right">
-                            <div className="text-[11px] text-[#5A6F8C]">Requested</div>
-                            <div className="font-mono text-sm font-semibold tabular-nums text-[#0B192C]">
-                              {selectedPlan.totalRequestedLiters.toFixed(1)} L
-                            </div>
-                          </div>
-                          <div className="text-right">
-                            <div className="text-[11px] text-[#5A6F8C]">Approved</div>
-                            <div className="font-mono text-sm font-bold tabular-nums text-[#1B3B6F]">
-                              {proposedTotal.toFixed(1)} L
-                            </div>
-                          </div>
-                          <div className="text-right">
-                            <div className="text-[11px] text-[#5A6F8C]">Reduction</div>
-                            <div className="font-mono text-sm font-semibold tabular-nums text-amber-800">
-                              -{reductionTotal.toFixed(1)} L
-                            </div>
-                          </div>
                           <button
                             type="button"
                             onClick={() => setSelectedPlanId(null)}
-                            aria-label="Collapse selected work plan"
-                            className="rounded border border-[#D5DCE6] bg-white p-1.5 text-[#334E73] hover:bg-[#F3F5F8]"
+                            aria-label="Close selected work plan"
+                            data-testid="approvals-review-close-btn"
+                            className="inline-flex items-center justify-center rounded-md bg-[#0B192C] px-3 py-1.5 text-xs font-semibold text-white hover:bg-[#1B3B6F] transition-colors whitespace-nowrap shrink-0"
                           >
-                            <X className="h-4 w-4" />
+                            Close
                           </button>
+                        </div>
+
+                        {/* Compact Inline Totals Strip (Visible on Mobile & Desktop) */}
+                        <div className="grid grid-cols-3 gap-1.5 rounded border border-[#E6EBF2] bg-white px-2 py-1 text-center">
+                          <div>
+                            <div className="text-[10px] text-[#5A6F8C]">Req</div>
+                            <div className="font-mono text-xs font-semibold tabular-nums text-[#0B192C]">
+                              {selectedPlan.totalRequestedLiters.toFixed(1)} L
+                            </div>
+                          </div>
+                          <div>
+                            <div className="text-[10px] text-[#5A6F8C]">Appr</div>
+                            <div className="font-mono text-xs font-bold tabular-nums text-[#1B3B6F]">
+                              {proposedTotal.toFixed(1)} L
+                            </div>
+                          </div>
+                          <div>
+                            <div className="text-[10px] text-[#5A6F8C]">Red</div>
+                            <div className="font-mono text-xs font-semibold tabular-nums text-amber-800">
+                              -{reductionTotal.toFixed(1)} L
+                            </div>
+                          </div>
                         </div>
                       </div>
 
@@ -416,44 +546,43 @@ export function ApprovalsView({
                         {planTickets.map((t) => {
                           const proposed = isPending ? getTicketProposed(t) : t.approvedLiters;
                           const evalRes = evaluateTabletopApproval(t.requestedLiters, proposed);
+                          const vehicleClassification = getVehicleClassificationLabel(vehicles, t);
 
                           return (
-                            <div key={t.id} className="p-4 space-y-3">
-                              <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-                                <div className="space-y-1">
-                                  <div className="flex flex-wrap items-center gap-2 text-xs">
+                            <div key={t.id} className="p-2.5 sm:p-3.5 space-y-2">
+                              <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                                <div className="space-y-0.5 min-w-0">
+                                  <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
                                     <span className="font-mono font-bold text-[#0B192C]">
                                       {t.ticketNumber}
                                     </span>
                                     <span aria-hidden="true">·</span>
-                                    <span className="font-mono text-[#1B3B6F]">{t.plateNumber}</span>
-                                    <span aria-hidden="true">·</span>
-                                    <span className="text-[#334E73]">{t.vehicleLabel}</span>
-                                    <span aria-hidden="true">·</span>
-                                    <span className="uppercase font-mono text-[#5A6F8C]">
-                                      {t.fuelType}
+                                    <span className="font-mono font-semibold text-[#1B3B6F]">{t.plateNumber}</span>
+                                    <span
+                                      data-testid={`approvals-ticket-class-${t.ticketNumber}`}
+                                      className="inline-block rounded border border-[#D5DCE6] bg-[#F3F5F8] px-1.5 py-0.5 text-[10px] font-semibold text-[#1E3A5F]"
+                                    >
+                                      {vehicleClassification}
+                                    </span>
+                                    <span className="uppercase font-mono text-[10px] text-[#5A6F8C]">
+                                      {t.fuelType === 'gasoline' ? 'GAS' : 'DSL'}
                                     </span>
                                   </div>
-                                  <div className="text-xs text-[#334E73]">
-                                    Purpose: <strong className="text-[#0B192C]">{t.purposeOrProject || t.projectTitle}</strong>
+                                  <div className="text-[11px] text-[#334E73] truncate">
+                                    <strong className="text-[#0B192C]">{t.driverName}</strong> · {t.destination} ({t.scheduledDate})
                                   </div>
-                                  <div className="text-xs text-[#5A6F8C]">
-                                    Driver: <strong className="text-[#0B192C]">{t.driverName}</strong> ·
-                                    Destination: {t.destination} ({t.scheduledDate})
-                                  </div>
-                                  <div className="text-[11px] font-mono text-[#334E73]">
-                                    Auto Limit: {t.computedLimitLiters.toFixed(1)} L · Requested:{' '}
-                                    {t.requestedLiters.toFixed(1)} L
+                                  <div className="text-[10px] font-mono text-[#5A6F8C]">
+                                    Limit: {t.computedLimitLiters.toFixed(1)} L · Req: {t.requestedLiters.toFixed(1)} L
                                   </div>
                                 </div>
 
-                                <div className="flex flex-col sm:flex-row sm:items-center gap-3 shrink-0">
-                                  <div className="flex items-center gap-2">
+                                <div className="flex flex-wrap items-center justify-between sm:justify-end gap-2 shrink-0">
+                                  <div className="flex items-center gap-1.5">
                                     <label
                                       htmlFor={`slider-${t.id}`}
                                       className="text-[11px] font-semibold text-[#334E73] whitespace-nowrap"
                                     >
-                                      Approve Liters:
+                                      Appr (L):
                                     </label>
                                     <input
                                       id={`slider-${t.id}`}
@@ -469,7 +598,7 @@ export function ApprovalsView({
                                           [t.id]: Number(e.target.value),
                                         }))
                                       }
-                                      className="w-28 accent-[#1B3B6F]"
+                                      className="w-20 sm:w-24 accent-[#1B3B6F]"
                                     />
                                     <input
                                       type="number"
@@ -488,11 +617,11 @@ export function ApprovalsView({
                                           ),
                                         }))
                                       }
-                                      className="w-20 rounded border border-[#D5DCE6] px-2 py-1 text-right font-mono text-xs font-bold text-[#0B192C]"
+                                      className="w-16 rounded border border-[#D5DCE6] px-1.5 py-1 text-right font-mono text-xs font-bold text-[#0B192C]"
                                     />
                                   </div>
                                   <span
-                                    className={`text-xs font-mono font-semibold whitespace-nowrap ${
+                                    className={`text-[11px] font-mono font-semibold whitespace-nowrap ${
                                       evalRes.status === 'rejected'
                                         ? 'text-red-700'
                                         : evalRes.status === 'reduced'
@@ -501,10 +630,10 @@ export function ApprovalsView({
                                     }`}
                                   >
                                     {evalRes.status === 'reduced'
-                                      ? `-${evalRes.reductionLiters.toFixed(1)} L (-${evalRes.reductionPct}%)`
+                                      ? `-${evalRes.reductionLiters.toFixed(1)} L`
                                       : evalRes.status === 'rejected'
-                                        ? 'Rejected (0 L)'
-                                        : 'Full Approval'}
+                                        ? '0 L'
+                                        : 'Full'}
                                   </span>
                                 </div>
                               </div>
@@ -513,12 +642,12 @@ export function ApprovalsView({
                                 <input
                                   type="text"
                                   disabled={!canApprove}
-                                  placeholder="Enter tabletop assessment reduction justification..."
+                                  placeholder="Reduction justification..."
                                   value={draftReasons[t.id] ?? ''}
                                   onChange={(e) =>
                                     setDraftReasons((prev) => ({ ...prev, [t.id]: e.target.value }))
                                   }
-                                  className="w-full rounded-md border border-[#D5DCE6] bg-[#F3F5F8] px-3 py-1.5 text-xs text-[#0B192C] placeholder:text-[#5A6F8C] focus:bg-white focus:outline-none"
+                                  className="w-full rounded-md border border-[#D5DCE6] bg-[#F3F5F8] px-2.5 py-1.5 text-xs text-[#0B192C] placeholder:text-[#5A6F8C] focus:bg-white focus:outline-none"
                                 />
                               )}
                             </div>
@@ -527,11 +656,11 @@ export function ApprovalsView({
                       </div>
 
                       {isPending && (
-                        <div className="flex flex-col gap-3 border-t border-[#D5DCE6] bg-[#F3F5F8] px-5 py-3.5 sm:flex-row sm:items-center sm:justify-between">
+                        <div className="flex flex-col gap-2 border-t border-[#D5DCE6] bg-[#F3F5F8] px-3 py-2.5 sm:flex-row sm:items-center sm:justify-between sm:px-4">
                           <input
                             type="text"
                             disabled={!canApprove}
-                            placeholder="Optional committee tabletop assessment remarks..."
+                            placeholder="Optional tabletop remarks..."
                             value={planNotes[selectedPlan.id] ?? ''}
                             onChange={(e) =>
                               setPlanNotes((prev) => ({ ...prev, [selectedPlan.id]: e.target.value }))
@@ -556,7 +685,8 @@ export function ApprovalsView({
                     </>
                   );
                 })()}
-              </section>
+                </section>
+              </div>
             )}
           </div>
         )}

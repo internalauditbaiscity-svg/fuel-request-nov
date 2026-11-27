@@ -1,11 +1,24 @@
-import jsPDF from 'jspdf';
+import { jsPDF } from 'jspdf';
 import autoTable from 'jspdf-autotable';
 import {
   DailyReconciliationSummary,
+  FleetVehicle,
   FuelDepot,
+  ReportUtilitiesConfig,
   TripTicket,
   WorkPlan,
+  WorkPlanReportLayoutVariant,
 } from '../types/fuel';
+import {
+  getActiveReportUtilityKeys,
+  getDepartmentMnemonic,
+  getOrderedWorkPlanFullReportSections,
+  getWorkPlanDepartmentSignOffs,
+  getWorkPlanDisplayLabel,
+  getWorkPlanFullReportSummaryItems,
+  getWorkPlanReportTargetsForVariant,
+  resolveWorkPlanReportLayoutVariant,
+} from './fuelEngine';
 
 export interface GeneratedPdfResult {
   title: string;
@@ -19,12 +32,35 @@ const SLATE_TEXT: [number, number, number] = [51, 78, 115];
 const LIGHT_GRAY_BG: [number, number, number] = [243, 245, 248];
 const BORDER_GRAY: [number, number, number] = [213, 220, 230];
 
-export function generateWorkPlanPdf(workPlan: WorkPlan, tickets: TripTicket[]): GeneratedPdfResult {
-  const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+export function generateWorkPlanPdf(
+  workPlan: WorkPlan,
+  tickets: TripTicket[],
+  reportUtilities?: ReportUtilitiesConfig,
+  vehicles?: FleetVehicle[],
+  explicitLayoutVariant?: WorkPlanReportLayoutVariant
+): GeneratedPdfResult {
+  const layoutVariant = resolveWorkPlanReportLayoutVariant(workPlan, explicitLayoutVariant);
+  const layoutTargets = getWorkPlanReportTargetsForVariant(layoutVariant);
+  const activeReviewSections = getActiveReportUtilityKeys(
+    reportUtilities,
+    layoutTargets.sectionsTarget
+  );
+  const activeTicketCols = getActiveReportUtilityKeys(
+    reportUtilities,
+    layoutTargets.ticketColsTarget
+  );
+  const useLandscape = activeTicketCols.length > 8;
+  const doc = new jsPDF({
+    orientation: useLandscape ? 'landscape' : 'portrait',
+    unit: 'mm',
+    format: 'a4',
+  });
+  const pageWidth = doc.internal.pageSize.getWidth();
+  const pageHeight = doc.internal.pageSize.getHeight();
 
   // Official LGU Bais Header
   doc.setFillColor(...NAVY);
-  doc.rect(0, 0, 210, 28, 'F');
+  doc.rect(0, 0, pageWidth, 28, 'F');
 
   doc.setTextColor(255, 255, 255);
   doc.setFont('helvetica', 'bold');
@@ -33,8 +69,27 @@ export function generateWorkPlanPdf(workPlan: WorkPlan, tickets: TripTicket[]): 
 
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(9);
-  doc.text('WEEKLY DEPARTMENTAL WORK PLAN & FUEL REQUISITION SCHEDULE', 14, 18);
-  doc.text(`Control No: ${workPlan.controlNumber}  |  Project Code: ${workPlan.projectCode}`, 14, 23);
+  const layoutTag =
+    layoutVariant === 'for_approval' ? 'FOR APPROVAL' : 'POST-APPROVAL MONITORING';
+  doc.text(
+    workPlan.requestType === 'single_trip'
+      ? `SINGLE TRIP TICKET & URGENT FUEL REQUISITION — ${layoutTag}`
+      : `WEEKLY DEPARTMENTAL WORK PLAN & FUEL SCHEDULE — ${layoutTag}`,
+    14,
+    18
+  );
+  const isSingleTrip = workPlan.requestType === 'single_trip';
+  const displayRef = getWorkPlanDisplayLabel(workPlan);
+  const headerRefLine = isSingleTrip
+    ? `Request Type: ${displayRef}`
+    : `Control No: ${displayRef}`;
+  doc.text(
+    workPlan.preparationDate
+      ? `${headerRefLine}  |  Prepared: ${workPlan.preparationDate}`
+      : headerRefLine,
+    14,
+    23
+  );
 
   // Plan Metadata Block
   doc.setTextColor(...NAVY);
@@ -45,108 +100,137 @@ export function generateWorkPlanPdf(workPlan: WorkPlan, tickets: TripTicket[]): 
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(9);
   doc.setTextColor(...SLATE_TEXT);
-  doc.text(`Office / Department: ${workPlan.department}`, 14, 43);
-  doc.text(`Coverage Period: ${workPlan.weekStart} to ${workPlan.weekEnd}`, 14, 48);
+  const deptMnemonic = getDepartmentMnemonic(workPlan.department, vehicles);
+  doc.text(`Dept: ${deptMnemonic} (${workPlan.department})`, 14, 43);
+  doc.text(
+    workPlan.requestType === 'single_trip'
+      ? `Expected Date: ${workPlan.weekStart}`
+      : `Coverage Period: ${workPlan.weekStart} to ${workPlan.weekEnd}`,
+    14,
+    48
+  );
   doc.text(`Status: ${workPlan.status.replace(/_/g, ' ').toUpperCase()}`, 14, 53);
 
-  doc.text(`Total Requested: ${workPlan.totalRequestedLiters.toFixed(1)} L`, 142, 43);
-  doc.text(`Total Approved: ${workPlan.totalApprovedLiters.toFixed(1)} L`, 142, 48);
-  doc.text(`Total Dispensed: ${workPlan.totalDispensedLiters.toFixed(1)} L`, 142, 53);
+  let cursorY = 59;
 
-  // Trip Tickets Table
-  const rows = tickets.map((t) => [
-    t.ticketNumber,
-    `${t.plateNumber}\n${t.driverName}`,
-    t.fuelType.toUpperCase(),
-    `${t.scheduledDate}\n${t.destination}${t.purposeOrProject ? `\nPurpose: ${t.purposeOrProject}` : ''}`,
-    `${t.computedLimitLiters.toFixed(1)} L`,
-    `${t.requestedLiters.toFixed(1)} L`,
-    `${t.approvedLiters.toFixed(1)} L`,
-    `${t.dispensedLiters.toFixed(1)} L`,
-    t.status.toUpperCase(),
-  ]);
+  const ticketHeadMap: Record<string, string> = {
+    ticketNumber: 'Ticket #',
+    vehicle: 'Vehicle / Fuel',
+    driver: 'Driver',
+    purpose: 'Purpose',
+    aipCode: 'AIP Code',
+    scheduledDate: 'Scheduled Date',
+    destination: 'Destination',
+    autoLimit: 'Auto Limit',
+    requested: 'Req (L)',
+    approved: 'Appr (L)',
+    dispensed: 'Disp (L)',
+    state: 'Status',
+  };
 
-  autoTable(doc, {
-    startY: 59,
-    head: [[
-      'Ticket #',
-      'Plate / Driver',
-      'Fuel',
-      'Date, Destination & Purpose',
-      'Auto Limit',
-      'Req (L)',
-      'Appr (L)',
-      'Disp (L)',
-      'Status',
-    ]],
-    body: rows.length > 0 ? rows : [['—', 'No embedded trip tickets', '—', '—', '—', '—', '—', '—', '—']],
-    styles: {
-      fontSize: 7.5,
-      cellPadding: 2.5,
-      textColor: NAVY,
-      lineColor: BORDER_GRAY,
-      lineWidth: 0.2,
-    },
-    headStyles: {
-      fillColor: NAVY,
-      textColor: [255, 255, 255],
-      fontStyle: 'bold',
-    },
-    alternateRowStyles: {
-      fillColor: LIGHT_GRAY_BG,
-    },
-  });
+  const mapTicketCell = (t: TripTicket, key: string): string => {
+    switch (key) {
+      case 'ticketNumber':
+        return t.ticketNumber;
+      case 'vehicle':
+        return `${t.plateNumber}\n${t.vehicleLabel || ''} (${t.fuelType.toUpperCase()})`.trim();
+      case 'driver':
+        return `${t.driverName}${t.driverLicense ? `\n${t.driverLicense}` : ''}`;
+      case 'purpose':
+        return t.purposeOrProject || t.projectTitle || '—';
+      case 'aipCode':
+        return (t.projectAip || workPlan.projectCode || '').trim() || '—';
+      case 'scheduledDate':
+        return t.scheduledDate || '—';
+      case 'destination':
+        return t.destination || '—';
+      case 'autoLimit':
+        return `${t.computedLimitLiters.toFixed(1)} L`;
+      case 'requested':
+        return `${t.requestedLiters.toFixed(1)} L`;
+      case 'approved':
+        return `${t.approvedLiters.toFixed(1)} L`;
+      case 'dispensed':
+        return `${t.dispensedLiters.toFixed(1)} L`;
+      case 'state':
+        return t.status.toUpperCase();
+      default:
+        return '—';
+    }
+  };
 
-  const finalY = ((doc as unknown as { lastAutoTable?: { finalY?: number } }).lastAutoTable?.finalY ?? 120) + 10;
+  const pdfSummaryItems = getWorkPlanFullReportSummaryItems(workPlan, tickets);
+  const orderedReviewSections = getOrderedWorkPlanFullReportSections(
+    activeReviewSections,
+    pdfSummaryItems.length > 0
+  );
 
-  // Approver Note if any
-  let signY = finalY;
-  if (workPlan.approverNote) {
-    doc.setFont('helvetica', 'bold');
-    doc.setFontSize(8.5);
-    doc.setTextColor(...NAVY);
-    doc.text('Tabletop Assessment Note:', 14, signY);
-    doc.setFont('helvetica', 'normal');
-    doc.setTextColor(...SLATE_TEXT);
-    doc.text(workPlan.approverNote, 14, signY + 5, { maxWidth: 182 });
-    signY += 15;
+  for (const sectionKey of orderedReviewSections) {
+    if (sectionKey === 'summaryMetrics' && pdfSummaryItems.length > 0) {
+      autoTable(doc, {
+        startY: cursorY,
+        head: [pdfSummaryItems.map((item) => item.label)],
+        body: [pdfSummaryItems.map((item) => item.value)],
+        styles: { fontSize: 8.5, cellPadding: 2.5, textColor: NAVY, lineColor: BORDER_GRAY, lineWidth: 0.2 },
+        headStyles: { fillColor: [27, 59, 111], textColor: [255, 255, 255] },
+      });
+      cursorY = ((doc as unknown as { lastAutoTable?: { finalY?: number } }).lastAutoTable?.finalY ?? cursorY + 18) + 7;
+    } else if (sectionKey === 'tripTicketsTable') {
+      const headers = activeTicketCols.map((k) => ticketHeadMap[k] ?? k);
+      const rows = tickets.map((t) => activeTicketCols.map((k) => mapTicketCell(t, k)));
+      autoTable(doc, {
+        startY: cursorY,
+        head: [headers],
+        body: rows.length > 0 ? rows : [activeTicketCols.map((_, idx) => (idx === 0 ? 'No embedded trip tickets' : '—'))],
+        styles: {
+          fontSize: 7.5,
+          cellPadding: 2.5,
+          textColor: NAVY,
+          lineColor: BORDER_GRAY,
+          lineWidth: 0.2,
+        },
+        headStyles: {
+          fillColor: NAVY,
+          textColor: [255, 255, 255],
+          fontStyle: 'bold',
+        },
+        alternateRowStyles: {
+          fillColor: LIGHT_GRAY_BG,
+        },
+      });
+      cursorY = ((doc as unknown as { lastAutoTable?: { finalY?: number } }).lastAutoTable?.finalY ?? cursorY + 40) + 8;
+
+      if (workPlan.approverNote) {
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(8.5);
+        doc.setTextColor(...NAVY);
+        doc.text('Tabletop Assessment Note:', 14, cursorY);
+        doc.setFont('helvetica', 'normal');
+        doc.setTextColor(...SLATE_TEXT);
+        doc.text(workPlan.approverNote, 14, cursorY + 5, { maxWidth: pageWidth - 28 });
+        cursorY += 14;
+      }
+    } else if (sectionKey === 'mandatorySignOffs' && layoutTargets.includeSignOffs) {
+      const deptSignOffs = getWorkPlanDepartmentSignOffs(workPlan);
+      if (deptSignOffs.length > 0) {
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(9.5);
+        doc.setTextColor(...NAVY);
+        doc.text('DEPARTMENTAL SIGN-OFFS (CONCERNED DEPARTMENT)', 14, cursorY);
+
+        autoTable(doc, {
+          startY: cursorY + 3,
+          head: [deptSignOffs.map((s) => s.label)],
+          body: [deptSignOffs.map((s) => `${s.name}\n(${s.designation})`)],
+          styles: { fontSize: 8.5, cellPadding: 4, textColor: NAVY, lineColor: BORDER_GRAY, lineWidth: 0.2 },
+          headStyles: { fillColor: [27, 59, 111], textColor: [255, 255, 255] },
+        });
+        cursorY = ((doc as unknown as { lastAutoTable?: { finalY?: number } }).lastAutoTable?.finalY ?? cursorY + 25) + 6;
+      }
+    }
   }
 
-  // Mandatory Hierarchical Sign-off Matrix
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(9.5);
-  doc.setTextColor(...NAVY);
-  doc.text('MANDATORY HIERARCHICAL VALIDATION & ACCOUNTABILITY SIGN-OFFS', 14, signY);
-
-  autoTable(doc, {
-    startY: signY + 3,
-    head: [['Prepared by', 'Reviewed by', 'Approved by']],
-    body: [
-      [
-        `${workPlan.preparedBy}\n(${workPlan.preparedByDesignation || 'Preparer / Focal Person'})`,
-        `${workPlan.reviewedBy}\n(${workPlan.reviewedByDesignation || 'Department Reviewer'})`,
-        `${workPlan.approvedBy}\n(${workPlan.approvedByDesignation || 'Approving Authority'})`,
-      ],
-    ],
-    styles: { fontSize: 8.5, cellPadding: 4, textColor: NAVY, lineColor: BORDER_GRAY, lineWidth: 0.2 },
-    headStyles: { fillColor: [27, 59, 111], textColor: [255, 255, 255] },
-  });
-
-  if (workPlan.divisionHead || workPlan.unitLead || workPlan.sectionManager) {
-    const hierarchyY = ((doc as unknown as { lastAutoTable?: { finalY?: number } }).lastAutoTable?.finalY ?? signY + 25) + 4;
-
-    autoTable(doc, {
-      startY: hierarchyY,
-      head: [['Division Head', 'Unit Lead', 'Section Manager']],
-      body: [
-        [workPlan.divisionHead || '—', workPlan.unitLead || '—', workPlan.sectionManager || '—'],
-      ],
-      styles: { fontSize: 8.5, cellPadding: 4, textColor: NAVY, lineColor: BORDER_GRAY, lineWidth: 0.2 },
-      headStyles: { fillColor: [51, 78, 115], textColor: [255, 255, 255] },
-    });
-  }
-
-  const footerY = 285;
+  const footerY = pageHeight - 12;
   doc.setFontSize(7.5);
   doc.setTextColor(...SLATE_TEXT);
   doc.text(
@@ -158,9 +242,13 @@ export function generateWorkPlanPdf(workPlan: WorkPlan, tickets: TripTicket[]): 
   const blob = doc.output('blob');
   const blobUrl = URL.createObjectURL(blob);
 
+  const safeFileKey = isSingleTrip
+    ? `SingleRequestTicket_${tickets[0]?.ticketNumber || workPlan.id}`
+    : workPlan.controlNumber || workPlan.id;
+
   return {
-    title: `Work Plan ${workPlan.controlNumber}`,
-    filename: `${workPlan.controlNumber}_BaisCity_WorkPlan.pdf`,
+    title: isSingleTrip ? `${displayRef}${tickets[0]?.ticketNumber ? ` (${tickets[0].ticketNumber})` : ''}` : `Work Plan ${displayRef}`,
+    filename: `${safeFileKey}_BaisCity_${isSingleTrip ? 'SingleRequestTicket' : 'WorkPlan'}.pdf`,
     blobUrl,
     doc,
   };
@@ -168,9 +256,13 @@ export function generateWorkPlanPdf(workPlan: WorkPlan, tickets: TripTicket[]): 
 
 export function generateDailyReconciliationPdf(
   report: DailyReconciliationSummary,
-  depots: FuelDepot[]
+  depots: FuelDepot[],
+  reportUtilities?: ReportUtilitiesConfig,
+  vehicles?: FleetVehicle[]
 ): GeneratedPdfResult {
   const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+  const activeSections = getActiveReportUtilityKeys(reportUtilities, 'reports_full_preview');
+  const activeDeptCols = getActiveReportUtilityKeys(reportUtilities, 'reports_dept_table');
 
   doc.setFillColor(...NAVY);
   doc.rect(0, 0, 210, 28, 'F');
@@ -185,76 +277,105 @@ export function generateDailyReconciliationPdf(
   doc.text('DAILY FUEL REQUEST, APPROVAL, DISPENSING & RECONCILIATION REPORT', 14, 18);
   doc.text(`Report Date: ${report.date || 'All Active Periods'}  |  Generated: ${new Date().toISOString().slice(0, 16)}`, 14, 23);
 
-  // Executive KPI Strip
-  autoTable(doc, {
-    startY: 34,
-    head: [['Total Requested', 'Total Approved', 'Total Dispensed', 'Forfeited Balance', 'Dispensed Cost (PHP)']],
-    body: [[
-      `${report.totalRequestedLiters.toFixed(1)} L`,
-      `${report.totalApprovedLiters.toFixed(1)} L`,
-      `${report.totalDispensedLiters.toFixed(1)} L`,
-      `${report.totalForfeitedLiters.toFixed(1)} L`,
-      `PHP ${report.totalDispensedCostPhp.toLocaleString('en-PH', { minimumFractionDigits: 2 })}`,
-    ]],
-    styles: { fontSize: 8.5, cellPadding: 3, textColor: NAVY, lineColor: BORDER_GRAY, lineWidth: 0.2 },
-    headStyles: { fillColor: [27, 59, 111], textColor: [255, 255, 255] },
-  });
+  const deptHeadMap: Record<string, string> = {
+    department: 'Dept',
+    requestedLiters: 'Req (L)',
+    approvedLiters: 'Appr (L)',
+    dispensedLiters: 'Disp (L)',
+    forfeitedLiters: 'Void (L)',
+    costPhp: 'Cost (PHP)',
+  };
 
-  const deptY = ((doc as unknown as { lastAutoTable?: { finalY?: number } }).lastAutoTable?.finalY ?? 55) + 8;
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(9.5);
-  doc.setTextColor(...NAVY);
-  doc.text('DEPARTMENTAL CONSUMPTION & COST ANALYSIS', 14, deptY);
+  let cursorY = 34;
 
-  autoTable(doc, {
-    startY: deptY + 3,
-    head: [['Department / Office', 'Requested (L)', 'Approved (L)', 'Dispensed (L)', 'Forfeited (L)', 'Cost (PHP)']],
-    body: report.departmentBreakdown.map((d) => [
-      d.department,
-      d.requestedLiters.toFixed(1),
-      d.approvedLiters.toFixed(1),
-      d.dispensedLiters.toFixed(1),
-      d.forfeitedLiters.toFixed(1),
-      d.costPhp.toLocaleString('en-PH', { minimumFractionDigits: 2 }),
-    ]),
-    styles: { fontSize: 8, cellPadding: 2.5, textColor: NAVY, lineColor: BORDER_GRAY, lineWidth: 0.2 },
-    headStyles: { fillColor: NAVY, textColor: [255, 255, 255] },
-    alternateRowStyles: { fillColor: LIGHT_GRAY_BG },
-  });
+  for (const sectionKey of activeSections) {
+    if (sectionKey === 'summaryMetrics') {
+      autoTable(doc, {
+        startY: cursorY,
+        head: [['Total Requested', 'Total Approved', 'Total Dispensed', 'Forfeited Balance', 'Dispensed Cost (PHP)']],
+        body: [[
+          `${report.totalRequestedLiters.toFixed(1)} L`,
+          `${report.totalApprovedLiters.toFixed(1)} L`,
+          `${report.totalDispensedLiters.toFixed(1)} L`,
+          `${report.totalForfeitedLiters.toFixed(1)} L`,
+          `PHP ${report.totalDispensedCostPhp.toLocaleString('en-PH', { minimumFractionDigits: 2 })}`,
+        ]],
+        styles: { fontSize: 8.5, cellPadding: 3, textColor: NAVY, lineColor: BORDER_GRAY, lineWidth: 0.2 },
+        headStyles: { fillColor: [27, 59, 111], textColor: [255, 255, 255] },
+      });
+      cursorY = ((doc as unknown as { lastAutoTable?: { finalY?: number } }).lastAutoTable?.finalY ?? cursorY + 20) + 8;
+    } else if (sectionKey === 'departmentBreakdown') {
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(9.5);
+      doc.setTextColor(...NAVY);
+      doc.text('DEPARTMENTAL CONSUMPTION & COST ANALYSIS', 14, cursorY);
 
-  const depotY = ((doc as unknown as { lastAutoTable?: { finalY?: number } }).lastAutoTable?.finalY ?? 110) + 8;
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(9.5);
-  doc.text('CITY FUEL DEPOT INVENTORY BALANCES', 14, depotY);
+      autoTable(doc, {
+        startY: cursorY + 3,
+        head: [activeDeptCols.map((k) => deptHeadMap[k] ?? k)],
+        body: report.departmentBreakdown.map((d) =>
+          activeDeptCols.map((k) => {
+            switch (k) {
+              case 'department':
+                return getDepartmentMnemonic(d.department, vehicles);
+              case 'requestedLiters':
+                return d.requestedLiters.toFixed(1);
+              case 'approvedLiters':
+                return d.approvedLiters.toFixed(1);
+              case 'dispensedLiters':
+                return d.dispensedLiters.toFixed(1);
+              case 'forfeitedLiters':
+                return d.forfeitedLiters.toFixed(1);
+              case 'costPhp':
+                return d.costPhp.toLocaleString('en-PH', { minimumFractionDigits: 2 });
+              default:
+                return '—';
+            }
+          })
+        ),
+        styles: { fontSize: 8, cellPadding: 2.5, textColor: NAVY, lineColor: BORDER_GRAY, lineWidth: 0.2 },
+        headStyles: { fillColor: NAVY, textColor: [255, 255, 255] },
+        alternateRowStyles: { fillColor: LIGHT_GRAY_BG },
+      });
+      cursorY = ((doc as unknown as { lastAutoTable?: { finalY?: number } }).lastAutoTable?.finalY ?? cursorY + 45) + 8;
+    } else if (sectionKey === 'depotValuation') {
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(9.5);
+      doc.setTextColor(...NAVY);
+      doc.text('CITY FUEL DEPOT INVENTORY BALANCES', 14, cursorY);
 
-  autoTable(doc, {
-    startY: depotY + 3,
-    head: [['Depot Name', 'Gasoline Stock / Cap', 'Diesel Stock / Cap', 'Last Dip Verification']],
-    body: depots.map((dep) => [
-      `${dep.name}\n${dep.location}`,
-      `${dep.gasolineCurrentLiters.toLocaleString()} / ${dep.gasolineCapacityLiters.toLocaleString()} L`,
-      `${dep.dieselCurrentLiters.toLocaleString()} / ${dep.dieselCapacityLiters.toLocaleString()} L`,
-      dep.lastDipVerifiedBy ? `${dep.lastDipVerifiedBy}` : 'Pending Verification',
-    ]),
-    styles: { fontSize: 8, cellPadding: 2.5, textColor: NAVY, lineColor: BORDER_GRAY, lineWidth: 0.2 },
-    headStyles: { fillColor: [51, 78, 115], textColor: [255, 255, 255] },
-  });
+      autoTable(doc, {
+        startY: cursorY + 3,
+        head: [['Depot Name', 'Gasoline Stock / Cap', 'Diesel Stock / Cap', 'Last Dip Verification']],
+        body: depots.map((dep) => [
+          `${dep.name}\n${dep.location}`,
+          `${dep.gasolineCurrentLiters.toLocaleString()} / ${dep.gasolineCapacityLiters.toLocaleString()} L`,
+          `${dep.dieselCurrentLiters.toLocaleString()} / ${dep.dieselCapacityLiters.toLocaleString()} L`,
+          dep.lastDipVerifiedBy ? `${dep.lastDipVerifiedBy}` : 'Pending Verification',
+        ]),
+        styles: { fontSize: 8, cellPadding: 2.5, textColor: NAVY, lineColor: BORDER_GRAY, lineWidth: 0.2 },
+        headStyles: { fillColor: [51, 78, 115], textColor: [255, 255, 255] },
+      });
+      cursorY = ((doc as unknown as { lastAutoTable?: { finalY?: number } }).lastAutoTable?.finalY ?? cursorY + 35) + 8;
+    } else if (sectionKey === 'discrepancyAlerts') {
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(9.5);
+      doc.setTextColor(...NAVY);
+      doc.text(`AUTOMATED RECONCILIATION DISCREPANCY ALERTS (${report.alerts.length})`, 14, cursorY);
 
-  const alertY = ((doc as unknown as { lastAutoTable?: { finalY?: number } }).lastAutoTable?.finalY ?? 160) + 8;
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(9.5);
-  doc.text(`AUTOMATED RECONCILIATION DISCREPANCY ALERTS (${report.alerts.length})`, 14, alertY);
-
-  autoTable(doc, {
-    startY: alertY + 3,
-    head: [['Severity', 'Category', 'Alert Summary']],
-    body:
-      report.alerts.length > 0
-        ? report.alerts.map((a) => [a.severity.toUpperCase(), a.category.replace(/_/g, ' '), `${a.title}: ${a.detail}`])
-        : [['NOMINAL', 'None', 'No reconciliation discrepancies detected for this period.']],
-    styles: { fontSize: 7.5, cellPadding: 2.5, textColor: NAVY, lineColor: BORDER_GRAY, lineWidth: 0.2 },
-    headStyles: { fillColor: [185, 28, 28], textColor: [255, 255, 255] },
-  });
+      autoTable(doc, {
+        startY: cursorY + 3,
+        head: [['Severity', 'Category', 'Alert Summary']],
+        body:
+          report.alerts.length > 0
+            ? report.alerts.map((a) => [a.severity.toUpperCase(), a.category.replace(/_/g, ' '), `${a.title}: ${a.detail}`])
+            : [['NOMINAL', 'None', 'No reconciliation discrepancies detected for this period.']],
+        styles: { fontSize: 7.5, cellPadding: 2.5, textColor: NAVY, lineColor: BORDER_GRAY, lineWidth: 0.2 },
+        headStyles: { fillColor: [185, 28, 28], textColor: [255, 255, 255] },
+      });
+      cursorY = ((doc as unknown as { lastAutoTable?: { finalY?: number } }).lastAutoTable?.finalY ?? cursorY + 30) + 8;
+    }
+  }
 
   const blob = doc.output('blob');
   const blobUrl = URL.createObjectURL(blob);
@@ -270,7 +391,8 @@ export function generateDailyReconciliationPdf(
 export function generateDispensingLedgerPdf(
   items: Array<{ ticket: TripTicket; workPlanNumber: string }>,
   depots: FuelDepot[],
-  filterSummary: string
+  filterSummary: string,
+  vehicles?: FleetVehicle[]
 ): GeneratedPdfResult {
   const doc = new jsPDF({ orientation: 'landscape', unit: 'mm', format: 'a4' });
   const depotNameMap = new Map<string, string>();
@@ -316,24 +438,26 @@ export function generateDispensingLedgerPdf(
     startY: tableStartY,
     head: [[
       'Ticket #',
-      'Work Plan #',
-      'Category',
-      'Department',
+      'Tx Code',
+      'WP #',
+      'Cat',
+      'Dept',
       'Plate / Driver',
-      'Fuel Type',
-      'Approved (L)',
-      'Dispensed (L)',
-      'Date Needed',
-      'Dispensed Timestamp',
-      'Proof File',
+      'Fuel',
+      'Appr (L)',
+      'Disp (L)',
+      'Needed',
+      'Disp At',
+      'Proof',
     ]],
     body:
       items.length > 0
         ? items.map(({ ticket: t, workPlanNumber }) => [
             t.ticketNumber,
+            t.gsoTransactionCode || 'Pending',
             workPlanNumber,
             t.servedOnce ? 'Dispensed' : 'Approved',
-            t.department,
+            getDepartmentMnemonic(t.department, vehicles),
             `${t.plateNumber}\n${t.driverName}`,
             t.fuelType.toUpperCase(),
             `${t.approvedLiters.toFixed(1)} L`,
@@ -342,7 +466,7 @@ export function generateDispensingLedgerPdf(
             t.dispensedAt ? t.dispensedAt.slice(0, 16).replace('T', ' ') : 'Pending',
             t.pumpReadingPhotoName || (t.servedOnce ? 'Baseline' : 'Pending'),
           ])
-        : [['—', '—', '—', 'No matching records in filtered view', '—', '—', '—', '—', '—', '—', '—']],
+        : [['—', '—', '—', '—', 'No matching records in filtered view', '—', '—', '—', '—', '—', '—', '—']],
     styles: { fontSize: 7.5, cellPadding: 2, textColor: NAVY, lineColor: BORDER_GRAY, lineWidth: 0.2 },
     headStyles: { fillColor: NAVY, textColor: [255, 255, 255], fontStyle: 'bold' },
     alternateRowStyles: { fillColor: LIGHT_GRAY_BG },

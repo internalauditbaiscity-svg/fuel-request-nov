@@ -32,6 +32,8 @@ import {
   SEED_AUDIT_LOGS,
   SEED_DEPOTS,
   SEED_INVENTORY_LOGS,
+  SEED_PMC_PROJECTS,
+  SEED_STORAGE_TANKS,
   SEED_TRIP_TICKETS,
   SEED_USERS,
   SEED_VEHICLES,
@@ -39,11 +41,15 @@ import {
 } from '../data/seedData';
 import {
   AuditLog,
+  AuditLogCategory,
   EnvironmentMode,
   FleetVehicle,
   FuelDepot,
   FuelType,
   InventoryLog,
+  PmcProject,
+  ReportUtilitiesConfig,
+  StorageTank,
   SyncQueueItem,
   TripTicket,
   UserAccount,
@@ -51,44 +57,80 @@ import {
   WorkPlan,
 } from '../types/fuel';
 import {
+  computeAggregateDepotCapacitiesFromTanks,
+  computeTankSpecifications,
+  normalizeStorageTankRecord,
+  TANK_FUEL_PRODUCT_STYLES,
+} from '../utils/tankRegistryEngine';
+import {
   authenticateLocalUserCredentials,
   buildCredentialLoginPayloadsFromUser,
   buildInvitePayloadFromUser,
   canAccessDepartmentRecord,
+  canAccessDepotLedgerRegister,
+  canManageReportUtilities,
+  canRegisterFleetUnit,
+  canUserEditRecords,
+  canUserEditWorkPlanRecord,
+  canUserRequestSingleTrip,
+  classifyAuditLogCategory,
+  computeAggregateDepotWacFromTanks,
   computeCredentialProofId,
   computeSingleDispenseOutcome,
+  computeWeightedAverageCostAfterDelivery,
+  createDefaultReportUtilitiesConfig,
   deduplicateUsersByEmail,
   evaluateTabletopApproval,
+  evaluateWorkPlanWeekStart,
+  findMatchingRbacUsersForSandboxPreview,
+  generateNextGsoTransactionCode,
   generateNextTripTicketNumbers,
   generateNextWorkPlanNumber,
   getDefaultNavSection,
+  getLocalIsoDate,
   getRemainingInactivityMs,
+  getSandboxPreviewDepartmentsForRole,
+  getWorkPlanDisplayLabel,
   hasCityWideAccess,
   hashPassword,
   hasValidPumpReadingProof,
   INACTIVITY_TIMEOUT_MS,
   isSessionExpired,
+  matchGsoHeadVerificationCode,
   MAX_TICKETS_PER_WORKPLAN,
   mergeClaimedUserProfile,
+  normalizePmcProject,
+  normalizeReportUtilitiesConfig,
   normalizeUsernameInput,
   parsePersistedSession,
   PersistedSessionState,
   prepareFirestoreRecordPayload,
   reconcileCollectionRecords,
+  resolveActiveUserFromRegistry,
+  resolveDefaultSandboxDepartmentForRole,
+  resolveDepotTransactionVerification,
   resolveEffectiveEnvironmentAfterGoogleAuth,
+  resolvePrevailingWeightedAverageCost,
+  resolveSandboxPreviewUser,
+  sanitizeAuditDetails,
+  USER_OFFICE_DEPARTMENT,
+  validateGsoHeadVerificationCode,
 } from '../utils/fuelEngine';
 
 interface LocalSnapshotState {
   users: UserAccount[];
   depots: FuelDepot[];
+  storageTanks: StorageTank[];
   vehicles: FleetVehicle[];
+  pmcProjects: PmcProject[];
   workPlans: WorkPlan[];
   tripTickets: TripTicket[];
   inventoryLogs: InventoryLog[];
   auditLogs: AuditLog[];
+  reportUtilities: ReportUtilitiesConfig;
 }
 
-const SANDBOX_STORAGE_KEY = 'bais_fuel_sandbox_v2';
+const SANDBOX_STORAGE_KEY = 'bais_fuel_sandbox_v3';
 const LIVE_CACHE_STORAGE_KEY = 'bais_fuel_live_cache_v2';
 const SYNC_QUEUE_KEY = 'bais_fuel_sync_queue_v2';
 export const AUTH_SESSION_STORAGE_KEY = 'bais_fuel_auth_session_v1';
@@ -150,11 +192,14 @@ function getInitialSeedState(): LocalSnapshotState {
   return {
     users: [...SEED_USERS],
     depots: [...SEED_DEPOTS],
+    storageTanks: [...SEED_STORAGE_TANKS],
     vehicles: [...SEED_VEHICLES],
+    pmcProjects: [...SEED_PMC_PROJECTS],
     workPlans: [...SEED_WORK_PLANS],
     tripTickets: [...SEED_TRIP_TICKETS],
     inventoryLogs: [...SEED_INVENTORY_LOGS],
     auditLogs: [...SEED_AUDIT_LOGS],
+    reportUtilities: createDefaultReportUtilitiesConfig(),
   };
 }
 
@@ -163,14 +208,48 @@ function loadLocalState(key: string): LocalSnapshotState {
     const raw = localStorage.getItem(key);
     if (!raw) return getInitialSeedState();
     const parsed = JSON.parse(raw) as Partial<LocalSnapshotState>;
+    const missingStorageTanks = parsed.storageTanks === undefined;
+    let depots = parsed.depots ?? [];
+    if (missingStorageTanks && key === SANDBOX_STORAGE_KEY) {
+      const existingIds = new Set(depots.map((d) => d.id));
+      const enriched = depots.map((d) => {
+        const seedMatch = SEED_DEPOTS.find((s) => s.id === d.id);
+        return seedMatch
+          ? {
+              ...seedMatch,
+              ...d,
+              siteCode: d.siteCode || seedMatch.siteCode,
+              coordinates: d.coordinates || seedMatch.coordinates,
+              permitNumber: d.permitNumber || seedMatch.permitNumber,
+              calibrationExpiryDate: d.calibrationExpiryDate || seedMatch.calibrationExpiryDate,
+              stationManager: d.stationManager || seedMatch.stationManager,
+            }
+          : d;
+      });
+      const extraSeedDepots = SEED_DEPOTS.filter((s) => !existingIds.has(s.id));
+      depots = [...enriched, ...extraSeedDepots];
+    }
     return {
       users: parsed.users && parsed.users.length > 0 ? parsed.users : [...SEED_USERS],
-      depots: parsed.depots ?? [],
+      depots,
+      storageTanks:
+        parsed.storageTanks !== undefined
+          ? parsed.storageTanks.map((t) => normalizeStorageTankRecord(t))
+          : key === SANDBOX_STORAGE_KEY
+            ? [...SEED_STORAGE_TANKS]
+            : [],
       vehicles: parsed.vehicles ?? [],
+      pmcProjects:
+        parsed.pmcProjects !== undefined
+          ? parsed.pmcProjects.map((p) => normalizePmcProject(p))
+          : key === SANDBOX_STORAGE_KEY
+            ? [...SEED_PMC_PROJECTS]
+            : [],
       workPlans: parsed.workPlans ?? [],
       tripTickets: parsed.tripTickets ?? [],
       inventoryLogs: parsed.inventoryLogs ?? [],
       auditLogs: parsed.auditLogs ?? [],
+      reportUtilities: normalizeReportUtilitiesConfig(parsed.reportUtilities),
     };
   } catch {
     return getInitialSeedState();
@@ -207,7 +286,9 @@ function makeId(prefix: string): string {
 }
 
 const SEED_DEPOT_TS = new Map(SEED_DEPOTS.map((d) => [d.id, d.updatedAt]));
+const SEED_STORAGE_TANK_TS = new Map(SEED_STORAGE_TANKS.map((t) => [t.id, t.updatedAt]));
 const SEED_VEHICLE_TS = new Map(SEED_VEHICLES.map((v) => [v.id, v.updatedAt]));
+const SEED_PMC_PROJECT_TS = new Map(SEED_PMC_PROJECTS.map((p) => [p.id, p.updatedAt]));
 const SEED_WORKPLAN_TS = new Map(SEED_WORK_PLANS.map((w) => [w.id, w.updatedAt]));
 const SEED_TICKET_TS = new Map(SEED_TRIP_TICKETS.map((t) => [t.id, t.updatedAt]));
 const SEED_INV_TS = new Map(SEED_INVENTORY_LOGS.map((l) => [l.id, l.createdAt]));
@@ -325,8 +406,9 @@ export function useFuelStore() {
   const [syncQueue, setSyncQueue] = useState<SyncQueueItem[]>(() => loadSyncQueue());
 
   // Role switcher for Admin Sandbox practice & testing different LGU Bais departmental roles
-  const [sandboxActiveRole, setSandboxActiveRole] = useState<UserRole>(bootAuth.role);
-  const [sandboxActiveDepartment, setSandboxActiveDepartment] = useState<string>(bootAuth.dept);
+  const [sandboxActiveRole, setSandboxActiveRoleState] = useState<UserRole>(bootAuth.role);
+  const [sandboxActiveDepartment, setSandboxActiveDepartmentState] = useState<string>(bootAuth.dept);
+  const [selectedSandboxUserUid, setSelectedSandboxUserUid] = useState<string | null>(null);
   const [liveUserProfile, setLiveUserProfile] = useState<UserAccount | null>(
     bootAuth.envMode === 'live' ? bootAuth.user : null
   );
@@ -381,8 +463,9 @@ export function useFuelStore() {
   // Firebase Auth listener + Admin bootstrap + Invited/Different-Gmail profile resolution
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, async (user) => {
+      let freshGoogleAttempt = false;
       if (user) {
-        const freshGoogleAttempt = googleSignInInitiatedRef.current;
+        freshGoogleAttempt = googleSignInInitiatedRef.current;
         googleSignInInitiatedRef.current = false;
 
         if (!freshGoogleAttempt) {
@@ -409,6 +492,28 @@ export function useFuelStore() {
       setFirebaseUser(user);
       if (user) {
         if (!user.email || !user.emailVerified) {
+          if (freshGoogleAttempt) {
+            const blockedLog: AuditLog = {
+              id: makeId('aud'),
+              actorUid: user.uid,
+              actorEmail: (user.email || 'unverified@unknown').trim().toLowerCase().slice(0, 254),
+              actorName: (user.displayName || 'Unverified Google Account').slice(0, 120),
+              actorRole: 'unauthenticated',
+              category: 'credential',
+              environment: 'sandbox',
+              action: 'GOOGLE_SSO_LOGIN_BLOCKED',
+              entityType: 'session',
+              entityId: user.uid,
+              summary: 'Blocked Google SSO sign-in because the account email is unverified.',
+              details: 'Method: Google SSO | Outcome: Blocked (Unverified Email)',
+              createdAt: new Date().toISOString(),
+            };
+            setSandboxState((prev) => {
+              const next = { ...prev, auditLogs: [blockedLog, ...prev.auditLogs] };
+              saveLocalState(SANDBOX_STORAGE_KEY, next);
+              return next;
+            });
+          }
           setGoogleAuthError(
             'Your Google account email must be verified before accessing Live Cloud.'
           );
@@ -432,6 +537,29 @@ export function useFuelStore() {
           if (userSnap.exists()) {
             const existingProfile = userSnap.data() as UserAccount;
             if (!existingProfile.active) {
+              if (freshGoogleAttempt) {
+                const suspLog: AuditLog = {
+                  id: makeId('aud'),
+                  actorUid: user.uid,
+                  actorEmail: authEmail,
+                  actorName: existingProfile.displayName,
+                  actorRole: existingProfile.role,
+                  department: existingProfile.department,
+                  category: 'credential',
+                  environment: 'live',
+                  action: 'GOOGLE_SSO_LOGIN_BLOCKED',
+                  entityType: 'session',
+                  entityId: user.uid,
+                  summary: `Blocked Google SSO sign-in for suspended account ${authEmail}.`,
+                  details: `Method: Google SSO | Role: ${existingProfile.role} | Outcome: Blocked (Suspended Account)`,
+                  createdAt: now,
+                };
+                setSandboxState((prev) => {
+                  const next = { ...prev, auditLogs: [suspLog, ...prev.auditLogs] };
+                  saveLocalState(SANDBOX_STORAGE_KEY, next);
+                  return next;
+                });
+              }
               setGoogleAuthError('This user account is suspended. Contact your Administrator.');
               clearPersistedSessionStorage();
               setLiveUserProfile(null);
@@ -577,6 +705,49 @@ export function useFuelStore() {
               activeSection: activeSectionRef.current || defaultSection,
               lastActivityAt: nowMs,
             });
+
+            if (freshGoogleAttempt) {
+              const ssoLog: AuditLog = {
+                id: makeId('aud'),
+                actorUid: user.uid,
+                actorEmail: resolvedProfile.email,
+                actorName: resolvedProfile.displayName,
+                actorRole: resolvedProfile.role,
+                department: resolvedProfile.department,
+                category: 'credential',
+                environment: resolvedEnvMode,
+                action: 'GOOGLE_SSO_LOGIN_SUCCESS',
+                entityType: 'session',
+                entityId: resolvedProfile.uid,
+                summary: `Google SSO sign-in succeeded for ${resolvedProfile.displayName} (${resolvedProfile.email}) in ${resolvedEnvMode.toUpperCase()} mode.`,
+                details: `Method: Google SSO | Role: ${resolvedProfile.role} | Office: ${resolvedProfile.department} | Environment: ${resolvedEnvMode.toUpperCase()}`,
+                createdAt: now,
+              };
+              const appendSsoLog = (prev: LocalSnapshotState): LocalSnapshotState => ({
+                ...prev,
+                auditLogs: [ssoLog, ...prev.auditLogs],
+              });
+              if (resolvedEnvMode === 'live') {
+                setLiveState((prev) => {
+                  const next = appendSsoLog(prev);
+                  saveLocalState(LIVE_CACHE_STORAGE_KEY, next);
+                  return next;
+                });
+              } else {
+                setSandboxState((prev) => {
+                  const next = appendSsoLog(prev);
+                  saveLocalState(SANDBOX_STORAGE_KEY, next);
+                  return next;
+                });
+              }
+              await setDoc(
+                doc(db, `environments/${resolvedEnvMode}/auditLogs`, ssoLog.id),
+                prepareFirestoreRecordPayload(ssoLog as unknown as Record<string, unknown>, user.uid, {
+                  isCreate: true,
+                  collection: 'auditLogs',
+                })
+              ).catch(() => {});
+            }
           }
         } catch (err) {
           console.error('Google Sign-In profile resolution failed:', err);
@@ -662,7 +833,12 @@ export function useFuelStore() {
         item.collection === 'users' ? 'users' : `environments/${targetEnv}/${item.collection}`;
       const docRef = doc(db, colPath, item.docId);
       try {
-        if (item.operation === 'set' && item.payload) {
+        if (item.collection === 'settings' && item.operation === 'set' && item.payload) {
+          const normalizedSettings = normalizeReportUtilitiesConfig(
+            item.payload as Partial<ReportUtilitiesConfig>
+          );
+          await setDoc(docRef, normalizedSettings);
+        } else if (item.operation === 'set' && item.payload) {
           const payload = prepareFirestoreRecordPayload(item.payload, firebaseUser.uid, {
             isCreate: true,
             collection: item.collection,
@@ -676,7 +852,7 @@ export function useFuelStore() {
             }
             await syncCredentialLoginDocs(userObj, firebaseUser.uid);
           }
-        } else if (item.operation === 'update' && item.payload) {
+        } else if (item.operation === 'update' && item.payload && item.collection !== 'settings') {
           const payload = prepareFirestoreRecordPayload(item.payload, firebaseUser.uid, {
             isCreate: false,
             collection: item.collection,
@@ -752,7 +928,9 @@ export function useFuelStore() {
 
       const [
         depotsSnap,
+        storageTanksSnap,
         vehiclesSnap,
+        pmcProjectsSnap,
         plansSnap,
         ticketsSnap,
         invSnap,
@@ -761,7 +939,9 @@ export function useFuelStore() {
         credLoginsSnap,
       ] = await Promise.all([
         getDocs(collection(db, `${envPrefix}/depots`)),
+        getDocs(collection(db, `${envPrefix}/storageTanks`)).catch(() => null),
         getDocs(collection(db, `${envPrefix}/vehicles`)),
+        getDocs(collection(db, `${envPrefix}/pmcProjects`)).catch(() => null),
         getDocs(collection(db, `${envPrefix}/workPlans`)),
         getDocs(collection(db, `${envPrefix}/tripTickets`)),
         getDocs(collection(db, `${envPrefix}/inventoryLogs`)),
@@ -771,7 +951,13 @@ export function useFuelStore() {
       ]);
 
       const cloudDepots = depotsSnap.docs.map((d) => d.data() as FuelDepot);
+      const cloudStorageTanks = storageTanksSnap
+        ? storageTanksSnap.docs.map((d) => normalizeStorageTankRecord(d.data() as StorageTank))
+        : [];
       const cloudVehicles = vehiclesSnap.docs.map((d) => d.data() as FleetVehicle);
+      const cloudPmcProjects = pmcProjectsSnap
+        ? pmcProjectsSnap.docs.map((d) => d.data() as PmcProject)
+        : [];
       const cloudPlans = plansSnap.docs.map((d) => d.data() as WorkPlan);
       const cloudTickets = ticketsSnap.docs.map((d) => d.data() as TripTicket);
       const cloudInv = invSnap.docs.map((d) => d.data() as InventoryLog);
@@ -788,7 +974,9 @@ export function useFuelStore() {
       const sandboxEmpty =
         targetEnv === 'sandbox' &&
         cloudDepots.length === 0 &&
+        cloudStorageTanks.length === 0 &&
         cloudVehicles.length === 0 &&
+        cloudPmcProjects.length === 0 &&
         cloudPlans.length === 0 &&
         cloudTickets.length === 0 &&
         cloudAudit.length === 0;
@@ -811,12 +999,26 @@ export function useFuelStore() {
         cloudPurgeAt,
         seedUpdatedAtByKey: useSeedFilter ? SEED_DEPOT_TS : undefined,
       });
+      const storageTanksRec = reconcileCollectionRecords({
+        localItems: localSnapshot.storageTanks ?? [],
+        cloudItems: cloudStorageTanks,
+        keyField: 'id',
+        cloudPurgeAt,
+        seedUpdatedAtByKey: useSeedFilter ? SEED_STORAGE_TANK_TS : undefined,
+      });
       const vehiclesRec = reconcileCollectionRecords({
         localItems: localSnapshot.vehicles,
         cloudItems: cloudVehicles,
         keyField: 'id',
         cloudPurgeAt,
         seedUpdatedAtByKey: useSeedFilter ? SEED_VEHICLE_TS : undefined,
+      });
+      const pmcProjectsRec = reconcileCollectionRecords({
+        localItems: localSnapshot.pmcProjects ?? [],
+        cloudItems: cloudPmcProjects,
+        keyField: 'id',
+        cloudPurgeAt,
+        seedUpdatedAtByKey: useSeedFilter ? SEED_PMC_PROJECT_TS : undefined,
       });
       const plansRec = reconcileCollectionRecords({
         localItems: localSnapshot.workPlans,
@@ -950,8 +1152,12 @@ export function useFuelStore() {
 
       await pushEnvItems('depots', depotsRec.toCreate, true);
       await pushEnvItems('depots', depotsRec.toUpdate, false);
+      await pushEnvItems('storageTanks', storageTanksRec.toCreate, true);
+      await pushEnvItems('storageTanks', storageTanksRec.toUpdate, false);
       await pushEnvItems('vehicles', vehiclesRec.toCreate, true);
       await pushEnvItems('vehicles', vehiclesRec.toUpdate, false);
+      await pushEnvItems('pmcProjects', pmcProjectsRec.toCreate, true);
+      await pushEnvItems('pmcProjects', pmcProjectsRec.toUpdate, false);
       await pushEnvItems('workPlans', plansRec.toCreate, true);
       await pushEnvItems('workPlans', plansRec.toUpdate, false);
       await pushEnvItems('tripTickets', ticketsRec.toCreate, true);
@@ -960,14 +1166,42 @@ export function useFuelStore() {
       await pushEnvItems('inventoryLogs', invRec.toUpdate, false);
       await pushEnvItems('auditLogs', auditRec.toCreate, true);
 
+      let mergedReportUtilities = normalizeReportUtilitiesConfig(localSnapshot.reportUtilities);
+      try {
+        const settingsRef = doc(db, `${envPrefix}/settings`, 'report_utilities');
+        const settingsSnap = await getDoc(settingsRef);
+        if (settingsSnap.exists()) {
+          const cloudSettings = normalizeReportUtilitiesConfig(
+            settingsSnap.data() as Partial<ReportUtilitiesConfig>
+          );
+          if (
+            mergedReportUtilities.updatedAt &&
+            (!cloudSettings.updatedAt || mergedReportUtilities.updatedAt > cloudSettings.updatedAt)
+          ) {
+            await setDoc(settingsRef, mergedReportUtilities);
+            pushedCount += 1;
+          } else {
+            mergedReportUtilities = cloudSettings;
+          }
+        } else if (mergedReportUtilities.updatedAt) {
+          await setDoc(settingsRef, mergedReportUtilities);
+          pushedCount += 1;
+        }
+      } catch (err) {
+        console.warn(`Reconcile ${envPrefix}/settings/report_utilities skipped:`, err);
+      }
+
       const nextState: LocalSnapshotState = {
         users: mergedUsers,
         depots: depotsRec.merged,
+        storageTanks: storageTanksRec.merged.map((t) => normalizeStorageTankRecord(t)),
         vehicles: vehiclesRec.merged,
+        pmcProjects: pmcProjectsRec.merged,
         workPlans: plansRec.merged,
         tripTickets: ticketsRec.merged,
         inventoryLogs: invRec.merged,
         auditLogs: auditRec.merged,
+        reportUtilities: mergedReportUtilities,
       };
 
       if (targetEnv === 'sandbox') {
@@ -1063,6 +1297,20 @@ export function useFuelStore() {
               setSandboxState((prev) => ({ ...prev, users: userRows }));
               return;
             }
+            if (colName === 'pmcProjects') {
+              const normalizedPmc = (rows as unknown as PmcProject[]).map((p) =>
+                normalizePmcProject(p)
+              );
+              setTargetEnvState((prev) => ({ ...prev, pmcProjects: normalizedPmc }));
+              return;
+            }
+            if (colName === 'storageTanks') {
+              const normalizedTanks = (rows as unknown as StorageTank[]).map((t) =>
+                normalizeStorageTankRecord(t)
+              );
+              setTargetEnvState((prev) => ({ ...prev, storageTanks: normalizedTanks }));
+              return;
+            }
             setTargetEnvState((prev) => ({ ...prev, [colName]: rows }));
           },
           (error) => {
@@ -1073,6 +1321,7 @@ export function useFuelStore() {
       };
 
       attach<FuelDepot>('depots', `${envPrefix}/depots`);
+      attach<StorageTank>('storageTanks', `${envPrefix}/storageTanks`);
       attach<FleetVehicle>(
         'vehicles',
         `${envPrefix}/vehicles`,
@@ -1091,14 +1340,28 @@ export function useFuelStore() {
         cityWide ? undefined : 'department',
         cityWide ? undefined : liveUserProfile.department
       );
-      if (cityWide) {
-        attach<InventoryLog>('inventoryLogs', `${envPrefix}/inventoryLogs`);
-      }
+      attach<InventoryLog>('inventoryLogs', `${envPrefix}/inventoryLogs`);
+      attach<PmcProject>('pmcProjects', `${envPrefix}/pmcProjects`);
 
       if (isAdminUser) {
         attach<AuditLog>('auditLogs', `${envPrefix}/auditLogs`);
         attach<UserAccount>('users', 'users');
       }
+
+      const reportUtilitiesUnsub = onSnapshot(
+        doc(db, `${envPrefix}/settings`, 'report_utilities'),
+        (snapshot) => {
+          if (!snapshot.exists()) return;
+          const remoteConfig = normalizeReportUtilitiesConfig(
+            snapshot.data() as Partial<ReportUtilitiesConfig>
+          );
+          setTargetEnvState((prev) => ({ ...prev, reportUtilities: remoteConfig }));
+        },
+        (error) => {
+          handleFirestoreError(error, OperationType.GET, `${envPrefix}/settings/report_utilities`);
+        }
+      );
+      unsubs.push(reportUtilitiesUnsub);
     };
 
     void startSyncAndListeners();
@@ -1128,23 +1391,125 @@ export function useFuelStore() {
 
   const activeData = envMode === 'live' ? liveState : sandboxState;
 
-  // Active User Context (Authenticated User + Sandbox Admin Role Preview)
+  const sandboxPreviewDepartmentOptions = useMemo(
+    () =>
+      getSandboxPreviewDepartmentsForRole(
+        sandboxActiveRole,
+        activeData.users,
+        activeData.vehicles
+      ),
+    [sandboxActiveRole, activeData.users, activeData.vehicles]
+  );
+
+  const resolvedSandboxDepartment = useMemo(
+    () =>
+      resolveDefaultSandboxDepartmentForRole(
+        sandboxActiveRole,
+        sandboxActiveDepartment,
+        activeData.users,
+        activeData.vehicles
+      ),
+    [sandboxActiveRole, sandboxActiveDepartment, activeData.users, activeData.vehicles]
+  );
+
+  const sandboxPreviewMatchingUsers = useMemo(
+    () =>
+      findMatchingRbacUsersForSandboxPreview(
+        sandboxActiveRole,
+        resolvedSandboxDepartment,
+        activeData.users,
+        activeData.vehicles
+      ),
+    [sandboxActiveRole, resolvedSandboxDepartment, activeData.users, activeData.vehicles]
+  );
+
+  // Keep Sandbox Role Preview department strictly aligned with office rules for the selected role
+  useEffect(() => {
+    if (
+      authenticatedUser?.role === 'admin' &&
+      sandboxActiveDepartment !== resolvedSandboxDepartment
+    ) {
+      setSandboxActiveDepartmentState(resolvedSandboxDepartment);
+    }
+  }, [authenticatedUser?.role, sandboxActiveDepartment, resolvedSandboxDepartment]);
+
+  const appendAuditRef = useRef<
+    | ((
+        action: string,
+        entityType: string,
+        entityId: string,
+        summary: string,
+        options?: {
+          category?: AuditLogCategory;
+          details?: string;
+          actorOverride?: Partial<
+            Pick<UserAccount, 'uid' | 'email' | 'displayName' | 'role' | 'department'>
+          >;
+          envOverride?: EnvironmentMode;
+        }
+      ) => Promise<void>)
+    | null
+  >(null);
+
+  const setSandboxActiveRole = useCallback(
+    (nextRole: UserRole) => {
+      const currentData = envMode === 'live' ? liveStateRef.current : sandboxStateRef.current;
+      const nextDept = resolveDefaultSandboxDepartmentForRole(
+        nextRole,
+        sandboxActiveDepartment,
+        currentData.users,
+        currentData.vehicles
+      );
+      setSandboxActiveRoleState(nextRole);
+      setSandboxActiveDepartmentState(nextDept);
+      setSelectedSandboxUserUid(null);
+      if (authenticatedUser?.role === 'admin' && nextRole !== sandboxActiveRole) {
+        void appendAuditRef.current?.(
+          'SANDBOX_ROLE_PREVIEW_CHANGED',
+          'session',
+          authenticatedUser.uid,
+          `Admin switched Sandbox Role Preview from ${sandboxActiveRole} to ${nextRole} (${nextDept}).`,
+          {
+            category: 'system',
+            details: `Previous Role: ${sandboxActiveRole} | Preview Role: ${nextRole} | Preview Office: ${nextDept}`,
+            actorOverride: authenticatedUser,
+            envOverride: 'sandbox',
+          }
+        );
+      }
+    },
+    [envMode, sandboxActiveDepartment, sandboxActiveRole, authenticatedUser]
+  );
+
+  const setSandboxActiveDepartment = useCallback(
+    (nextDept: string) => {
+      const currentData = envMode === 'live' ? liveStateRef.current : sandboxStateRef.current;
+      const resolved = resolveDefaultSandboxDepartmentForRole(
+        sandboxActiveRole,
+        nextDept,
+        currentData.users,
+        currentData.vehicles
+      );
+      setSandboxActiveDepartmentState(resolved);
+      setSelectedSandboxUserUid(null);
+    },
+    [envMode, sandboxActiveRole]
+  );
+
+  // Active User Context (Live Registry RBAC + Sandbox Admin Role Preview)
   const currentUser: UserAccount = useMemo(() => {
     if (envMode === 'live' && firebaseUser && liveUserProfile) {
-      return liveUserProfile;
+      return resolveActiveUserFromRegistry(liveUserProfile, activeData.users);
     }
     if (authenticatedUser) {
-      // Allow an authenticated Admin in Sandbox to preview other roles via sidebar tester
-      if (authenticatedUser.role === 'admin' && sandboxActiveRole !== 'admin') {
-        return {
-          ...authenticatedUser,
-          displayName: `${authenticatedUser.displayName} (${sandboxActiveRole.replace(/_/g, ' ')})`,
-          role: sandboxActiveRole,
-          department: sandboxActiveDepartment,
-          canSwitchToLive: false,
-        };
-      }
-      return authenticatedUser;
+      return resolveSandboxPreviewUser({
+        authenticatedUser,
+        sandboxActiveRole,
+        sandboxActiveDepartment: resolvedSandboxDepartment,
+        users: activeData.users,
+        selectedSandboxUserUid,
+        vehicles: activeData.vehicles,
+      });
     }
     return {
       uid: 'unauthenticated',
@@ -1157,7 +1522,17 @@ export function useFuelStore() {
       createdAt: '2026-11-12T00:00:00Z',
       updatedAt: '2026-11-12T00:00:00Z',
     };
-  }, [envMode, firebaseUser, liveUserProfile, authenticatedUser, sandboxActiveRole, sandboxActiveDepartment]);
+  }, [
+    envMode,
+    firebaseUser,
+    liveUserProfile,
+    authenticatedUser,
+    sandboxActiveRole,
+    resolvedSandboxDepartment,
+    activeData.users,
+    activeData.vehicles,
+    selectedSandboxUserUid,
+  ]);
 
   // Department-filtered views for strict RBAC data visibility
   const visibleWorkPlans = useMemo(
@@ -1196,9 +1571,10 @@ export function useFuelStore() {
       col: SyncQueueItem['collection'],
       docId: string,
       operation: SyncQueueItem['operation'],
-      payload?: Record<string, unknown>
+      payload?: Record<string, unknown>,
+      targetEnvOverride?: EnvironmentMode
     ) => {
-      const targetEnv: EnvironmentMode = envMode;
+      const targetEnv: EnvironmentMode = targetEnvOverride ?? envMode;
       const normalizedPayload =
         payload && firebaseUser && operation === 'set'
           ? prepareFirestoreRecordPayload(payload, firebaseUser.uid, {
@@ -1208,6 +1584,14 @@ export function useFuelStore() {
           : payload;
 
       const applyLocalListMutation = (prev: LocalSnapshotState): LocalSnapshotState => {
+        if (col === 'settings') {
+          return {
+            ...prev,
+            reportUtilities: normalizeReportUtilitiesConfig(
+              normalizedPayload as Partial<ReportUtilitiesConfig> | undefined
+            ),
+          };
+        }
         const list = [...(prev[col] as Array<{ id?: string; uid?: string }>)];
         const matchKey = col === 'users' ? 'uid' : 'id';
         const idx = list.findIndex((item) => item[matchKey] === docId);
@@ -1217,8 +1601,12 @@ export function useFuelStore() {
         } else if (operation === 'set' && normalizedPayload) {
           if (idx >= 0) list[idx] = normalizedPayload as { id?: string; uid?: string };
           else list.unshift(normalizedPayload as { id?: string; uid?: string });
-        } else if (operation === 'update' && normalizedPayload && idx >= 0) {
-          list[idx] = { ...list[idx], ...normalizedPayload };
+        } else if (operation === 'update' && normalizedPayload) {
+          if (idx >= 0) {
+            list[idx] = { ...list[idx], ...normalizedPayload };
+          } else if (col === 'users' && typeof normalizedPayload.uid === 'string') {
+            list.unshift(normalizedPayload as { id?: string; uid?: string });
+          }
         }
         return { ...prev, [col]: list };
       };
@@ -1245,11 +1633,10 @@ export function useFuelStore() {
             createdAt: new Date().toISOString(),
           },
         ]);
-        setSyncNotice(
-          !firebaseUser
-            ? `Saved locally in ${targetEnv === 'sandbox' ? 'Sandbox' : 'Live'}. Sign in with Google to push changes to the deployed web app.`
-            : 'Offline entry saved locally. Will auto-sync to Firebase when online.'
-        );
+        if (!effectiveOnline) {
+          setSyncNotice('Offline entry saved locally. Will auto-sync to Firebase when online.');
+          setTimeout(() => setSyncNotice(null), 4000);
+        }
         return;
       }
 
@@ -1269,6 +1656,13 @@ export function useFuelStore() {
           } catch (updateErr) {
             const msg = updateErr instanceof Error ? updateErr.message : String(updateErr);
             if (msg.includes('No document to update') || msg.includes('not-found')) {
+              if (col === 'settings') {
+                await setDoc(
+                  docRef,
+                  normalizeReportUtilitiesConfig(normalizedPayload as Partial<ReportUtilitiesConfig>)
+                );
+                return;
+              }
               const sourceState =
                 targetEnv === 'sandbox' ? sandboxStateRef.current : liveStateRef.current;
               const list = sourceState[col] as unknown as Array<
@@ -1301,22 +1695,96 @@ export function useFuelStore() {
   );
 
   const appendAudit = useCallback(
-    async (action: string, entityType: string, entityId: string, summary: string) => {
+    async (
+      action: string,
+      entityType: string,
+      entityId: string,
+      summary: string,
+      options?: {
+        category?: AuditLogCategory;
+        details?: string;
+        actorOverride?: {
+          uid?: string;
+          email?: string;
+          displayName?: string;
+          role?: UserRole | 'unauthenticated' | 'system';
+          department?: string;
+        };
+        envOverride?: EnvironmentMode;
+      }
+    ) => {
+      const targetEnv = options?.envOverride ?? envMode;
+      const actorUid = options?.actorOverride?.uid ?? firebaseUser?.uid ?? currentUser.uid;
+      const actorEmail = (options?.actorOverride?.email ?? currentUser.email ?? 'system@baiscity.gov.ph')
+        .trim()
+        .slice(0, 254);
+      const actorName = (options?.actorOverride?.displayName ?? currentUser.displayName ?? '')
+        .trim()
+        .slice(0, 120);
+      const actorRole = (options?.actorOverride?.role ?? currentUser.role ?? 'system')
+        .trim()
+        .slice(0, 48);
+      const department = (options?.actorOverride?.department ?? currentUser.department ?? '')
+        .trim()
+        .slice(0, 120);
+      const category =
+        options?.category ??
+        classifyAuditLogCategory({
+          action,
+          entityType,
+        });
+      const safeSummary = sanitizeAuditDetails(summary, 400) || 'Audit entry';
+      const safeDetails = sanitizeAuditDetails(options?.details, 1200);
+
       const log: AuditLog = {
         id: makeId('aud'),
-        actorUid: firebaseUser?.uid ?? currentUser.uid,
-        actorEmail: currentUser.email,
-        actorRole: currentUser.role,
-        department: currentUser.department,
-        action,
-        entityType,
-        entityId,
-        summary: summary.slice(0, 400),
+        actorUid: actorUid || 'system',
+        actorEmail,
+        ...(actorName ? { actorName } : {}),
+        actorRole,
+        ...(department ? { department } : {}),
+        category,
+        environment: targetEnv,
+        action: action.trim().slice(0, 80),
+        entityType: entityType.trim().slice(0, 64),
+        entityId: entityId.trim().slice(0, 128) || 'unknown',
+        summary: safeSummary.length < 2 ? 'Audit entry' : safeSummary,
+        ...(safeDetails ? { details: safeDetails } : {}),
         createdAt: new Date().toISOString(),
       };
-      await persistMutation('auditLogs', log.id, 'set', log as unknown as Record<string, unknown>);
+      await persistMutation(
+        'auditLogs',
+        log.id,
+        'set',
+        log as unknown as Record<string, unknown>,
+        targetEnv
+      );
     },
-    [firebaseUser?.uid, currentUser, persistMutation]
+    [envMode, firebaseUser?.uid, currentUser, persistMutation]
+  );
+
+  appendAuditRef.current = appendAudit;
+
+  const changeEnvMode = useCallback(
+    (nextEnv: EnvironmentMode) => {
+      if (nextEnv === envMode) return;
+      const prevEnv = envMode;
+      setEnvMode(nextEnv);
+      if (authenticatedUser) {
+        void appendAudit(
+          'ENVIRONMENT_SWITCHED',
+          'environment',
+          nextEnv,
+          `Switched operating environment from ${prevEnv.toUpperCase()} to ${nextEnv.toUpperCase()}.`,
+          {
+            category: 'system',
+            details: `From: ${prevEnv.toUpperCase()} | To: ${nextEnv.toUpperCase()} | Account: ${authenticatedUser.email}`,
+            envOverride: nextEnv,
+          }
+        );
+      }
+    },
+    [envMode, authenticatedUser, appendAudit]
   );
 
   const isAuthenticatedSession = Boolean(authenticatedUser || (envMode === 'live' && firebaseUser));
@@ -1334,30 +1802,6 @@ export function useFuelStore() {
       throw err;
     }
   }, []);
-
-  const connectGoogleForSync = useCallback(async () => {
-    setGoogleAuthError(null);
-    setSessionExpiredNotice(null);
-    preserveEnvOnAuthRef.current = envMode;
-    googleSignInInitiatedRef.current = true;
-    try {
-      return await firebaseSignInWithGoogle();
-    } catch (err) {
-      preserveEnvOnAuthRef.current = null;
-      googleSignInInitiatedRef.current = false;
-      throw err;
-    }
-  }, [envMode]);
-
-  const triggerManualReconcile = useCallback(async () => {
-    if (!firebaseUser || !liveUserProfile) return;
-    await flushSyncQueue();
-    const count = await reconcileEnvironmentToCloud(envMode, firebaseUser, liveUserProfile);
-    if (count === 0) {
-      setSyncNotice(`Cloud (${envMode.toUpperCase()} & User Credentials) is already up to date.`);
-      setTimeout(() => setSyncNotice(null), 4000);
-    }
-  }, [envMode, firebaseUser, liveUserProfile, flushSyncQueue, reconcileEnvironmentToCloud]);
 
   // Credential Authentication (Username/Email & Password assigned by Administrator, Local + Cross-Device Cloud Proof)
   const loginWithCredentials = useCallback(
@@ -1388,6 +1832,25 @@ export function useFuelStore() {
               if (credSnap.exists()) {
                 const cred = credSnap.data() as Partial<UserAccount> & { uid: string };
                 if (cred.active === false) {
+                  const safeIdentifier = cleanId.slice(0, 120);
+                  await appendAudit(
+                    'CREDENTIAL_LOGIN_FAILED',
+                    'session',
+                    cred.uid || safeIdentifier || 'unknown',
+                    `Blocked credential sign-in for suspended cloud account "${safeIdentifier}".`,
+                    {
+                      category: 'credential',
+                      details: `Method: Cloud Credential Proof | Identifier: ${safeIdentifier} | Outcome: Blocked (Suspended Account)`,
+                      actorOverride: {
+                        uid: cred.uid || 'unauthenticated',
+                        email: (cred.email || safeIdentifier || 'unknown@baiscity.gov.ph').slice(0, 254),
+                        displayName: cred.displayName || safeIdentifier,
+                        role: cred.role || 'unauthenticated',
+                        department: cred.department || 'Unassigned',
+                      },
+                      envOverride: 'sandbox',
+                    }
+                  );
                   return {
                     ok: false,
                     error: 'This user account is suspended. Contact your Administrator.',
@@ -1407,6 +1870,8 @@ export function useFuelStore() {
                   canEdit: cred.role === 'admin' ? true : Boolean(cred.canEdit),
                   canDelete: cred.role === 'admin' ? true : Boolean(cred.canDelete),
                   canSwitchToLive: cred.role === 'admin' ? true : Boolean(cred.canSwitchToLive),
+                  canRequestSingleTrip:
+                    cred.role === 'admin' ? true : Boolean(cred.canRequestSingleTrip),
                   active: true,
                   createdBy: cred.createdBy || 'admin',
                   createdAt: cred.createdAt || new Date().toISOString(),
@@ -1439,9 +1904,30 @@ export function useFuelStore() {
       }
 
       if (!matched) {
+        const safeIdentifier = normalizeUsernameInput(username).slice(0, 120) || 'blank';
+        const reason = localResult.error || 'Invalid username or password.';
+        await appendAudit(
+          'CREDENTIAL_LOGIN_FAILED',
+          'session',
+          safeIdentifier,
+          `Failed credential sign-in attempt for identifier "${safeIdentifier}".`,
+          {
+            category: 'credential',
+            details: `Method: Username/Password | Identifier: ${safeIdentifier} | Outcome: Rejected | Reason: ${reason}`,
+            actorOverride: {
+              uid: 'unauthenticated',
+              email: safeIdentifier.includes('@') ? safeIdentifier : `${safeIdentifier}@login-attempt`,
+              displayName: `Login Attempt (${safeIdentifier})`,
+              role: 'unauthenticated',
+              department: 'Authentication Gate',
+            },
+            envOverride: 'sandbox',
+          }
+        );
         return localResult;
       }
 
+      const authMethod = localResult.ok ? 'Local Credential Registry' : 'Cloud Credential Proof';
       const nowMs = Date.now();
       const defaultSection = getDefaultNavSection(matched.role);
       lastActivityAtRef.current = nowMs;
@@ -1450,8 +1936,9 @@ export function useFuelStore() {
       setSessionExpiredNotice(null);
       setEnvMode('sandbox');
       setAuthenticatedUser(matched);
-      setSandboxActiveRole(matched.role);
-      setSandboxActiveDepartment(matched.department);
+      setSandboxActiveRoleState(matched.role);
+      setSandboxActiveDepartmentState(matched.department);
+      setSelectedSandboxUserUid(null);
       writeCachedAuthProfile(matched);
       writePersistedSession({
         uid: matched.uid,
@@ -1461,29 +1948,75 @@ export function useFuelStore() {
         activeSection: defaultSection,
         lastActivityAt: nowMs,
       });
+      await appendAudit(
+        'CREDENTIAL_LOGIN_SUCCESS',
+        'session',
+        matched.uid,
+        `Credential sign-in succeeded for ${matched.displayName} (${matched.username || matched.email}) as ${matched.role}.`,
+        {
+          category: 'credential',
+          details: `Method: ${authMethod} | Username: ${matched.username || 'N/A'} | Email: ${matched.email} | Role: ${matched.role} | Office: ${matched.department} | Environment: SANDBOX`,
+          actorOverride: matched,
+          envOverride: 'sandbox',
+        }
+      );
       return { ok: true, user: matched };
     },
-    [effectiveOnline]
+    [effectiveOnline, appendAudit]
   );
 
   const logout = useCallback(async () => {
+    const signingOutUser = authenticatedUser ?? currentUser;
+    if (signingOutUser && signingOutUser.uid !== 'unauthenticated') {
+      await appendAudit(
+        'USER_SIGN_OUT',
+        'session',
+        signingOutUser.uid,
+        `User ${signingOutUser.displayName} (${signingOutUser.email}) signed out of ${envMode.toUpperCase()} session.`,
+        {
+          category: 'credential',
+          details: `Action: Explicit Sign Out | Role: ${signingOutUser.role} | Office: ${signingOutUser.department} | Environment: ${envMode.toUpperCase()}`,
+          actorOverride: signingOutUser,
+          envOverride: envMode,
+        }
+      ).catch(() => {});
+    }
     clearPersistedSessionStorage();
     setGoogleAuthError(null);
     setSessionExpiredNotice(null);
     setAuthenticatedUser(null);
     setLiveUserProfile(null);
-    setSandboxActiveRole('admin');
+    setSandboxActiveRoleState('admin');
+    setSandboxActiveDepartmentState(USER_OFFICE_DEPARTMENT);
+    setSelectedSandboxUserUid(null);
     activeSectionRef.current = 'dashboard';
     if (firebaseUser) {
       await signOutFirebase();
     }
-  }, [firebaseUser]);
+  }, [firebaseUser, authenticatedUser, currentUser, envMode, appendAudit]);
 
   const expireSessionDueToInactivity = useCallback(async () => {
+    const expiringUser = authenticatedUser ?? currentUser;
+    if (expiringUser && expiringUser.uid !== 'unauthenticated') {
+      await appendAudit(
+        'SESSION_EXPIRED_INACTIVITY',
+        'session',
+        expiringUser.uid,
+        `Session automatically terminated for ${expiringUser.displayName} (${expiringUser.email}) after 10 minutes of inactivity.`,
+        {
+          category: 'credential',
+          details: `Trigger: 10-Minute Inactivity Timeout | Role: ${expiringUser.role} | Office: ${expiringUser.department} | Environment: ${envMode.toUpperCase()}`,
+          actorOverride: expiringUser,
+          envOverride: envMode,
+        }
+      ).catch(() => {});
+    }
     clearPersistedSessionStorage();
     setAuthenticatedUser(null);
     setLiveUserProfile(null);
-    setSandboxActiveRole('admin');
+    setSandboxActiveRoleState('admin');
+    setSandboxActiveDepartmentState(USER_OFFICE_DEPARTMENT);
+    setSelectedSandboxUserUid(null);
     activeSectionRef.current = 'dashboard';
     setSessionExpiredNotice(
       'Your session expired after 10 minutes of inactivity. Please sign in again.'
@@ -1491,7 +2024,7 @@ export function useFuelStore() {
     if (firebaseUser) {
       await signOutFirebase().catch(() => {});
     }
-  }, [firebaseUser]);
+  }, [firebaseUser, authenticatedUser, currentUser, envMode, appendAudit]);
 
   const persistActiveSection = useCallback(
     (section: string) => {
@@ -1673,6 +2206,25 @@ export function useFuelStore() {
       if (ticketDrafts.length === 0 || ticketDrafts.length > MAX_TICKETS_PER_WORKPLAN) {
         throw new Error(`Work plan must contain between 1 and ${MAX_TICKETS_PER_WORKPLAN} trip tickets.`);
       }
+      const isSingleTrip = planInput.requestType === 'single_trip';
+      if (isSingleTrip && !canUserRequestSingleTrip(currentUser)) {
+        throw new Error(
+          'Single Trip Ticket permission is deactivated for this user account. Contact your Administrator.'
+        );
+      }
+      if (!isSingleTrip) {
+        const effectivePrepDate = (planInput.preparationDate || '').trim() || getLocalIsoDate();
+        const weekStartEval = evaluateWorkPlanWeekStart(effectivePrepDate, planInput.weekStart);
+        if (!weekStartEval.allowed) {
+          throw new Error(
+            weekStartEval.reason ||
+              'Week Start Date cannot be earlier than Preparation Date. Work plans can only be prepared moving forward.'
+          );
+        }
+        if (planInput.weekEnd && planInput.weekEnd < planInput.weekStart) {
+          throw new Error('Week End Date cannot be earlier than Week Start Date.');
+        }
+      }
 
       const now = new Date().toISOString();
       const wpId = makeId('wp');
@@ -1683,7 +2235,9 @@ export function useFuelStore() {
         : weekStartYearMatch
           ? Number(weekStartYearMatch[1])
           : new Date().getFullYear();
-      const sequentialControlNo = generateNextWorkPlanNumber(activeData.workPlans, targetYear);
+      const sequentialControlNo = isSingleTrip
+        ? ''
+        : generateNextWorkPlanNumber(activeData.workPlans, targetYear);
       const sequentialTicketNos = generateNextTripTicketNumbers(
         activeData.tripTickets,
         ticketDrafts.length
@@ -1735,11 +2289,12 @@ export function useFuelStore() {
         await persistMutation('tripTickets', ttId, 'set', ticket as unknown as Record<string, unknown>);
       }
 
+      const planDisplayRef = getWorkPlanDisplayLabel(newPlan);
       await appendAudit(
         'WORKPLAN_CREATED',
         'workPlan',
         wpId,
-        `Submitted Weekly Work Plan ${newPlan.controlNumber} (${newPlan.department}) with ${ticketDrafts.length} trip ticket(s) totaling ${newPlan.totalRequestedLiters.toFixed(1)} L.`
+        `Submitted ${isSingleTrip ? planDisplayRef : `Weekly Work Plan ${planDisplayRef}`} (${newPlan.department}) with ${ticketDrafts.length} trip ticket(s) totaling ${newPlan.totalRequestedLiters.toFixed(1)} L.`
       );
       return { workPlan: newPlan, tickets: createdTickets };
     },
@@ -1747,9 +2302,7 @@ export function useFuelStore() {
       activeData.workPlans,
       activeData.tripTickets,
       firebaseUser?.uid,
-      currentUser.uid,
-      currentUser.role,
-      currentUser.department,
+      currentUser,
       persistMutation,
       appendAudit,
     ]
@@ -1791,7 +2344,6 @@ export function useFuelStore() {
         status: planStatus,
         totalApprovedLiters: Math.round(totalApproved * 10) / 10,
         approverNote: approverNote || workPlan.approverNote,
-        approvedBy: currentUser.displayName,
         updatedAt: now,
       });
 
@@ -1799,7 +2351,7 @@ export function useFuelStore() {
         'TABLETOP_APPROVAL_SUBMITTED',
         'workPlan',
         workPlan.id,
-        `Tabletop assessment on ${workPlan.controlNumber}: ${totalApproved.toFixed(1)} L approved of ${workPlan.totalRequestedLiters.toFixed(1)} L requested.`
+        `Tabletop assessment on ${getWorkPlanDisplayLabel(workPlan)}: ${totalApproved.toFixed(1)} L approved of ${workPlan.totalRequestedLiters.toFixed(1)} L requested.`
       );
     },
     [currentUser.displayName, persistMutation, appendAudit]
@@ -1810,7 +2362,8 @@ export function useFuelStore() {
     async (
       ticket: TripTicket,
       actualDispensedLiters: number,
-      pumpProof?: { dataUrl: string; fileName: string }
+      pumpProof?: { dataUrl: string; fileName: string },
+      dispenserOptions?: { tankId?: string; pumpId?: string }
     ) => {
       if (!pumpProof || !hasValidPumpReadingProof(pumpProof.dataUrl)) {
         return {
@@ -1836,11 +2389,38 @@ export function useFuelStore() {
       }
 
       const now = new Date().toISOString();
-      const unitPrice =
-        ticket.fuelType === 'gasoline' ? depot.gasolinePricePerLiter : depot.dieselPricePerLiter;
       const cleanPhotoName = (pumpProof.fileName || 'pump-reading.jpg').trim().slice(0, 160);
+      const gsoTransactionCode = generateNextGsoTransactionCode(
+        'dispense',
+        activeData.inventoryLogs,
+        activeData.tripTickets
+      );
+
+      // Resolve connected StorageTank from Master Registry FIRST so per-tank WAC is applied accurately
+      const matchedTank =
+        (dispenserOptions?.tankId
+          ? activeData.storageTanks.find((t) => t.id === dispenserOptions.tankId)
+          : undefined) ??
+        activeData.storageTanks.find(
+          (t) => t.depotId === depot.id && t.mappedFuelType === ticket.fuelType
+        );
+      const resolvedPumpId =
+        dispenserOptions?.pumpId?.trim() ||
+        matchedTank?.connectedDispensers?.[0] ||
+        undefined;
+
+      const unitPrice = resolvePrevailingWeightedAverageCost({
+        fuelType: ticket.fuelType,
+        timestampIso: now,
+        inventoryLogs: activeData.inventoryLogs,
+        depots: activeData.depots,
+        storageTanks: activeData.storageTanks,
+        depotId: depot.id,
+        tankId: matchedTank?.id,
+      });
 
       await persistMutation('tripTickets', ticket.id, 'update', {
+        gsoTransactionCode,
         dispensedLiters: outcome.dispensedLiters,
         forfeitedLiters: outcome.forfeitedLiters,
         unitPriceAtDispense: unitPrice,
@@ -1861,6 +2441,20 @@ export function useFuelStore() {
           : { dieselCurrentLiters: outcome.newDepotBalance, updatedAt: now };
       await persistMutation('depots', depot.id, 'update', depotUpdate);
 
+      let tankBeforeDispense = currentStock;
+      let tankAfterDispense = outcome.newDepotBalance;
+      if (matchedTank) {
+        tankBeforeDispense = matchedTank.currentBookVolumeLiters;
+        tankAfterDispense = Math.max(
+          0,
+          Math.round((matchedTank.currentBookVolumeLiters - outcome.dispensedLiters) * 10) / 10
+        );
+        await persistMutation('storageTanks', matchedTank.id, 'update', {
+          currentBookVolumeLiters: tankAfterDispense,
+          updatedAt: now,
+        });
+      }
+
       const parentPlan = activeData.workPlans.find((w) => w.id === ticket.workPlanId);
       if (parentPlan) {
         const nextPlanDispensed =
@@ -1875,13 +2469,18 @@ export function useFuelStore() {
         id: makeId('inv'),
         depotId: depot.id,
         depotName: depot.name,
+        ...(matchedTank ? { tankId: matchedTank.id } : {}),
+        ...(resolvedPumpId ? { pumpId: resolvedPumpId } : {}),
         fuelType: ticket.fuelType,
         transactionType: 'dispense',
         litersDelta: -outcome.dispensedLiters,
-        balanceBefore: currentStock,
-        balanceAfter: outcome.newDepotBalance,
+        balanceBefore: tankBeforeDispense,
+        balanceAfter: tankAfterDispense,
+        prevailingWeightedAverageCostPhp: unitPrice,
+        gsoTransactionCode,
+        tripTicketNumber: ticket.ticketNumber,
         referenceNumber: ticket.ticketNumber,
-        notes: `Once-daily dispense to ${ticket.plateNumber} (${ticket.driverName}). Pump proof: ${cleanPhotoName}. Unserved balance forfeited: ${outcome.forfeitedLiters.toFixed(1)} L.`,
+        notes: `Once-daily dispense to ${ticket.plateNumber} (${ticket.driverName})${resolvedPumpId ? ` via ${resolvedPumpId}` : ''}${matchedTank ? ` [${matchedTank.tankCode}]` : ''} @ Tank WAC ₱${unitPrice.toFixed(4)}/L. Pump proof: ${cleanPhotoName}. Unserved balance forfeited: ${outcome.forfeitedLiters.toFixed(1)} L.`,
         approvalStatus: 'verified',
         gsoApproverName: currentUser.displayName,
         digitalVerificationCode: `DISP-${ticket.ticketNumber.slice(-5)}`,
@@ -1895,12 +2494,22 @@ export function useFuelStore() {
         'FUEL_DISPENSED_ONCE',
         'tripTicket',
         ticket.id,
-        `Dispensed ${outcome.dispensedLiters.toFixed(1)} L ${ticket.fuelType} for ${ticket.ticketNumber} (${ticket.plateNumber}) with pump photo proof (${cleanPhotoName}). Forfeited balance: ${outcome.forfeitedLiters.toFixed(1)} L.`
+        `[${gsoTransactionCode}] Dispensed ${outcome.dispensedLiters.toFixed(1)} L ${ticket.fuelType} for ${ticket.ticketNumber} (${ticket.plateNumber})${matchedTank ? ` from ${matchedTank.tankCode}` : ''} @ Tank WAC PHP ${unitPrice.toFixed(4)}/L with pump photo proof (${cleanPhotoName}). Forfeited balance: ${outcome.forfeitedLiters.toFixed(1)} L.`
       );
 
       return { ok: true, outcome };
     },
-    [activeData.depots, activeData.workPlans, firebaseUser?.uid, currentUser, persistMutation, appendAudit]
+    [
+      activeData.depots,
+      activeData.storageTanks,
+      activeData.workPlans,
+      activeData.inventoryLogs,
+      activeData.tripTickets,
+      firebaseUser?.uid,
+      currentUser,
+      persistMutation,
+      appendAudit,
+    ]
   );
 
   // 4. Depot Delivery & Pre-Fill Dipping Shrinkage/Overage Adjustment
@@ -1908,47 +2517,185 @@ export function useFuelStore() {
     async (params: {
       depot: FuelDepot;
       fuelType: FuelType;
+      tankId?: string;
       transactionType: 'delivery' | 'shrinkage_adjustment' | 'overage_adjustment';
       litersAmount: number;
+      deliveryUnitCostPhp?: number;
+      deliveryTotalAmountPhp?: number;
       physicalDipLiters?: number;
       referenceNumber: string;
+      purchaseOrderRef?: string;
+      supplierName?: string;
+      deliveryDate?: string;
       notes: string;
       gsoApproverName?: string;
       digitalVerificationCode?: string;
-    }) => {
+      postImmediately?: boolean;
+      requireSeparateGsoApproval?: boolean;
+    }): Promise<InventoryLog> => {
       const now = new Date().toISOString();
-      const { depot, fuelType, transactionType, litersAmount } = params;
-      const before =
+      const latestState = envMode === 'live' ? liveStateRef.current : sandboxStateRef.current;
+      const depot = latestState.depots.find((d) => d.id === params.depot.id) ?? params.depot;
+      const { fuelType, transactionType, litersAmount } = params;
+
+      const matchedTank =
+        (params.tankId
+          ? latestState.storageTanks.find((t) => t.id === params.tankId)
+          : undefined) ??
+        latestState.storageTanks.find(
+          (t) => t.depotId === depot.id && t.mappedFuelType === fuelType
+        );
+
+      const depotBefore =
         fuelType === 'gasoline' ? depot.gasolineCurrentLiters : depot.dieselCurrentLiters;
-      const capacity =
+      const depotCapacity =
         fuelType === 'gasoline' ? depot.gasolineCapacityLiters : depot.dieselCapacityLiters;
 
       const delta =
         transactionType === 'shrinkage_adjustment'
           ? -Math.abs(litersAmount)
           : Math.abs(litersAmount);
-      const after = Math.max(0, Math.min(capacity, Math.round((before + delta) * 10) / 10));
-
-      const isVerifiedNow = Boolean(
-        params.digitalVerificationCode && params.digitalVerificationCode.trim().length >= 4
+      const depotAfter = Math.max(
+        0,
+        Math.min(depotCapacity, Math.round((depotBefore + delta) * 10) / 10)
       );
+
+      // Per-tank stock balance (used as exact basis for per-tank WAC)
+      const tankBefore = matchedTank ? matchedTank.currentBookVolumeLiters : depotBefore;
+      const tankCapacity = matchedTank ? matchedTank.grossCapacityLiters : depotCapacity;
+      const tankAfter = Math.max(
+        0,
+        Math.min(tankCapacity, Math.round((tankBefore + delta) * 10) / 10)
+      );
+
+      const gsoTransactionCode = generateNextGsoTransactionCode(
+        transactionType,
+        latestState.inventoryLogs,
+        latestState.tripTickets
+      );
+
+      const rawManualCode = params.requireSeparateGsoApproval
+        ? ''
+        : (params.digitalVerificationCode ?? '').trim();
+      let validatedManualCode: string | undefined;
+      let validatedApproverName: string | undefined = params.gsoApproverName;
+      if (rawManualCode.length > 0) {
+        const allKnownUsers = deduplicateUsersByEmail([
+          ...liveStateRef.current.users,
+          ...sandboxStateRef.current.users,
+        ]);
+        const gsoMatch = matchGsoHeadVerificationCode(rawManualCode, allKnownUsers);
+        if (!gsoMatch.matched || !gsoMatch.gsoHead) {
+          await appendAudit(
+            'GSO_VERIFICATION_REJECTED',
+            'inventoryLog',
+            depot.id,
+            `Rejected invalid GSO Head verification code during ${depot.name} ${fuelType} ${transactionType.replace(/_/g, ' ')}.`,
+            {
+              category: 'credential',
+              details: `Depot: ${depot.name} | Fuel: ${fuelType.toUpperCase()} | Transaction: ${transactionType} | Ref: ${params.referenceNumber.trim().slice(0, 64)} | Code Verification: Failed`,
+            }
+          ).catch(() => {});
+          throw new Error(
+            gsoMatch.error ||
+              'Invalid GSO Head Verification Code. Enter an active GSO Head account code or queue for separate GSO Head approval.'
+          );
+        }
+        validatedManualCode = gsoMatch.normalizedCode;
+        validatedApproverName = gsoMatch.gsoHead.displayName;
+      }
+
+      const verification = resolveDepotTransactionVerification({
+        transactionType,
+        digitalVerificationCode: validatedManualCode,
+        gsoApproverName: validatedApproverName,
+        actorDisplayName: currentUser.displayName,
+        gsoTransactionCode,
+        postImmediately: params.postImmediately,
+        requireSeparateGsoApproval: params.requireSeparateGsoApproval,
+      });
+      const isVerifiedNow = verification.isVerifiedNow;
+
+      const currentWac = resolvePrevailingWeightedAverageCost({
+        fuelType,
+        timestampIso: now,
+        inventoryLogs: latestState.inventoryLogs,
+        depots: latestState.depots,
+        storageTanks: latestState.storageTanks,
+        depotId: depot.id,
+        tankId: matchedTank?.id,
+      });
+
+      const isDelivery = transactionType === 'delivery';
+      const deliveryUnitCost =
+        isDelivery && typeof params.deliveryUnitCostPhp === 'number' && params.deliveryUnitCostPhp > 0
+          ? Math.round(params.deliveryUnitCostPhp * 10000) / 10000
+          : isDelivery
+            ? currentWac
+            : undefined;
+      const computedWacAfter =
+        isDelivery && deliveryUnitCost !== undefined
+          ? computeWeightedAverageCostAfterDelivery({
+              currentStockLiters: tankBefore,
+              currentWacPhp: currentWac,
+              deliveredLiters: Math.abs(litersAmount),
+              deliveryUnitCostPhp: deliveryUnitCost,
+            })
+          : undefined;
+
+      const cleanPoRef = params.purchaseOrderRef?.trim().toUpperCase().slice(0, 64);
+      const cleanSupplier = params.supplierName?.trim().slice(0, 120);
+      const cleanDeliveryDate = params.deliveryDate?.trim().slice(0, 20);
+      const cleanTotalAmount =
+        isDelivery &&
+        typeof params.deliveryTotalAmountPhp === 'number' &&
+        Number.isFinite(params.deliveryTotalAmountPhp) &&
+        params.deliveryTotalAmountPhp >= 0
+          ? Math.min(1_000_000_000, Math.round(params.deliveryTotalAmountPhp * 100) / 100)
+          : undefined;
+      const cleanPhysicalDip =
+        typeof params.physicalDipLiters === 'number' &&
+        Number.isFinite(params.physicalDipLiters) &&
+        params.physicalDipLiters >= 0
+          ? Math.round(params.physicalDipLiters * 10) / 10
+          : undefined;
 
       const log: InventoryLog = {
         id: makeId('inv'),
         depotId: depot.id,
         depotName: depot.name,
+        ...(matchedTank ? { tankId: matchedTank.id } : {}),
         fuelType,
         transactionType,
         litersDelta: delta,
-        balanceBefore: before,
-        balanceAfter: isVerifiedNow ? after : before,
-        physicalDipLiters: params.physicalDipLiters,
-        referenceNumber: params.referenceNumber,
-        notes: params.notes,
-        approvalStatus: isVerifiedNow ? 'verified' : 'pending_gso_approval',
-        gsoApproverName: isVerifiedNow ? params.gsoApproverName || currentUser.displayName : undefined,
-        digitalVerificationCode: isVerifiedNow ? params.digitalVerificationCode : undefined,
-        verifiedAt: isVerifiedNow ? now : undefined,
+        balanceBefore: tankBefore,
+        balanceAfter: isVerifiedNow ? tankAfter : tankBefore,
+        ...(isDelivery && deliveryUnitCost !== undefined
+          ? {
+              deliveryUnitCostPhp: deliveryUnitCost,
+              ...(cleanTotalAmount !== undefined ? { deliveryTotalAmountPhp: cleanTotalAmount } : {}),
+              weightedAverageCostBefore: currentWac,
+              weightedAverageCostAfter: computedWacAfter,
+              prevailingWeightedAverageCostPhp: computedWacAfter,
+            }
+          : {
+              prevailingWeightedAverageCostPhp: currentWac,
+            }),
+        ...(cleanPhysicalDip !== undefined ? { physicalDipLiters: cleanPhysicalDip } : {}),
+        gsoTransactionCode,
+        referenceNumber: params.referenceNumber.trim().slice(0, 64),
+        ...(cleanPoRef ? { purchaseOrderRef: cleanPoRef } : {}),
+        ...(cleanSupplier ? { supplierName: cleanSupplier } : {}),
+        ...(cleanDeliveryDate ? { deliveryDate: cleanDeliveryDate } : {}),
+        notes: params.notes.trim().slice(0, 400),
+        approvalStatus: verification.approvalStatus,
+        ...(isVerifiedNow && verification.gsoApproverName
+          ? { gsoApproverName: verification.gsoApproverName }
+          : {}),
+        ...(isVerifiedNow && verification.digitalVerificationCode
+          ? { digitalVerificationCode: verification.digitalVerificationCode }
+          : {}),
+        ...(isVerifiedNow ? { verifiedAt: now } : {}),
         ownerId: firebaseUser?.uid ?? currentUser.uid,
         createdAt: now,
       };
@@ -1956,79 +2703,524 @@ export function useFuelStore() {
       await persistMutation('inventoryLogs', log.id, 'set', log as unknown as Record<string, unknown>);
 
       if (isVerifiedNow) {
-        const tankUpdate =
+        let updatedStorageTanks = latestState.storageTanks;
+        if (matchedTank) {
+          const tankPayload: Record<string, unknown> = {
+            currentBookVolumeLiters: tankAfter,
+            ...(isDelivery && computedWacAfter !== undefined
+              ? { currentWacPhp: computedWacAfter }
+              : {}),
+            ...(cleanPhysicalDip !== undefined
+              ? { lastDipVolumeLiters: cleanPhysicalDip, lastDipAt: now }
+              : {}),
+            updatedAt: now,
+          };
+          await persistMutation('storageTanks', matchedTank.id, 'update', tankPayload);
+          updatedStorageTanks = latestState.storageTanks.map((t) =>
+            t.id === matchedTank.id
+              ? {
+                  ...t,
+                  currentBookVolumeLiters: tankAfter,
+                  ...(isDelivery && computedWacAfter !== undefined
+                    ? { currentWacPhp: computedWacAfter }
+                    : {}),
+                }
+              : t
+          );
+        }
+
+        const aggregateDepotWac =
+          isDelivery && computedWacAfter !== undefined
+            ? computeAggregateDepotWacFromTanks({
+                depotId: depot.id,
+                fuelType,
+                storageTanks: updatedStorageTanks,
+                fallbackWacPhp: computedWacAfter,
+              })
+            : undefined;
+
+        const depotUpdate =
           fuelType === 'gasoline'
             ? {
-                gasolineCurrentLiters: after,
+                gasolineCurrentLiters: depotAfter,
+                ...(aggregateDepotWac !== undefined
+                  ? { gasolinePricePerLiter: aggregateDepotWac }
+                  : {}),
                 lastDipVerifiedAt: now,
-                lastDipVerifiedBy: params.gsoApproverName || currentUser.displayName,
+                lastDipVerifiedBy: verification.gsoApproverName || currentUser.displayName,
                 updatedAt: now,
               }
             : {
-                dieselCurrentLiters: after,
+                dieselCurrentLiters: depotAfter,
+                ...(aggregateDepotWac !== undefined
+                  ? { dieselPricePerLiter: aggregateDepotWac }
+                  : {}),
                 lastDipVerifiedAt: now,
-                lastDipVerifiedBy: params.gsoApproverName || currentUser.displayName,
+                lastDipVerifiedBy: verification.gsoApproverName || currentUser.displayName,
                 updatedAt: now,
               };
-        await persistMutation('depots', depot.id, 'update', tankUpdate);
+        await persistMutation('depots', depot.id, 'update', depotUpdate);
       }
 
       await appendAudit(
         `DEPOT_${transactionType.toUpperCase()}`,
         'inventoryLog',
         log.id,
-        `${depot.name} ${fuelType} ${transactionType.replace(/_/g, ' ')}: ${delta > 0 ? '+' : ''}${delta.toFixed(1)} L (${log.approvalStatus}).`
+        `[${gsoTransactionCode}] ${depot.name}${matchedTank ? ` (${matchedTank.tankCode})` : ''} ${fuelType} ${transactionType.replace(/_/g, ' ')}: ${delta > 0 ? '+' : ''}${delta.toFixed(1)} L${isDelivery && computedWacAfter !== undefined ? ` @ PHP ${deliveryUnitCost?.toFixed(2)}/L -> Est. Tank WAC PHP ${computedWacAfter.toFixed(4)}/L` : ''} (${log.approvalStatus}).`,
+        {
+          category: 'transaction',
+          details: [
+            `Tx Code: ${gsoTransactionCode}`,
+            `Depot: ${depot.name}`,
+            matchedTank ? `Tank: ${matchedTank.tankCode}` : '',
+            `Fuel Class: ${fuelType.toUpperCase()}`,
+            `Type: ${transactionType.replace(/_/g, ' ')}`,
+            `Volume Delta: ${delta > 0 ? '+' : ''}${delta.toFixed(1)} L`,
+            `Tank Balance Before -> After: ${tankBefore.toLocaleString()} L -> ${(isVerifiedNow ? tankAfter : tankBefore).toLocaleString()} L`,
+            isDelivery && deliveryUnitCost !== undefined ? `Delivery Unit Cost: PHP ${deliveryUnitCost.toFixed(4)}/L` : '',
+            isDelivery && cleanTotalAmount !== undefined ? `Delivery Total Amount: PHP ${cleanTotalAmount.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : '',
+            isDelivery && computedWacAfter !== undefined ? `Tank WAC (Projected/Effected): PHP ${computedWacAfter.toFixed(4)}/L` : '',
+            `Reference: ${log.referenceNumber}`,
+            cleanPoRef ? `PO Ref: ${cleanPoRef}` : '',
+            cleanSupplier ? `Supplier: ${cleanSupplier}` : '',
+            `Verification Status: ${log.approvalStatus}`,
+          ]
+            .filter(Boolean)
+            .join(' | '),
+        }
       );
+      return log;
     },
-    [currentUser, persistMutation, appendAudit]
+    [
+      envMode,
+      firebaseUser?.uid,
+      currentUser,
+      persistMutation,
+      appendAudit,
+    ]
   );
 
-  const verifyPendingAdjustment = useCallback(
-    async (log: InventoryLog, gsoApproverName: string, digitalVerificationCode: string) => {
-      const depot = activeData.depots.find((d) => d.id === log.depotId);
-      if (!depot) return;
+  // 4b. Fuel Depot & UST Master Registry CRUD (Single Source of Truth)
+  const saveDepotInfo = useCallback(
+    async (
+      depotId: string,
+      updates: Partial<
+        Pick<
+          FuelDepot,
+          | 'siteCode'
+          | 'name'
+          | 'location'
+          | 'coordinates'
+          | 'permitNumber'
+          | 'calibrationExpiryDate'
+          | 'stationManager'
+          | 'reorderThresholdPct'
+        >
+      >
+    ) => {
+      const existing = activeData.depots.find((d) => d.id === depotId);
+      if (!existing) return;
       const now = new Date().toISOString();
-      const before =
-        log.fuelType === 'gasoline' ? depot.gasolineCurrentLiters : depot.dieselCurrentLiters;
-      const capacity =
-        log.fuelType === 'gasoline' ? depot.gasolineCapacityLiters : depot.dieselCapacityLiters;
-      const after = Math.max(0, Math.min(capacity, Math.round((before + log.litersDelta) * 10) / 10));
+      const cleanedUpdates: Record<string, unknown> = {
+        name: (updates.name ?? existing.name).trim().slice(0, 120),
+        location: (updates.location ?? existing.location).trim().slice(0, 160),
+        updatedAt: now,
+      };
+      if (updates.siteCode !== undefined && updates.siteCode.trim()) {
+        cleanedUpdates.siteCode = updates.siteCode.trim().toUpperCase().slice(0, 32);
+      }
+      if (updates.coordinates !== undefined && updates.coordinates.trim()) {
+        cleanedUpdates.coordinates = updates.coordinates.trim().slice(0, 80);
+      }
+      if (updates.permitNumber !== undefined && updates.permitNumber.trim()) {
+        cleanedUpdates.permitNumber = updates.permitNumber.trim().slice(0, 64);
+      }
+      if (updates.calibrationExpiryDate !== undefined && updates.calibrationExpiryDate.trim()) {
+        cleanedUpdates.calibrationExpiryDate = updates.calibrationExpiryDate.trim().slice(0, 20);
+      }
+      if (updates.stationManager !== undefined && updates.stationManager.trim()) {
+        cleanedUpdates.stationManager = updates.stationManager.trim().slice(0, 120);
+      }
+      if (typeof updates.reorderThresholdPct === 'number' && Number.isFinite(updates.reorderThresholdPct)) {
+        cleanedUpdates.reorderThresholdPct = Math.max(0, Math.min(100, updates.reorderThresholdPct));
+      }
 
-      await persistMutation('inventoryLogs', log.id, 'update', {
-        approvalStatus: 'verified',
-        balanceAfter: after,
-        gsoApproverName,
-        digitalVerificationCode,
-        verifiedAt: now,
-      });
-
-      const tankUpdate =
-        log.fuelType === 'gasoline'
-          ? {
-              gasolineCurrentLiters: after,
-              lastDipVerifiedAt: now,
-              lastDipVerifiedBy: gsoApproverName,
-              updatedAt: now,
-            }
-          : {
-              dieselCurrentLiters: after,
-              lastDipVerifiedAt: now,
-              lastDipVerifiedBy: gsoApproverName,
-              updatedAt: now,
-            };
-      await persistMutation('depots', depot.id, 'update', tankUpdate);
-
+      await persistMutation('depots', depotId, 'update', cleanedUpdates);
       await appendAudit(
-        'INVENTORY_ADJUSTMENT_VERIFIED',
-        'inventoryLog',
-        log.id,
-        `GSO personnel ${gsoApproverName} digitally verified ${log.referenceNumber} (${log.litersDelta > 0 ? '+' : ''}${log.litersDelta.toFixed(1)} L).`
+        'DEPOT_METADATA_UPDATED',
+        'depot',
+        depotId,
+        `Updated Fuel Depot Master info for ${String(cleanedUpdates.name)} (${String(cleanedUpdates.siteCode || existing.siteCode || depotId)}).`
       );
     },
     [activeData.depots, persistMutation, appendAudit]
   );
 
-  // 5. Fleet CRUD (Permission-gated via Admin-assigned canEdit / canDelete)
+  const syncDepotCapacitiesFromTanks = useCallback(
+    async (depotId: string, nextTanks: StorageTank[], nowIso: string) => {
+      const depot = activeData.depots.find((d) => d.id === depotId);
+      if (!depot) return;
+      const depotTanks = nextTanks.filter((t) => t.depotId === depotId);
+      if (depotTanks.length === 0) return;
+
+      const agg = computeAggregateDepotCapacitiesFromTanks(depotId, nextTanks);
+      const nextDieselCap = Math.max(
+        agg.dieselCapacityLiters > 0 ? agg.dieselCapacityLiters : depot.dieselCapacityLiters,
+        depot.dieselCurrentLiters,
+        100
+      );
+      const nextGasCap = Math.max(
+        agg.gasolineCapacityLiters > 0 ? agg.gasolineCapacityLiters : depot.gasolineCapacityLiters,
+        depot.gasolineCurrentLiters,
+        100
+      );
+      await persistMutation('depots', depotId, 'update', {
+        dieselCapacityLiters: nextDieselCap,
+        gasolineCapacityLiters: nextGasCap,
+        updatedAt: nowIso,
+      });
+    },
+    [activeData.depots, persistMutation]
+  );
+
+  const saveStorageTank = useCallback(
+    async (
+      tankDraft: Omit<
+        StorageTank,
+        | 'id'
+        | 'mappedFuelType'
+        | 'grossCapacityLiters'
+        | 'safeFillCapacityLiters'
+        | 'deadstockVolumeLiters'
+        | 'netWorkingVolumeLiters'
+        | 'ownerId'
+        | 'createdAt'
+        | 'updatedAt'
+      >,
+      existingTankId?: string
+    ): Promise<StorageTank> => {
+      const now = new Date().toISOString();
+      const existing = existingTankId
+        ? activeData.storageTanks.find((t) => t.id === existingTankId)
+        : undefined;
+      const id = existing?.id ?? makeId('tank');
+      const productStyle = TANK_FUEL_PRODUCT_STYLES[tankDraft.fuelProduct] ?? TANK_FUEL_PRODUCT_STYLES.diesel;
+      const specs = computeTankSpecifications({
+        geometry: tankDraft.geometry,
+        diameterCm: tankDraft.diameterCm,
+        lengthCm: tankDraft.lengthCm,
+        widthCm: tankDraft.widthCm,
+        heightCm: tankDraft.heightCm,
+        tiltAngleDegrees: tankDraft.tiltAngleDegrees,
+        overfillBufferPct: tankDraft.overfillBufferPct,
+        deadstockClearanceCm: tankDraft.deadstockClearanceCm,
+        customStrappingPoints: tankDraft.customStrappingPoints,
+      });
+
+      const parentDepot = activeData.depots.find((d) => d.id === tankDraft.depotId);
+      const fallbackTankWac =
+        productStyle.mappedDepotFuelType === 'gasoline'
+          ? parentDepot?.gasolinePricePerLiter ?? 64.5
+          : parentDepot?.dieselPricePerLiter ?? 58.2;
+      const resolvedTankWac =
+        typeof tankDraft.currentWacPhp === 'number' && Number.isFinite(tankDraft.currentWacPhp) && tankDraft.currentWacPhp > 0
+          ? Math.round(tankDraft.currentWacPhp * 10000) / 10000
+          : typeof existing?.currentWacPhp === 'number' && Number.isFinite(existing.currentWacPhp) && existing.currentWacPhp > 0
+            ? existing.currentWacPhp
+            : fallbackTankWac;
+
+      const record = normalizeStorageTankRecord({
+        ...tankDraft,
+        id,
+        tankCode: tankDraft.tankCode.trim().toUpperCase().slice(0, 40),
+        name: tankDraft.name.trim().slice(0, 120),
+        locationZone: tankDraft.locationZone.trim().slice(0, 120),
+        manholeTag: tankDraft.manholeTag?.trim() ? tankDraft.manholeTag.trim().slice(0, 80) : undefined,
+        mappedFuelType: productStyle.mappedDepotFuelType,
+        connectedDispensers: Array.from(
+          new Set(tankDraft.connectedDispensers.map((p) => p.trim()).filter(Boolean))
+        ).slice(0, 32),
+        grossCapacityLiters: specs.grossCapacityLiters,
+        safeFillCapacityLiters: specs.safeFillCapacityLiters,
+        deadstockVolumeLiters: specs.deadstockVolumeLiters,
+        netWorkingVolumeLiters: specs.netWorkingVolumeLiters,
+        calibrationCertificateNo: tankDraft.calibrationCertificateNo?.trim()
+          ? tankDraft.calibrationCertificateNo.trim().slice(0, 64)
+          : undefined,
+        calibrationExpiryDate: tankDraft.calibrationExpiryDate?.trim()
+          ? tankDraft.calibrationExpiryDate.trim().slice(0, 20)
+          : undefined,
+        openingDipLiters: Math.min(specs.grossCapacityLiters, Math.max(0, tankDraft.openingDipLiters)),
+        currentBookVolumeLiters: Math.min(
+          specs.grossCapacityLiters,
+          Math.max(0, tankDraft.currentBookVolumeLiters)
+        ),
+        currentWacPhp: resolvedTankWac,
+        ownerId: existing?.ownerId ?? firebaseUser?.uid ?? currentUser.uid,
+        createdAt: existing?.createdAt ?? now,
+        updatedAt: now,
+      });
+
+      await persistMutation(
+        'storageTanks',
+        record.id,
+        existing ? 'update' : 'set',
+        record as unknown as Record<string, unknown>
+      );
+
+      const nextTanks = existing
+        ? activeData.storageTanks.map((t) => (t.id === record.id ? record : t))
+        : [record, ...activeData.storageTanks];
+      await syncDepotCapacitiesFromTanks(record.depotId, nextTanks, now);
+
+      await appendAudit(
+        existing ? 'STORAGE_TANK_UPDATED' : 'STORAGE_TANK_REGISTERED',
+        'storageTank',
+        record.id,
+        `${existing ? 'Updated' : 'Registered'} ${record.tankCode} (${record.name}, ${productStyle.label}, Gross ${record.grossCapacityLiters.toLocaleString()} L / Safe Fill ${record.safeFillCapacityLiters.toLocaleString()} L).`
+      );
+      return record;
+    },
+    [
+      activeData.depots,
+      activeData.storageTanks,
+      firebaseUser?.uid,
+      currentUser.uid,
+      persistMutation,
+      syncDepotCapacitiesFromTanks,
+      appendAudit,
+    ]
+  );
+
+  const deleteStorageTank = useCallback(
+    async (tank: StorageTank) => {
+      const now = new Date().toISOString();
+      await persistMutation('storageTanks', tank.id, 'delete');
+      const remainingTanks = activeData.storageTanks.filter((t) => t.id !== tank.id);
+      await syncDepotCapacitiesFromTanks(tank.depotId, remainingTanks, now);
+      await appendAudit(
+        'STORAGE_TANK_DELETED',
+        'storageTank',
+        tank.id,
+        `Removed tank ${tank.tankCode} (${tank.name}) from Master Registry.`
+      );
+    },
+    [activeData.storageTanks, persistMutation, syncDepotCapacitiesFromTanks, appendAudit]
+  );
+
+  const recordTankDipReading = useCallback(
+    async (params: {
+      tankId: string;
+      calculatedVolumeLiters: number;
+      timestampIso: string;
+    }) => {
+      const tank = activeData.storageTanks.find((t) => t.id === params.tankId);
+      if (!tank) return;
+      const roundedVol = Math.round(Math.max(0, params.calculatedVolumeLiters) * 10) / 10;
+      await persistMutation('storageTanks', tank.id, 'update', {
+        lastDipVolumeLiters: roundedVol,
+        lastDipAt: params.timestampIso,
+        updatedAt: params.timestampIso,
+      });
+      await persistMutation('depots', tank.depotId, 'update', {
+        lastDipVerifiedAt: params.timestampIso,
+        lastDipVerifiedBy: currentUser.displayName,
+        updatedAt: params.timestampIso,
+      });
+      await appendAudit(
+        'TANK_DIPSTICK_LOGGED',
+        'storageTank',
+        tank.id,
+        `Logged physical dipstick reading for ${tank.tankCode} (${tank.name}): ${roundedVol.toLocaleString()} L.`,
+        {
+          category: 'transaction',
+          details: `Tank Code: ${tank.tankCode} | Tank Name: ${tank.name} | Fuel Class: ${tank.mappedFuelType.toUpperCase()} | Calculated Dip Volume: ${roundedVol.toLocaleString()} L | Reading Timestamp: ${params.timestampIso}`,
+        }
+      );
+    },
+    [activeData.storageTanks, currentUser.displayName, persistMutation, appendAudit]
+  );
+
+  const verifyPendingAdjustment = useCallback(
+    async (log: InventoryLog, _gsoApproverName: string, digitalVerificationCode: string) => {
+      if (!canAccessDepotLedgerRegister(currentUser.role)) {
+        throw new Error(
+          'Access Denied: GSO Depot Dispenser cannot access or verify Depot Ledger Register records.'
+        );
+      }
+      const allKnownUsers = deduplicateUsersByEmail([
+        ...liveStateRef.current.users,
+        ...sandboxStateRef.current.users,
+      ]);
+      const gsoMatch = matchGsoHeadVerificationCode(digitalVerificationCode, allKnownUsers);
+      if (!gsoMatch.matched || !gsoMatch.gsoHead) {
+        await appendAudit(
+          'GSO_VERIFICATION_REJECTED',
+          'inventoryLog',
+          log.id,
+          `Rejected invalid GSO Head verification code for pending inventory log ${log.referenceNumber}.`,
+          {
+            category: 'credential',
+            details: `Log Ref: ${log.referenceNumber} | Depot: ${log.depotName} | Fuel: ${log.fuelType.toUpperCase()} | Code Verification: Failed`,
+          }
+        ).catch(() => {});
+        throw new Error(
+          gsoMatch.error ||
+            'Invalid GSO Head Verification Code. Only the distinct code assigned to an active GSO Head account is accepted.'
+        );
+      }
+      const verifiedApproverName = gsoMatch.gsoHead.displayName;
+      const verifiedCode = gsoMatch.normalizedCode;
+
+      const latestState = envMode === 'live' ? liveStateRef.current : sandboxStateRef.current;
+      const depot = latestState.depots.find((d) => d.id === log.depotId);
+      if (!depot) return;
+      const now = new Date().toISOString();
+
+      // Resolve target StorageTank FIRST so per-tank balance & per-tank WAC are computed exclusively for this tank
+      const matchedTank =
+        (log.tankId ? latestState.storageTanks.find((t) => t.id === log.tankId) : undefined) ??
+        latestState.storageTanks.find(
+          (t) => t.depotId === depot.id && t.mappedFuelType === log.fuelType
+        );
+
+      const depotBefore =
+        log.fuelType === 'gasoline' ? depot.gasolineCurrentLiters : depot.dieselCurrentLiters;
+      const depotCapacity =
+        log.fuelType === 'gasoline' ? depot.gasolineCapacityLiters : depot.dieselCapacityLiters;
+      const depotAfter = Math.max(
+        0,
+        Math.min(depotCapacity, Math.round((depotBefore + log.litersDelta) * 10) / 10)
+      );
+
+      const tankBefore = matchedTank ? matchedTank.currentBookVolumeLiters : depotBefore;
+      const tankCapacity = matchedTank ? matchedTank.grossCapacityLiters : depotCapacity;
+      const tankAfter = Math.max(
+        0,
+        Math.min(tankCapacity, Math.round((tankBefore + log.litersDelta) * 10) / 10)
+      );
+
+      const isDelivery = log.transactionType === 'delivery';
+      const currentWac = resolvePrevailingWeightedAverageCost({
+        fuelType: log.fuelType,
+        timestampIso: now,
+        inventoryLogs: latestState.inventoryLogs,
+        depots: latestState.depots,
+        storageTanks: latestState.storageTanks,
+        depotId: depot.id,
+        tankId: matchedTank?.id,
+      });
+      const deliveryUnitCost = log.deliveryUnitCostPhp ?? currentWac;
+      const computedWacAfter = isDelivery
+        ? computeWeightedAverageCostAfterDelivery({
+            currentStockLiters: tankBefore,
+            currentWacPhp: currentWac,
+            deliveredLiters: Math.abs(log.litersDelta),
+            deliveryUnitCostPhp: deliveryUnitCost,
+          })
+        : undefined;
+
+      await persistMutation('inventoryLogs', log.id, 'update', {
+        approvalStatus: 'verified',
+        balanceBefore: tankBefore,
+        balanceAfter: tankAfter,
+        ...(isDelivery && computedWacAfter !== undefined
+          ? {
+              weightedAverageCostBefore: currentWac,
+              weightedAverageCostAfter: computedWacAfter,
+              prevailingWeightedAverageCostPhp: computedWacAfter,
+            }
+          : {
+              prevailingWeightedAverageCostPhp: currentWac,
+            }),
+        gsoApproverName: verifiedApproverName,
+        digitalVerificationCode: verifiedCode,
+        verifiedAt: now,
+      });
+
+      let updatedStorageTanks = latestState.storageTanks;
+      if (matchedTank) {
+        await persistMutation('storageTanks', matchedTank.id, 'update', {
+          currentBookVolumeLiters: tankAfter,
+          ...(isDelivery && computedWacAfter !== undefined
+            ? { currentWacPhp: computedWacAfter }
+            : {}),
+          updatedAt: now,
+        });
+        updatedStorageTanks = latestState.storageTanks.map((t) =>
+          t.id === matchedTank.id
+            ? {
+                ...t,
+                currentBookVolumeLiters: tankAfter,
+                ...(isDelivery && computedWacAfter !== undefined
+                  ? { currentWacPhp: computedWacAfter }
+                  : {}),
+              }
+            : t
+        );
+      }
+
+      const aggregateDepotWac =
+        isDelivery && computedWacAfter !== undefined
+          ? computeAggregateDepotWacFromTanks({
+              depotId: depot.id,
+              fuelType: log.fuelType,
+              storageTanks: updatedStorageTanks,
+              fallbackWacPhp: computedWacAfter,
+            })
+          : undefined;
+
+      const depotUpdate =
+        log.fuelType === 'gasoline'
+          ? {
+              gasolineCurrentLiters: depotAfter,
+              ...(aggregateDepotWac !== undefined
+                ? { gasolinePricePerLiter: aggregateDepotWac }
+                : {}),
+              lastDipVerifiedAt: now,
+              lastDipVerifiedBy: verifiedApproverName,
+              updatedAt: now,
+            }
+          : {
+              dieselCurrentLiters: depotAfter,
+              ...(aggregateDepotWac !== undefined
+                ? { dieselPricePerLiter: aggregateDepotWac }
+                : {}),
+              lastDipVerifiedAt: now,
+              lastDipVerifiedBy: verifiedApproverName,
+              updatedAt: now,
+            };
+      await persistMutation('depots', depot.id, 'update', depotUpdate);
+
+      await appendAudit(
+        isDelivery ? 'INVENTORY_DELIVERY_VERIFIED' : 'INVENTORY_ADJUSTMENT_VERIFIED',
+        'inventoryLog',
+        log.id,
+        `GSO Head ${verifiedApproverName} verified ${isDelivery ? 'fuel delivery' : 'dipstick variance adjustment'} ${log.referenceNumber}${matchedTank ? ` on ${matchedTank.tankCode}` : ''} (${log.litersDelta > 0 ? '+' : ''}${log.litersDelta.toFixed(1)} L${isDelivery && computedWacAfter !== undefined ? `, Tank WAC PHP ${computedWacAfter.toFixed(4)}/L` : ''}).`,
+        {
+          category: 'transaction',
+          details: [
+            log.gsoTransactionCode ? `Tx Code: ${log.gsoTransactionCode}` : '',
+            `Depot: ${depot.name}`,
+            matchedTank ? `Tank: ${matchedTank.tankCode}` : '',
+            `Fuel Class: ${log.fuelType.toUpperCase()}`,
+            `Type: ${log.transactionType.replace(/_/g, ' ')}`,
+            `Delta: ${log.litersDelta > 0 ? '+' : ''}${log.litersDelta.toFixed(1)} L`,
+            `Tank Balance: ${tankBefore.toLocaleString()} L -> ${tankAfter.toLocaleString()} L`,
+            isDelivery && computedWacAfter !== undefined
+              ? `Tank WAC: PHP ${currentWac.toFixed(4)}/L -> PHP ${computedWacAfter.toFixed(4)}/L`
+              : `Effected Tank WAC: PHP ${currentWac.toFixed(4)}/L`,
+            `GSO Head Approver: ${verifiedApproverName}`,
+          ]
+            .filter(Boolean)
+            .join(' | '),
+        }
+      );
+    },
+    [currentUser.role, envMode, persistMutation, appendAudit]
+  );
+
+  // 5. Fleet CRUD (Registration allowed for Admin & GSO Head; Edit/Delete gated via Admin-assigned canEdit / canDelete)
   const saveVehicle = useCallback(
     async (
       vehicleData: Omit<FleetVehicle, 'id' | 'ownerId' | 'createdAt' | 'updatedAt'>,
@@ -2036,6 +3228,9 @@ export function useFuelStore() {
     ) => {
       const now = new Date().toISOString();
       if (existingId) {
+        if (!canUserEditRecords(currentUser)) {
+          throw new Error('Only System Administrator or users with Edit permission can modify existing fleet records.');
+        }
         await persistMutation('vehicles', existingId, 'update', {
           ...vehicleData,
           updatedAt: now,
@@ -2047,6 +3242,9 @@ export function useFuelStore() {
           `Updated fleet record ${vehicleData.plateNumber} (${vehicleData.makeModel}).`
         );
       } else {
+        if (!canRegisterFleetUnit(currentUser.role)) {
+          throw new Error('Only System Administrator and GSO Head can register fleet units.');
+        }
         const id = makeId('veh');
         const newVeh: FleetVehicle = {
           ...vehicleData,
@@ -2064,7 +3262,7 @@ export function useFuelStore() {
         );
       }
     },
-    [firebaseUser?.uid, currentUser.uid, persistMutation, appendAudit]
+    [firebaseUser?.uid, currentUser, persistMutation, appendAudit]
   );
 
   const deleteVehicle = useCallback(
@@ -2075,6 +3273,63 @@ export function useFuelStore() {
         'vehicle',
         vehicle.id,
         `Deleted fleet unit ${vehicle.plateNumber} (${vehicle.makeModel}).`
+      );
+    },
+    [persistMutation, appendAudit]
+  );
+
+  // 5b. PMC Project Registry CRUD (PMC Staff & System Administrator)
+  const savePmcProject = useCallback(
+    async (
+      projectData: Omit<PmcProject, 'id' | 'ownerId' | 'createdAt' | 'updatedAt'>,
+      existingId?: string
+    ) => {
+      const now = new Date().toISOString();
+      if (existingId) {
+        await persistMutation('pmcProjects', existingId, 'update', {
+          ...projectData,
+          updatedAt: now,
+        });
+        await appendAudit(
+          'PMC_PROJECT_UPDATED',
+          'pmcProject',
+          existingId,
+          `Updated PMC project ${projectData.aipCode} (${projectData.projectName}) — Approval Year ${projectData.approvalYear}, Fuel POW PHP ${projectData.fuelComponentAmountPhp.toFixed(2)}.`
+        );
+      } else {
+        const id = makeId('pmc');
+        const newProject: PmcProject = {
+          ...projectData,
+          id,
+          ownerId: firebaseUser?.uid ?? currentUser.uid,
+          createdAt: now,
+          updatedAt: now,
+        };
+        await persistMutation(
+          'pmcProjects',
+          id,
+          'set',
+          newProject as unknown as Record<string, unknown>
+        );
+        await appendAudit(
+          'PMC_PROJECT_CREATED',
+          'pmcProject',
+          id,
+          `Registered PMC project ${newProject.aipCode} (${newProject.projectName}) — Approval Year ${newProject.approvalYear}, Fuel POW PHP ${newProject.fuelComponentAmountPhp.toFixed(2)}.`
+        );
+      }
+    },
+    [firebaseUser?.uid, currentUser.uid, persistMutation, appendAudit]
+  );
+
+  const deletePmcProject = useCallback(
+    async (project: PmcProject) => {
+      await persistMutation('pmcProjects', project.id, 'delete');
+      await appendAudit(
+        'PMC_PROJECT_DELETED',
+        'pmcProject',
+        project.id,
+        `Deleted PMC project ${project.aipCode} (${project.projectName}).`
       );
     },
     [persistMutation, appendAudit]
@@ -2091,7 +3346,7 @@ export function useFuelStore() {
         'WORKPLAN_DELETED',
         'workPlan',
         workPlan.id,
-        `Deleted work plan ${workPlan.controlNumber} and ${linkedTickets.length} embedded trip ticket(s).`
+        `Deleted ${getWorkPlanDisplayLabel(workPlan)} and ${linkedTickets.length} embedded trip ticket(s).`
       );
     },
     [activeData.tripTickets, persistMutation, appendAudit]
@@ -2099,6 +3354,14 @@ export function useFuelStore() {
 
   const updateWorkPlanAdmin = useCallback(
     async (workPlanId: string, updates: Partial<WorkPlan>) => {
+      const targetPlan = activeData.workPlans.find((w) => w.id === workPlanId);
+      if (targetPlan && !canUserEditWorkPlanRecord(currentUser, targetPlan)) {
+        throw new Error(
+          targetPlan.requestType === 'single_trip'
+            ? 'Single Trip Ticket edit permission is deactivated for this user account.'
+            : 'Edit permission is required to modify this record.'
+        );
+      }
       await persistMutation('workPlans', workPlanId, 'update', {
         ...updates,
         updatedAt: new Date().toISOString(),
@@ -2110,7 +3373,66 @@ export function useFuelStore() {
         `Modified work plan ${workPlanId}.`
       );
     },
-    [persistMutation, appendAudit]
+    [activeData.workPlans, currentUser, persistMutation, appendAudit]
+  );
+
+  const applySavedUserImmediately = useCallback(
+    (savedUser: UserAccount) => {
+      const normalizedEmail = savedUser.email.trim().toLowerCase();
+      const upsertIntoSnapshot = (prev: LocalSnapshotState): LocalSnapshotState => {
+        const idx = prev.users.findIndex(
+          (u) =>
+            u.uid === savedUser.uid ||
+            (normalizedEmail.length > 0 && u.email.trim().toLowerCase() === normalizedEmail)
+        );
+        const nextUsers = [...prev.users];
+        if (idx >= 0) {
+          nextUsers[idx] = { ...nextUsers[idx], ...savedUser };
+        } else {
+          nextUsers.unshift(savedUser);
+        }
+        return { ...prev, users: nextUsers };
+      };
+
+      const nextSandbox = upsertIntoSnapshot(sandboxStateRef.current);
+      const nextLive = upsertIntoSnapshot(liveStateRef.current);
+      sandboxStateRef.current = nextSandbox;
+      liveStateRef.current = nextLive;
+      setSandboxState(nextSandbox);
+      setLiveState(nextLive);
+      saveLocalState(SANDBOX_STORAGE_KEY, nextSandbox);
+      saveLocalState(LIVE_CACHE_STORAGE_KEY, nextLive);
+
+      const matchesProfile = (profile: UserAccount | null): boolean =>
+        Boolean(
+          profile &&
+            (profile.uid === savedUser.uid ||
+              (normalizedEmail.length > 0 &&
+                profile.email.trim().toLowerCase() === normalizedEmail))
+        );
+
+      setAuthenticatedUser((prev) => {
+        if (!matchesProfile(prev)) return prev;
+        const merged: UserAccount = { ...prev!, ...savedUser };
+        writeCachedAuthProfile(merged);
+        return merged;
+      });
+      setLiveUserProfile((prev) => {
+        if (!matchesProfile(prev)) return prev;
+        const merged: UserAccount = { ...prev!, ...savedUser };
+        writeCachedAuthProfile(merged);
+        return merged;
+      });
+
+      if (
+        savedUser.active &&
+        savedUser.role === sandboxActiveRole &&
+        savedUser.department.trim().toLowerCase() === resolvedSandboxDepartment.trim().toLowerCase()
+      ) {
+        setSelectedSandboxUserUid(savedUser.uid);
+      }
+    },
+    [sandboxActiveRole, resolvedSandboxDepartment]
   );
 
   // 6. Admin User Creation, Edit, Delete & RBAC Management (Always synced to /users + /invites + /credentialLogins)
@@ -2126,6 +3448,8 @@ export function useFuelStore() {
       canEdit: boolean;
       canDelete: boolean;
       canSwitchToLive: boolean;
+      canRequestSingleTrip: boolean;
+      gsoVerificationCode?: string;
     }) => {
       const now = new Date().toISOString();
       const cleanUsername = normalizeUsernameInput(input.username).slice(0, 64);
@@ -2155,6 +3479,16 @@ export function useFuelStore() {
       );
 
       const targetUid = existingByEmail ? existingByEmail.uid : emailKey;
+      const gsoCodeValidation = validateGsoHeadVerificationCode({
+        role: input.role,
+        code: input.gsoVerificationCode,
+        existingUsers: allKnownUsers,
+        excludeUid: targetUid,
+      });
+      if (!gsoCodeValidation.valid) {
+        throw new Error(gsoCodeValidation.error || 'Invalid GSO Head Verification Code.');
+      }
+
       const userDoc: UserAccount = {
         uid: targetUid,
         username: cleanUsername,
@@ -2167,18 +3501,23 @@ export function useFuelStore() {
         canEdit: input.role === 'admin' ? true : input.canEdit,
         canDelete: input.role === 'admin' ? true : input.canDelete,
         canSwitchToLive: input.role === 'admin' ? true : input.canSwitchToLive,
+        canRequestSingleTrip: input.role === 'admin' ? true : input.canRequestSingleTrip,
+        ...(input.role === 'gso_head' && gsoCodeValidation.normalizedCode
+          ? { gsoVerificationCode: gsoCodeValidation.normalizedCode }
+          : {}),
         active: true,
         createdBy: existingByEmail?.createdBy || firebaseUser?.uid || currentUser.uid,
         createdAt: existingByEmail?.createdAt || now,
         updatedAt: now,
       };
+      applySavedUserImmediately(userDoc);
       await persistMutation('users', targetUid, 'set', userDoc as unknown as Record<string, unknown>);
 
       if (firebaseUser && effectiveOnline) {
         const invitePayload = buildInvitePayloadFromUser(userDoc, firebaseUser.uid);
         if (invitePayload && typeof invitePayload.id === 'string') {
           try {
-            await setDoc(doc(db, 'invites', invitePayload.id), invitePayload, { merge: true });
+            await setDoc(doc(db, 'invites', invitePayload.id), invitePayload);
           } catch (err) {
             console.warn('Invite write skipped:', err);
           }
@@ -2194,13 +3533,14 @@ export function useFuelStore() {
         'USER_CREATED',
         'user',
         targetUid,
-        `Created user ${userDoc.username} (${userDoc.email}) with role ${userDoc.role}, edit=${userDoc.canEdit}, delete=${userDoc.canDelete}, liveSwitch=${userDoc.canSwitchToLive}, dept=${userDoc.department}.`
+        `Created user ${userDoc.username} (${userDoc.email}) with role ${userDoc.role}, edit=${userDoc.canEdit}, delete=${userDoc.canDelete}, singleTrip=${userDoc.canRequestSingleTrip}, liveSwitch=${userDoc.canSwitchToLive}, dept=${userDoc.department}${userDoc.role === 'gso_head' ? ', gsoHeadCodeAssigned=true' : ''}.`
       );
     },
     [
       currentUser.uid,
       firebaseUser,
       effectiveOnline,
+      applySavedUserImmediately,
       persistMutation,
       syncCredentialLoginDocs,
       appendAudit,
@@ -2221,6 +3561,8 @@ export function useFuelStore() {
         canEdit: boolean;
         canDelete: boolean;
         canSwitchToLive: boolean;
+        canRequestSingleTrip: boolean;
+        gsoVerificationCode?: string;
       }
     ) => {
       const now = new Date().toISOString();
@@ -2241,14 +3583,35 @@ export function useFuelStore() {
         throw new Error('Department Concerned must be at least 2 characters.');
       }
 
+      const allKnownUsers = deduplicateUsersByEmail([
+        ...liveStateRef.current.users,
+        ...sandboxStateRef.current.users,
+      ]);
+      const gsoCodeValidation = validateGsoHeadVerificationCode({
+        role: updates.role,
+        code: updates.gsoVerificationCode,
+        existingUsers: allKnownUsers,
+        excludeUid: uid,
+      });
+      if (!gsoCodeValidation.valid) {
+        throw new Error(gsoCodeValidation.error || 'Invalid GSO Head Verification Code.');
+      }
+
       const previousUser =
         liveStateRef.current.users.find((u) => u.uid === uid) ??
         sandboxStateRef.current.users.find((u) => u.uid === uid) ??
         null;
 
-      const payload: Record<string, unknown> = {
+      const resolvedPasswordHash =
+        updates.password && updates.password.trim().length > 0
+          ? hashPassword(updates.password)
+          : previousUser?.passwordHash;
+
+      const mergedUser: UserAccount = {
+        uid,
+        email: cleanEmail || previousUser?.email || `${cleanUsername}@baiscity.gov.ph`,
         username: cleanUsername,
-        email: cleanEmail,
+        ...(resolvedPasswordHash ? { passwordHash: resolvedPasswordHash } : {}),
         displayName: cleanDisplayName,
         role: updates.role,
         department: cleanDepartment,
@@ -2256,39 +3619,26 @@ export function useFuelStore() {
         canEdit: updates.role === 'admin' ? true : updates.canEdit,
         canDelete: updates.role === 'admin' ? true : updates.canDelete,
         canSwitchToLive: updates.role === 'admin' ? true : updates.canSwitchToLive,
+        canRequestSingleTrip: updates.role === 'admin' ? true : updates.canRequestSingleTrip,
+        ...(updates.role === 'gso_head' && gsoCodeValidation.normalizedCode
+          ? { gsoVerificationCode: gsoCodeValidation.normalizedCode }
+          : {}),
+        active: previousUser?.active ?? true,
+        createdBy: previousUser?.createdBy || firebaseUser?.uid || currentUser.uid,
+        createdAt: previousUser?.createdAt || now,
         updatedAt: now,
       };
-      if (updates.password && updates.password.trim().length > 0) {
-        payload.passwordHash = hashPassword(updates.password);
-      }
 
-      await persistMutation('users', uid, 'update', payload);
+      // Immediately effect updated RBAC permissions across both Sandbox & Live + active session
+      // Use 'set' so removing gsoVerificationCode on role change cleanly strips the field from Firestore & local state.
+      applySavedUserImmediately(mergedUser);
+      await persistMutation('users', uid, 'set', mergedUser as unknown as Record<string, unknown>);
 
-      if (firebaseUser && effectiveOnline && cleanEmail) {
-        const mergedUser: UserAccount = {
-          uid,
-          email: cleanEmail,
-          username: cleanUsername,
-          passwordHash:
-            typeof payload.passwordHash === 'string'
-              ? payload.passwordHash
-              : previousUser?.passwordHash,
-          displayName: String(payload.displayName),
-          role: updates.role,
-          department: String(payload.department),
-          positionTitle: String(payload.positionTitle),
-          canEdit: Boolean(payload.canEdit),
-          canDelete: Boolean(payload.canDelete),
-          canSwitchToLive: Boolean(payload.canSwitchToLive),
-          active: previousUser?.active ?? true,
-          createdBy: previousUser?.createdBy || firebaseUser.uid,
-          createdAt: previousUser?.createdAt || now,
-          updatedAt: now,
-        };
+      if (firebaseUser && effectiveOnline && mergedUser.email) {
         const invitePayload = buildInvitePayloadFromUser(mergedUser, firebaseUser.uid);
         if (invitePayload && typeof invitePayload.id === 'string') {
           try {
-            await setDoc(doc(db, 'invites', invitePayload.id), invitePayload, { merge: true });
+            await setDoc(doc(db, 'invites', invitePayload.id), invitePayload);
           } catch (err) {
             console.warn('Invite sync on user update skipped:', err);
           }
@@ -2300,21 +3650,18 @@ export function useFuelStore() {
         }
       }
 
-      if (authenticatedUser?.uid === uid) {
-        setAuthenticatedUser((prev) => (prev ? ({ ...prev, ...payload } as UserAccount) : null));
-      }
-
       await appendAudit(
         'USER_UPDATED',
         'user',
         uid,
-        `Admin updated user ${String(payload.username)} (${String(payload.department)}).`
+        `Admin updated user ${mergedUser.username} (${mergedUser.department}) — role=${mergedUser.role}, edit=${mergedUser.canEdit}, delete=${mergedUser.canDelete}, singleTrip=${mergedUser.canRequestSingleTrip}, liveSwitch=${mergedUser.canSwitchToLive}${mergedUser.role === 'gso_head' ? ', gsoHeadCodeAssigned=true' : ''}.`
       );
     },
     [
-      authenticatedUser?.uid,
+      currentUser.uid,
       firebaseUser,
       effectiveOnline,
+      applySavedUserImmediately,
       persistMutation,
       syncCredentialLoginDocs,
       appendAudit,
@@ -2324,6 +3671,7 @@ export function useFuelStore() {
   const deleteUserAccount = useCallback(
     async (user: UserAccount) => {
       await persistMutation('users', user.uid, 'delete');
+      setSelectedSandboxUserUid((prev) => (prev === user.uid ? null : prev));
       if (firebaseUser && effectiveOnline) {
         const emailId = normalizeEmailToId(user.email);
         if (emailId) {
@@ -2354,6 +3702,7 @@ export function useFuelStore() {
       const nextActive = !user.active;
       const now = new Date().toISOString();
       const updatedUser: UserAccount = { ...user, active: nextActive, updatedAt: now };
+      applySavedUserImmediately(updatedUser);
       await persistMutation('users', user.uid, 'update', {
         active: nextActive,
         updatedAt: now,
@@ -2381,7 +3730,14 @@ export function useFuelStore() {
         `Set user ${user.username || user.email} active status to ${nextActive}.`
       );
     },
-    [firebaseUser, effectiveOnline, persistMutation, syncCredentialLoginDocs, appendAudit]
+    [
+      firebaseUser,
+      effectiveOnline,
+      applySavedUserImmediately,
+      persistMutation,
+      syncCredentialLoginDocs,
+      appendAudit,
+    ]
   );
 
   // 7. Purge Sandbox Records & Re-seed Sandbox (Synchronized to Firestore environments/sandbox)
@@ -2416,17 +3772,20 @@ export function useFuelStore() {
     setSandboxState((prev) => ({
       users: prev.users.length > 0 ? prev.users : [...SEED_USERS],
       depots: [freshDepot],
+      storageTanks: [],
       vehicles: [],
+      pmcProjects: [],
       workPlans: [],
       tripTickets: [],
       inventoryLogs: [],
       auditLogs: [purgeLog],
+      reportUtilities: normalizeReportUtilitiesConfig(prev.reportUtilities),
     }));
 
     setSyncQueue((prev) => prev.filter((q) => (q.envMode ?? 'live') !== 'sandbox'));
 
     if (firebaseUser && effectiveOnline) {
-      const cols = ['tripTickets', 'workPlans', 'vehicles', 'inventoryLogs', 'depots', 'auditLogs'] as const;
+      const cols = ['tripTickets', 'workPlans', 'vehicles', 'pmcProjects', 'storageTanks', 'inventoryLogs', 'depots', 'auditLogs'] as const;
       for (const colName of cols) {
         try {
           const snap = await getDocs(collection(db, `environments/sandbox/${colName}`));
@@ -2459,7 +3818,11 @@ export function useFuelStore() {
       ...liveStateRef.current.users,
       ...SEED_USERS,
     ]);
-    setSandboxState({ ...restored, users: unifiedUsers });
+    setSandboxState({
+      ...restored,
+      users: unifiedUsers,
+      reportUtilities: normalizeReportUtilitiesConfig(sandboxStateRef.current.reportUtilities),
+    });
 
     if (firebaseUser && effectiveOnline) {
       const envPrefix = 'environments/sandbox';
@@ -2475,7 +3838,9 @@ export function useFuelStore() {
         }
       };
       await writeSeeds('depots', restored.depots);
+      await writeSeeds('storageTanks', restored.storageTanks);
       await writeSeeds('vehicles', restored.vehicles);
+      await writeSeeds('pmcProjects', restored.pmcProjects);
       await writeSeeds('workPlans', restored.workPlans);
       await writeSeeds('tripTickets', restored.tripTickets);
       await writeSeeds('inventoryLogs', restored.inventoryLogs);
@@ -2483,13 +3848,30 @@ export function useFuelStore() {
       setSyncNotice('Restored Sandbox baseline records and synchronized to Cloud.');
       setTimeout(() => setSyncNotice(null), 4000);
     }
-  }, [firebaseUser, effectiveOnline]);
+    await appendAudit(
+      'SANDBOX_DEMO_RESTORED',
+      'environment',
+      'sandbox',
+      'Restored Sandbox practice environment to official baseline demonstration records.',
+      {
+        category: 'system',
+        details: 'Environment: SANDBOX | Action: Baseline Demo Restore',
+        envOverride: 'sandbox',
+      }
+    );
+  }, [firebaseUser, effectiveOnline, appendAudit]);
 
   const seedLiveBaselineData = useCallback(async () => {
     if (!firebaseUser || envMode !== 'live') return;
     const batch = writeBatch(db);
     for (const depot of SEED_DEPOTS) {
       batch.set(doc(db, 'environments/live/depots', depot.id), depot);
+    }
+    for (const tank of SEED_STORAGE_TANKS) {
+      batch.set(doc(db, 'environments/live/storageTanks', tank.id), {
+        ...tank,
+        ownerId: firebaseUser.uid,
+      });
     }
     for (const veh of SEED_VEHICLES) {
       batch.set(doc(db, 'environments/live/vehicles', veh.id), {
@@ -2502,26 +3884,121 @@ export function useFuelStore() {
       'LIVE_BASELINE_SEEDED',
       'environment',
       'live',
-      'Initialized Bais City GSO Depots and Fleet Registry baseline in Live Firestore.'
+      'Initialized Bais City GSO Depots, UST Storage Tanks, and Fleet Registry baseline in Live Firestore.'
     );
   }, [firebaseUser, envMode, appendAudit]);
+
+  const saveReportUtilitiesConfig = useCallback(
+    async (
+      draftConfig: Partial<ReportUtilitiesConfig>
+    ): Promise<{ ok: boolean; error?: string; config?: ReportUtilitiesConfig }> => {
+      if (!canManageReportUtilities(currentUser.role)) {
+        return {
+          ok: false,
+          error: 'Only System Administrators are authorized to modify Report Utilities settings.',
+        };
+      }
+
+      const now = new Date().toISOString();
+      const normalized = normalizeReportUtilitiesConfig({
+        ...draftConfig,
+        id: 'report_utilities',
+        updatedBy: (currentUser.displayName || currentUser.email || 'System Administrator').slice(
+          0,
+          128
+        ),
+        updatedAt: now,
+      });
+
+      const targetEnv: EnvironmentMode = envMode;
+      const updateState = (prev: LocalSnapshotState): LocalSnapshotState => ({
+        ...prev,
+        reportUtilities: normalized,
+      });
+
+      if (targetEnv === 'sandbox') {
+        setSandboxState((prev) => {
+          const next = updateState(prev);
+          saveLocalState(SANDBOX_STORAGE_KEY, next);
+          return next;
+        });
+      } else {
+        setLiveState((prev) => {
+          const next = updateState(prev);
+          saveLocalState(LIVE_CACHE_STORAGE_KEY, next);
+          return next;
+        });
+      }
+
+      if (!effectiveOnline || !firebaseUser) {
+        setSyncQueue((prev) => [
+          ...prev.filter(
+            (q) =>
+              !(
+                (q.envMode ?? 'live') === targetEnv &&
+                q.collection === 'settings' &&
+                q.docId === 'report_utilities'
+              )
+          ),
+          {
+            id: makeId('sync'),
+            envMode: targetEnv,
+            collection: 'settings',
+            docId: 'report_utilities',
+            operation: 'set',
+            payload: normalized as unknown as Record<string, unknown>,
+            createdAt: now,
+          },
+        ]);
+      } else {
+        try {
+          await setDoc(doc(db, `environments/${targetEnv}/settings`, 'report_utilities'), normalized);
+        } catch (err) {
+          handleFirestoreError(
+            err,
+            OperationType.WRITE,
+            `environments/${targetEnv}/settings/report_utilities`
+          );
+        }
+      }
+
+      await appendAudit(
+        'REPORT_UTILITIES_UPDATED',
+        'settings',
+        'report_utilities',
+        'Updated system-wide Report Utilities preview and full report layout sequence.'
+      );
+
+      setSyncNotice('Report Utilities layout saved and applied retroactively across the system.');
+      setTimeout(() => setSyncNotice(null), 4000);
+
+      return { ok: true, config: normalized };
+    },
+    [currentUser, envMode, effectiveOnline, firebaseUser, appendAudit]
+  );
 
   const deduplicatedUsers = useMemo(
     () => deduplicateUsersByEmail(activeData.users),
     [activeData.users]
   );
 
+  const normalizedReportUtilities = useMemo(
+    () => normalizeReportUtilitiesConfig(activeData.reportUtilities),
+    [activeData.reportUtilities]
+  );
+
   const normalizedData = useMemo(
     () => ({
       ...activeData,
       users: deduplicatedUsers,
+      reportUtilities: normalizedReportUtilities,
     }),
-    [activeData, deduplicatedUsers]
+    [activeData, deduplicatedUsers, normalizedReportUtilities]
   );
 
   return {
     envMode,
-    setEnvMode,
+    setEnvMode: changeEnvMode,
     firebaseUser,
     authReady,
     authenticatedUser,
@@ -2540,14 +4017,17 @@ export function useFuelStore() {
     syncQueue,
     syncNotice,
     flushSyncQueue,
-    connectGoogleForSync,
-    reconcileNow: triggerManualReconcile,
     currentUser,
     sandboxActiveRole,
     setSandboxActiveRole,
-    sandboxActiveDepartment,
+    sandboxActiveDepartment: resolvedSandboxDepartment,
     setSandboxActiveDepartment,
+    sandboxPreviewDepartmentOptions,
+    sandboxPreviewMatchingUsers,
+    selectedSandboxUserUid,
+    setSelectedSandboxUserUid,
     data: normalizedData,
+    reportUtilities: normalizedReportUtilities,
     visibleWorkPlans,
     visibleTickets,
     visibleVehicles,
@@ -2558,8 +4038,14 @@ export function useFuelStore() {
     dispenseTripTicket,
     recordDepotTransaction,
     verifyPendingAdjustment,
+    saveDepotInfo,
+    saveStorageTank,
+    deleteStorageTank,
+    recordTankDipReading,
     saveVehicle,
     deleteVehicle,
+    savePmcProject,
+    deletePmcProject,
     deleteWorkPlan,
     updateWorkPlanAdmin,
     createUserAccount,
@@ -2569,5 +4055,6 @@ export function useFuelStore() {
     purgeSandboxRecords,
     restoreSandboxDemoData,
     seedLiveBaselineData,
+    saveReportUtilitiesConfig,
   };
 }

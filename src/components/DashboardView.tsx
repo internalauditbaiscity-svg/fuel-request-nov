@@ -2,18 +2,20 @@ import { useState } from 'react';
 import { AlertTriangle, CheckCircle2, Fuel, TrendingDown } from 'lucide-react';
 import {
   DailyReconciliationSummary,
+  FleetVehicle,
   FuelDepot,
   TripTicket,
   UserAccount,
   WorkPlan,
 } from '../types/fuel';
-import { canViewDailyReconciliation } from '../utils/fuelEngine';
+import { canViewDailyReconciliation, getDepartmentMnemonic } from '../utils/fuelEngine';
 import { RecordsPreviewGate } from './RecordsPreviewGate';
 import { NavSection } from './SidebarNav';
 
 interface DashboardViewProps {
   workPlans: WorkPlan[];
   tickets: TripTicket[];
+  vehicles?: FleetVehicle[];
   depots: FuelDepot[];
   reconciliation: DailyReconciliationSummary;
   currentUser: UserAccount;
@@ -23,6 +25,7 @@ interface DashboardViewProps {
 export function DashboardView({
   workPlans,
   tickets,
+  vehicles = [],
   depots,
   reconciliation,
   currentUser,
@@ -110,40 +113,35 @@ export function DashboardView({
 
       {/* Detailed Project Records, Depot Gauges & Alerts Gate */}
       <RecordsPreviewGate
-        title="Infrastructure Project & Reconciliation Details"
-        description="Created work plan monitoring records, tank utilization details, and discrepancy alerts remain hidden until Preview is pressed."
+        title="Projects, Tanks & Alerts"
+        description="Work plan utilization, depot tank gauges, and discrepancy alerts."
         recordCount={workPlans.length + reconciliation.alerts.length}
         previewOpen={previewOpen}
         onTogglePreview={setPreviewOpen}
-        buttonLabel="Preview Dashboard Records"
+        buttonLabel="Preview Details"
       >
-        <div className="space-y-6">
+        <div className="space-y-2.5">
           {/* Main 2-Column Monitoring Grid: Infrastructure Projects + Depot Levels */}
-          <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
+          <div className="grid grid-cols-1 gap-2.5 lg:grid-cols-3">
         {/* Infrastructure Projects Fuel Monitoring */}
         <section className="lg:col-span-2 rounded-lg border border-[#D5DCE6] bg-white">
-          <div className="flex items-center justify-between border-b border-[#D5DCE6] px-5 py-3.5">
-            <div>
-              <h2 className="font-display text-sm font-bold text-[#0B192C]">
-                Infrastructure Projects Fuel Monitoring
-              </h2>
-              <p className="text-xs text-[#5A6F8C]">
-                Weekly work plans tied to LGU Bais infrastructure and field operations
-              </p>
-            </div>
+          <div className="flex items-center justify-between border-b border-[#D5DCE6] px-3 py-2">
+            <h2 className="font-display text-xs font-bold text-[#0B192C]">
+              Projects Fuel Monitoring
+            </h2>
             <button
               type="button"
               onClick={() => onNavigate('work_plans')}
-              className="text-xs font-semibold text-[#1B3B6F] hover:underline whitespace-nowrap"
+              className="text-[11px] font-semibold text-[#1B3B6F] hover:underline whitespace-nowrap"
             >
-              View Work Plans
+              Work Plans
             </button>
           </div>
 
           <div className="divide-y divide-[#E6EBF2]">
             {workPlans.length === 0 ? (
-              <div className="p-8 text-center text-xs text-[#5A6F8C]">
-                No infrastructure work plans logged for this environment.
+              <div className="p-4 text-center text-xs text-[#5A6F8C]">
+                No infrastructure work plans logged.
               </div>
             ) : (
               workPlans.map((wp) => {
@@ -152,26 +150,27 @@ export function DashboardView({
                     ? Math.min(100, Math.round((wp.totalDispensedLiters / wp.totalApprovedLiters) * 100))
                     : 0;
                 return (
-                  <div key={wp.id} className="p-4 space-y-2">
-                    <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+                  <div key={wp.id} className="p-2.5 sm:p-3 space-y-1.5">
+                    <div className="flex flex-col gap-0.5 sm:flex-row sm:items-center sm:justify-between">
                       <div className="min-w-0">
-                        <div className="flex flex-wrap items-center gap-2 text-xs text-[#5A6F8C]">
+                        <div className="flex flex-wrap items-center gap-1.5 text-[11px] text-[#5A6F8C]">
                           <span className="font-mono font-semibold text-[#1B3B6F]">
-                            {wp.projectCode}
+                            {wp.projectCode || wp.controlNumber}
                           </span>
                           <span aria-hidden="true">·</span>
-                          <span>{wp.department}</span>
+                          <span className="font-mono font-bold text-[#0B192C]" title={wp.department}>
+                            {getDepartmentMnemonic(wp.department, vehicles)}
+                          </span>
                         </div>
-                        <div className="font-display text-sm font-semibold text-[#0B192C] truncate">
+                        <div className="font-display text-xs sm:text-sm font-semibold text-[#0B192C] truncate">
                           {wp.projectTitle}
                         </div>
                       </div>
-                      <div className="font-mono text-xs tabular-nums text-[#0B192C] shrink-0">
+                      <div className="font-mono text-[11px] tabular-nums text-[#0B192C] shrink-0">
                         {wp.totalDispensedLiters.toFixed(1)} / {wp.totalApprovedLiters.toFixed(1)} L
-                        approved
                       </div>
                     </div>
-                    <div className="h-2 w-full rounded bg-[#E6EBF2] overflow-hidden">
+                    <div className="h-1.5 w-full rounded bg-[#E6EBF2] overflow-hidden">
                       <div
                         className="h-full bg-[#1B3B6F] transition-all"
                         style={{ width: `${utilization}%` }}
@@ -186,16 +185,16 @@ export function DashboardView({
 
         {/* Real-Time Fuel Depot Tank Levels */}
         <section className="rounded-lg border border-[#D5DCE6] bg-white">
-          <div className="flex items-center justify-between border-b border-[#D5DCE6] px-5 py-3.5">
-            <h2 className="font-display text-sm font-bold text-[#0B192C]">
-              Fuel Depot Tank Inventory
+          <div className="flex items-center justify-between border-b border-[#D5DCE6] px-3 py-2">
+            <h2 className="font-display text-xs font-bold text-[#0B192C]">
+              Depot Tanks
             </h2>
             <button
               type="button"
               onClick={() => onNavigate('inventory')}
-              className="text-xs font-semibold text-[#1B3B6F] hover:underline whitespace-nowrap"
+              className="text-[11px] font-semibold text-[#1B3B6F] hover:underline whitespace-nowrap"
             >
-              Manage Tanks
+              Manage
             </button>
           </div>
           <div className="divide-y divide-[#E6EBF2]">
@@ -209,20 +208,20 @@ export function DashboardView({
               const threshold = depot.reorderThresholdPct ?? 25;
 
               return (
-                <div key={depot.id} className="p-4 space-y-3">
-                  <div>
-                    <div className="flex items-center gap-2 font-display text-sm font-bold text-[#0B192C]">
-                      <Fuel className="h-4 w-4 text-[#1B3B6F]" />
+                <div key={depot.id} className="p-2.5 sm:p-3 space-y-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-1.5 font-display text-xs font-bold text-[#0B192C]">
+                      <Fuel className="h-3.5 w-3.5 text-[#1B3B6F] shrink-0" />
                       <span>{depot.name}</span>
                     </div>
-                    <div className="text-xs text-[#5A6F8C]">{depot.location}</div>
+                    <span className="text-[10px] text-[#5A6F8C] truncate">{depot.location}</span>
                   </div>
 
                   {/* Gasoline Bar */}
                   <div className="space-y-1">
-                    <div className="flex justify-between text-xs">
+                    <div className="flex justify-between text-[11px]">
                       <span className="font-medium text-[#334E73]">
-                        Gasoline (₱{depot.gasolinePricePerLiter.toFixed(2)}/L)
+                        Gas (₱{depot.gasolinePricePerLiter.toFixed(2)}/L)
                       </span>
                       <span
                         className={`font-mono font-semibold tabular-nums ${
@@ -232,7 +231,7 @@ export function DashboardView({
                         {depot.gasolineCurrentLiters.toLocaleString()} L ({gasPct}%)
                       </span>
                     </div>
-                    <div className="h-2 w-full rounded bg-[#E6EBF2] overflow-hidden">
+                    <div className="h-1.5 w-full rounded bg-[#E6EBF2] overflow-hidden">
                       <div
                         className={`h-full ${
                           gasPct <= threshold ? 'bg-red-700' : 'bg-[#334E73]'
@@ -244,9 +243,9 @@ export function DashboardView({
 
                   {/* Diesel Bar */}
                   <div className="space-y-1">
-                    <div className="flex justify-between text-xs">
+                    <div className="flex justify-between text-[11px]">
                       <span className="font-medium text-[#334E73]">
-                        Diesel (₱{depot.dieselPricePerLiter.toFixed(2)}/L)
+                        Dsl (₱{depot.dieselPricePerLiter.toFixed(2)}/L)
                       </span>
                       <span
                         className={`font-mono font-semibold tabular-nums ${
@@ -256,7 +255,7 @@ export function DashboardView({
                         {depot.dieselCurrentLiters.toLocaleString()} L ({dslPct}%)
                       </span>
                     </div>
-                    <div className="h-2 w-full rounded bg-[#E6EBF2] overflow-hidden">
+                    <div className="h-1.5 w-full rounded bg-[#E6EBF2] overflow-hidden">
                       <div
                         className={`h-full ${
                           dslPct <= threshold ? 'bg-red-700' : 'bg-[#0B192C]'
@@ -274,40 +273,40 @@ export function DashboardView({
 
       {/* Automated Reconciliation Discrepancy Alerts */}
       <section className="rounded-lg border border-[#D5DCE6] bg-white">
-        <div className="flex items-center justify-between border-b border-[#D5DCE6] px-5 py-3.5">
-          <div className="flex items-center gap-2">
-            <AlertTriangle className="h-4 w-4 text-amber-700" />
-            <h2 className="font-display text-sm font-bold text-[#0B192C]">
-              Automated Reconciliation & Discrepancy Alerts ({reconciliation.alerts.length})
+        <div className="flex items-center justify-between border-b border-[#D5DCE6] px-3 py-2">
+          <div className="flex items-center gap-1.5">
+            <AlertTriangle className="h-3.5 w-3.5 text-amber-700" />
+            <h2 className="font-display text-xs font-bold text-[#0B192C]">
+              Discrepancy Alerts ({reconciliation.alerts.length})
             </h2>
           </div>
           {canOpenDailyReport && (
             <button
               type="button"
               onClick={() => onNavigate('reports')}
-              className="text-xs font-semibold text-[#1B3B6F] hover:underline whitespace-nowrap"
+              className="text-[11px] font-semibold text-[#1B3B6F] hover:underline whitespace-nowrap"
             >
-              Open Daily Report
+              Daily Report
             </button>
           )}
         </div>
 
         {reconciliation.alerts.length === 0 ? (
-          <div className="flex items-center gap-2 p-5 text-xs text-emerald-800">
+          <div className="flex items-center gap-2 p-3 text-xs text-emerald-800">
             <CheckCircle2 className="h-4 w-4 shrink-0" />
-            <span>All depot tanks, trip ticket limits, and dispensing records are reconciled with zero discrepancies.</span>
+            <span>All tanks and dispensing records reconciled with zero discrepancies.</span>
           </div>
         ) : (
           <div className="divide-y divide-[#E6EBF2]">
             {reconciliation.alerts.map((alert) => (
               <div
                 key={alert.id}
-                className="flex flex-col gap-1 px-5 py-3 sm:flex-row sm:items-center sm:justify-between"
+                className="flex flex-col gap-0.5 px-3 py-2 sm:flex-row sm:items-center sm:justify-between"
               >
                 <div className="space-y-0.5">
-                  <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-1.5">
                     <span
-                      className={`text-[11px] font-bold uppercase ${
+                      className={`text-[10px] font-bold uppercase ${
                         alert.severity === 'high' ? 'text-red-700' : 'text-amber-800'
                       }`}
                     >
@@ -315,11 +314,14 @@ export function DashboardView({
                     </span>
                     <span className="text-xs font-semibold text-[#0B192C]">{alert.title}</span>
                   </div>
-                  <p className="text-xs text-[#5A6F8C]">{alert.detail}</p>
+                  <p className="text-[11px] text-[#5A6F8C]">{alert.detail}</p>
                 </div>
                 {alert.department && (
-                  <span className="text-xs font-medium text-[#334E73] shrink-0">
-                    {alert.department}
+                  <span
+                    className="font-mono text-[11px] font-bold text-[#1B3B6F] shrink-0"
+                    title={alert.department}
+                  >
+                    {getDepartmentMnemonic(alert.department, vehicles)}
                   </span>
                 )}
               </div>

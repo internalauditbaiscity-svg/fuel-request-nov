@@ -81,12 +81,24 @@ service cloud.firestore {
       return isAdmin() || (hasActiveProfile() && userRole() in ['admin', 'gso_head', 'gso_dispenser']);
     }
 
+    function isGsoHead() {
+      return isAdmin() || (hasActiveProfile() && userRole() in ['admin', 'gso_head']);
+    }
+
+    function isPmcPersonnel() {
+      return isAdmin() || (hasActiveProfile() && userRole() == 'pmc_staff');
+    }
+
     function hasEditPerm() {
       return isAdmin() || (hasActiveProfile() && getUserDoc().data.canEdit == true);
     }
 
     function hasDeletePerm() {
       return isAdmin() || (hasActiveProfile() && getUserDoc().data.canDelete == true);
+    }
+
+    function hasSingleTripPerm() {
+      return isAdmin() || (hasActiveProfile() && getUserDoc().data.canRequestSingleTrip == true);
     }
 
     function isValidEnv(envId) {
@@ -104,18 +116,20 @@ service cloud.firestore {
 
     function isValidUserAccount(data) {
       return data.keys().hasAll(['uid', 'email', 'displayName', 'role', 'department', 'active', 'createdBy', 'createdAt', 'updatedAt']) &&
-        data.keys().hasOnly(['uid', 'username', 'passwordHash', 'email', 'displayName', 'role', 'department', 'positionTitle', 'canEdit', 'canDelete', 'canSwitchToLive', 'active', 'createdBy', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['uid', 'username', 'passwordHash', 'email', 'displayName', 'role', 'department', 'positionTitle', 'canEdit', 'canDelete', 'canSwitchToLive', 'canRequestSingleTrip', 'gsoVerificationCode', 'active', 'createdBy', 'createdAt', 'updatedAt']) &&
         isValidId(data.uid) &&
         (!('username' in data) || (data.username is string && data.username.size() >= 2 && data.username.size() <= 64)) &&
         (!('passwordHash' in data) || (data.passwordHash is string && data.passwordHash.size() <= 128)) &&
         data.email is string && data.email.size() >= 3 && data.email.size() <= 254 &&
         data.displayName is string && data.displayName.size() >= 2 && data.displayName.size() <= 120 &&
-        data.role in ['admin', 'approver', 'gso_head', 'gso_dispenser', 'department_head', 'requester', 'auditor'] &&
+        data.role in ['admin', 'approver', 'gso_head', 'gso_dispenser', 'department_head', 'requester', 'pmc_staff', 'auditor'] &&
         data.department is string && data.department.size() >= 2 && data.department.size() <= 120 &&
         (!('positionTitle' in data) || (data.positionTitle is string && data.positionTitle.size() <= 120)) &&
         (!('canEdit' in data) || data.canEdit is bool) &&
         (!('canDelete' in data) || data.canDelete is bool) &&
         (!('canSwitchToLive' in data) || data.canSwitchToLive is bool) &&
+        (!('canRequestSingleTrip' in data) || data.canRequestSingleTrip is bool) &&
+        (!('gsoVerificationCode' in data) || (data.role == 'gso_head' && data.gsoVerificationCode is string && data.gsoVerificationCode.size() >= 4 && data.gsoVerificationCode.size() <= 32 && data.gsoVerificationCode.matches('^[A-Z0-9\\-]{4,32}$'))) &&
         data.active is bool &&
         data.createdBy is string && data.createdBy.size() >= 1 && data.createdBy.size() <= 128 &&
         data.createdAt is string && data.createdAt.size() >= 10 && data.createdAt.size() <= 64 &&
@@ -124,9 +138,10 @@ service cloud.firestore {
 
     function isValidFleetVehicle(data) {
       return data.keys().hasAll(['id', 'office', 'plateNumber', 'chassisNumber', 'makeModel', 'yearAcquired', 'equipmentClass', 'fuelType', 'efficiencyRate', 'efficiencyUnit', 'maxWeeklyLiters', 'status', 'ownerId', 'createdAt', 'updatedAt']) &&
-        data.keys().hasOnly(['id', 'office', 'plateNumber', 'chassisNumber', 'makeModel', 'yearAcquired', 'equipmentClass', 'fuelType', 'efficiencyRate', 'efficiencyUnit', 'maxWeeklyLiters', 'assignedDriver', 'driverLicense', 'status', 'nextMaintenanceDate', 'odometerKm', 'ownerId', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['id', 'office', 'officeMnemonic', 'plateNumber', 'chassisNumber', 'makeModel', 'yearAcquired', 'equipmentClass', 'fuelType', 'efficiencyRate', 'efficiencyUnit', 'maxWeeklyLiters', 'assignedDriver', 'driverLicense', 'status', 'nextMaintenanceDate', 'odometerKm', 'ownerId', 'createdAt', 'updatedAt']) &&
         isValidId(data.id) &&
         data.office is string && data.office.size() >= 2 && data.office.size() <= 120 &&
+        (!('officeMnemonic' in data) || (data.officeMnemonic is string && data.officeMnemonic.matches('^[A-Z]{3,5}$'))) &&
         data.plateNumber is string && data.plateNumber.size() >= 2 && data.plateNumber.size() <= 40 &&
         data.chassisNumber is string && data.chassisNumber.size() >= 3 && data.chassisNumber.size() <= 64 &&
         data.makeModel is string && data.makeModel.size() >= 2 && data.makeModel.size() <= 120 &&
@@ -148,10 +163,15 @@ service cloud.firestore {
 
     function isValidFuelDepot(data) {
       return data.keys().hasAll(['id', 'name', 'location', 'gasolineCapacityLiters', 'gasolineCurrentLiters', 'gasolinePricePerLiter', 'dieselCapacityLiters', 'dieselCurrentLiters', 'dieselPricePerLiter', 'updatedAt']) &&
-        data.keys().hasOnly(['id', 'name', 'location', 'gasolineCapacityLiters', 'gasolineCurrentLiters', 'gasolinePricePerLiter', 'dieselCapacityLiters', 'dieselCurrentLiters', 'dieselPricePerLiter', 'reorderThresholdPct', 'lastDipVerifiedAt', 'lastDipVerifiedBy', 'updatedAt']) &&
+        data.keys().hasOnly(['id', 'siteCode', 'name', 'location', 'coordinates', 'permitNumber', 'calibrationExpiryDate', 'stationManager', 'gasolineCapacityLiters', 'gasolineCurrentLiters', 'gasolinePricePerLiter', 'dieselCapacityLiters', 'dieselCurrentLiters', 'dieselPricePerLiter', 'reorderThresholdPct', 'lastDipVerifiedAt', 'lastDipVerifiedBy', 'updatedAt']) &&
         isValidId(data.id) &&
+        (!('siteCode' in data) || (data.siteCode is string && data.siteCode.size() <= 32)) &&
         data.name is string && data.name.size() >= 2 && data.name.size() <= 120 &&
         data.location is string && data.location.size() >= 2 && data.location.size() <= 160 &&
+        (!('coordinates' in data) || (data.coordinates is string && data.coordinates.size() <= 80)) &&
+        (!('permitNumber' in data) || (data.permitNumber is string && data.permitNumber.size() <= 64)) &&
+        (!('calibrationExpiryDate' in data) || (data.calibrationExpiryDate is string && data.calibrationExpiryDate.size() <= 20)) &&
+        (!('stationManager' in data) || (data.stationManager is string && data.stationManager.size() <= 120)) &&
         data.gasolineCapacityLiters is number && data.gasolineCapacityLiters > 0 &&
         data.gasolineCurrentLiters is number && data.gasolineCurrentLiters >= 0 && data.gasolineCurrentLiters <= data.gasolineCapacityLiters &&
         data.gasolinePricePerLiter is number && data.gasolinePricePerLiter >= 0 &&
@@ -166,23 +186,25 @@ service cloud.firestore {
 
     function isValidWorkPlan(data) {
       return data.keys().hasAll(['id', 'controlNumber', 'department', 'projectTitle', 'projectCode', 'weekStart', 'weekEnd', 'status', 'totalRequestedLiters', 'totalApprovedLiters', 'totalDispensedLiters', 'preparedBy', 'reviewedBy', 'approvedBy', 'ownerId', 'createdAt', 'updatedAt']) &&
-        data.keys().hasOnly(['id', 'controlNumber', 'department', 'projectTitle', 'projectCode', 'weekStart', 'weekEnd', 'status', 'totalRequestedLiters', 'totalApprovedLiters', 'totalDispensedLiters', 'preparedBy', 'preparedByDesignation', 'reviewedBy', 'reviewedByDesignation', 'approvedBy', 'approvedByDesignation', 'divisionHead', 'unitLead', 'sectionManager', 'approverNote', 'ownerId', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['id', 'controlNumber', 'requestType', 'preparationDate', 'department', 'projectTitle', 'projectCode', 'weekStart', 'weekEnd', 'status', 'totalRequestedLiters', 'totalApprovedLiters', 'totalDispensedLiters', 'preparedBy', 'preparedByDesignation', 'reviewedBy', 'reviewedByDesignation', 'approvedBy', 'approvedByDesignation', 'divisionHead', 'unitLead', 'sectionManager', 'approverNote', 'ownerId', 'createdAt', 'updatedAt']) &&
         isValidId(data.id) &&
-        data.controlNumber is string && data.controlNumber.size() >= 4 && data.controlNumber.size() <= 48 &&
+        data.controlNumber is string && (('requestType' in data && data.requestType == 'single_trip') || data.controlNumber.size() >= 4) && data.controlNumber.size() <= 48 &&
+        (!('requestType' in data) || (data.requestType in ['weekly_work_plan', 'single_trip'])) &&
+        (!('preparationDate' in data) || (data.preparationDate is string && data.preparationDate.size() <= 20)) &&
         data.department is string && data.department.size() >= 2 && data.department.size() <= 120 &&
         data.projectTitle is string && data.projectTitle.size() >= 3 && data.projectTitle.size() <= 200 &&
-        data.projectCode is string && data.projectCode.size() >= 2 && data.projectCode.size() <= 48 &&
+        data.projectCode is string && data.projectCode.size() <= 48 &&
         data.weekStart is string && data.weekStart.size() >= 8 && data.weekStart.size() <= 20 &&
         data.weekEnd is string && data.weekEnd.size() >= 8 && data.weekEnd.size() <= 20 &&
         data.status in ['pending_approval', 'approved', 'partially_approved', 'rejected', 'completed'] &&
         data.totalRequestedLiters is number && data.totalRequestedLiters >= 0 &&
         data.totalApprovedLiters is number && data.totalApprovedLiters >= 0 && data.totalApprovedLiters <= data.totalRequestedLiters &&
         data.totalDispensedLiters is number && data.totalDispensedLiters >= 0 &&
-        data.preparedBy is string && data.preparedBy.size() >= 2 && data.preparedBy.size() <= 120 &&
+        data.preparedBy is string && (('requestType' in data && data.requestType == 'single_trip') || data.preparedBy.size() >= 2) && data.preparedBy.size() <= 120 &&
         (!('preparedByDesignation' in data) || (data.preparedByDesignation is string && data.preparedByDesignation.size() <= 120)) &&
-        data.reviewedBy is string && data.reviewedBy.size() >= 2 && data.reviewedBy.size() <= 120 &&
+        data.reviewedBy is string && (('requestType' in data && data.requestType == 'single_trip') || data.reviewedBy.size() >= 2) && data.reviewedBy.size() <= 120 &&
         (!('reviewedByDesignation' in data) || (data.reviewedByDesignation is string && data.reviewedByDesignation.size() <= 120)) &&
-        data.approvedBy is string && data.approvedBy.size() >= 2 && data.approvedBy.size() <= 120 &&
+        data.approvedBy is string && (('requestType' in data && data.requestType == 'single_trip') || data.approvedBy.size() >= 2) && data.approvedBy.size() <= 120 &&
         (!('approvedByDesignation' in data) || (data.approvedByDesignation is string && data.approvedByDesignation.size() <= 120)) &&
         (!('divisionHead' in data) || (data.divisionHead is string && data.divisionHead.size() <= 120)) &&
         (!('unitLead' in data) || (data.unitLead is string && data.unitLead.size() <= 120)) &&
@@ -195,13 +217,16 @@ service cloud.firestore {
 
     function isValidTripTicket(data) {
       return data.keys().hasAll(['id', 'workPlanId', 'ticketNumber', 'department', 'projectTitle', 'vehicleId', 'plateNumber', 'driverName', 'fuelType', 'depotId', 'scheduledDate', 'destination', 'computedLimitLiters', 'requestedLiters', 'approvedLiters', 'dispensedLiters', 'forfeitedLiters', 'servedOnce', 'status', 'ownerId', 'createdAt', 'updatedAt']) &&
-        data.keys().hasOnly(['id', 'workPlanId', 'ticketNumber', 'department', 'projectTitle', 'purposeOrProject', 'vehicleId', 'plateNumber', 'vehicleLabel', 'driverName', 'driverLicense', 'fuelType', 'depotId', 'scheduledDate', 'destination', 'estimatedUsage', 'computedLimitLiters', 'requestedLiters', 'approvedLiters', 'dispensedLiters', 'forfeitedLiters', 'unitPriceAtDispense', 'servedOnce', 'dispensedAt', 'dispensedBy', 'pumpReadingPhotoDataUrl', 'pumpReadingPhotoName', 'status', 'reductionReason', 'ownerId', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['id', 'workPlanId', 'ticketNumber', 'gsoTransactionCode', 'department', 'projectTitle', 'purposeOrProject', 'projectAip', 'pmcProjectId', 'vehicleId', 'plateNumber', 'vehicleLabel', 'driverName', 'driverLicense', 'fuelType', 'depotId', 'scheduledDate', 'destination', 'estimatedUsage', 'computedLimitLiters', 'requestedLiters', 'approvedLiters', 'dispensedLiters', 'forfeitedLiters', 'unitPriceAtDispense', 'servedOnce', 'dispensedAt', 'dispensedBy', 'pumpReadingPhotoDataUrl', 'pumpReadingPhotoName', 'status', 'reductionReason', 'ownerId', 'createdAt', 'updatedAt']) &&
         isValidId(data.id) &&
         isValidId(data.workPlanId) &&
         data.ticketNumber is string && data.ticketNumber.size() >= 7 && data.ticketNumber.size() <= 48 &&
+        (!('gsoTransactionCode' in data) || (data.gsoTransactionCode is string && data.gsoTransactionCode.matches('^[A-Z0-9]{7}$'))) &&
         data.department is string && data.department.size() >= 2 && data.department.size() <= 120 &&
         data.projectTitle is string && data.projectTitle.size() >= 3 && data.projectTitle.size() <= 200 &&
         (!('purposeOrProject' in data) || (data.purposeOrProject is string && data.purposeOrProject.size() <= 200)) &&
+        (!('projectAip' in data) || (data.projectAip is string && data.projectAip.size() <= 160)) &&
+        (!('pmcProjectId' in data) || isValidId(data.pmcProjectId)) &&
         isValidId(data.vehicleId) &&
         data.plateNumber is string && data.plateNumber.size() >= 2 && data.plateNumber.size() <= 40 &&
         (!('vehicleLabel' in data) || (data.vehicleLabel is string && data.vehicleLabel.size() <= 120)) &&
@@ -232,17 +257,29 @@ service cloud.firestore {
 
     function isValidInventoryLog(data) {
       return data.keys().hasAll(['id', 'depotId', 'depotName', 'fuelType', 'transactionType', 'litersDelta', 'balanceBefore', 'balanceAfter', 'referenceNumber', 'approvalStatus', 'ownerId', 'createdAt']) &&
-        data.keys().hasOnly(['id', 'depotId', 'depotName', 'fuelType', 'transactionType', 'litersDelta', 'balanceBefore', 'balanceAfter', 'physicalDipLiters', 'referenceNumber', 'notes', 'approvalStatus', 'gsoApproverName', 'digitalVerificationCode', 'verifiedAt', 'ownerId', 'createdAt']) &&
+        data.keys().hasOnly(['id', 'depotId', 'depotName', 'tankId', 'pumpId', 'fuelType', 'transactionType', 'litersDelta', 'balanceBefore', 'balanceAfter', 'deliveryUnitCostPhp', 'deliveryTotalAmountPhp', 'weightedAverageCostBefore', 'weightedAverageCostAfter', 'prevailingWeightedAverageCostPhp', 'physicalDipLiters', 'gsoTransactionCode', 'tripTicketNumber', 'referenceNumber', 'purchaseOrderRef', 'supplierName', 'deliveryDate', 'notes', 'approvalStatus', 'gsoApproverName', 'digitalVerificationCode', 'verifiedAt', 'ownerId', 'createdAt']) &&
         isValidId(data.id) &&
         isValidId(data.depotId) &&
         data.depotName is string && data.depotName.size() >= 2 && data.depotName.size() <= 120 &&
+        (!('tankId' in data) || isValidId(data.tankId)) &&
+        (!('pumpId' in data) || (data.pumpId is string && data.pumpId.size() <= 64)) &&
         data.fuelType in ['gasoline', 'diesel'] &&
         data.transactionType in ['delivery', 'dispense', 'shrinkage_adjustment', 'overage_adjustment'] &&
         data.litersDelta is number &&
         data.balanceBefore is number && data.balanceBefore >= 0 &&
         data.balanceAfter is number && data.balanceAfter >= 0 &&
+        (!('deliveryUnitCostPhp' in data) || (data.deliveryUnitCostPhp is number && data.deliveryUnitCostPhp >= 0)) &&
+        (!('deliveryTotalAmountPhp' in data) || (data.deliveryTotalAmountPhp is number && data.deliveryTotalAmountPhp >= 0 && data.deliveryTotalAmountPhp <= 1000000000)) &&
+        (!('weightedAverageCostBefore' in data) || (data.weightedAverageCostBefore is number && data.weightedAverageCostBefore >= 0)) &&
+        (!('weightedAverageCostAfter' in data) || (data.weightedAverageCostAfter is number && data.weightedAverageCostAfter >= 0)) &&
+        (!('prevailingWeightedAverageCostPhp' in data) || (data.prevailingWeightedAverageCostPhp is number && data.prevailingWeightedAverageCostPhp >= 0)) &&
         (!('physicalDipLiters' in data) || (data.physicalDipLiters is number && data.physicalDipLiters >= 0)) &&
+        (!('gsoTransactionCode' in data) || (data.gsoTransactionCode is string && data.gsoTransactionCode.matches('^[A-Z0-9]{7}$'))) &&
+        (!('tripTicketNumber' in data) || (data.tripTicketNumber is string && data.tripTicketNumber.size() <= 48)) &&
         data.referenceNumber is string && data.referenceNumber.size() >= 2 && data.referenceNumber.size() <= 64 &&
+        (!('purchaseOrderRef' in data) || (data.purchaseOrderRef is string && data.purchaseOrderRef.size() <= 64)) &&
+        (!('supplierName' in data) || (data.supplierName is string && data.supplierName.size() <= 120)) &&
+        (!('deliveryDate' in data) || (data.deliveryDate is string && data.deliveryDate.size() <= 20)) &&
         (!('notes' in data) || (data.notes is string && data.notes.size() <= 400)) &&
         data.approvalStatus in ['pending_gso_approval', 'verified', 'rejected'] &&
         (!('gsoApproverName' in data) || (data.gsoApproverName is string && data.gsoApproverName.size() <= 120)) &&
@@ -254,33 +291,39 @@ service cloud.firestore {
 
     function isValidAuditLog(data) {
       return data.keys().hasAll(['id', 'actorUid', 'actorEmail', 'actorRole', 'action', 'entityType', 'entityId', 'summary', 'createdAt']) &&
-        data.keys().hasOnly(['id', 'actorUid', 'actorEmail', 'actorRole', 'department', 'action', 'entityType', 'entityId', 'summary', 'createdAt']) &&
+        data.keys().hasOnly(['id', 'actorUid', 'actorEmail', 'actorName', 'actorRole', 'department', 'category', 'environment', 'action', 'entityType', 'entityId', 'summary', 'details', 'createdAt']) &&
         isValidId(data.id) &&
         data.actorUid is string && data.actorUid.size() >= 1 && data.actorUid.size() <= 128 &&
         data.actorEmail is string && data.actorEmail.size() <= 254 &&
+        (!('actorName' in data) || (data.actorName is string && data.actorName.size() <= 120)) &&
         data.actorRole is string && data.actorRole.size() <= 48 &&
         (!('department' in data) || (data.department is string && data.department.size() <= 120)) &&
+        (!('category' in data) || data.category in ['credential', 'transaction', 'registry', 'system']) &&
+        (!('environment' in data) || data.environment in ['sandbox', 'live']) &&
         data.action is string && data.action.size() >= 2 && data.action.size() <= 80 &&
         data.entityType is string && data.entityType.size() >= 2 && data.entityType.size() <= 64 &&
         data.entityId is string && data.entityId.size() >= 1 && data.entityId.size() <= 128 &&
         data.summary is string && data.summary.size() >= 2 && data.summary.size() <= 400 &&
+        (!('details' in data) || (data.details is string && data.details.size() <= 1200)) &&
         data.createdAt is string && data.createdAt.size() >= 10 && data.createdAt.size() <= 64;
     }
 
     function isValidUserInvite(data) {
       return data.keys().hasAll(['id', 'email', 'displayName', 'role', 'department', 'active', 'createdBy', 'createdAt']) &&
-        data.keys().hasOnly(['id', 'email', 'username', 'passwordHash', 'displayName', 'role', 'department', 'positionTitle', 'canEdit', 'canDelete', 'canSwitchToLive', 'active', 'createdBy', 'createdAt']) &&
+        data.keys().hasOnly(['id', 'email', 'username', 'passwordHash', 'displayName', 'role', 'department', 'positionTitle', 'canEdit', 'canDelete', 'canSwitchToLive', 'canRequestSingleTrip', 'gsoVerificationCode', 'active', 'createdBy', 'createdAt']) &&
         isValidId(data.id) &&
         data.email is string && data.email.size() >= 3 && data.email.size() <= 254 &&
         (!('username' in data) || (data.username is string && data.username.size() >= 2 && data.username.size() <= 64)) &&
         (!('passwordHash' in data) || (data.passwordHash is string && data.passwordHash.size() <= 128)) &&
         data.displayName is string && data.displayName.size() >= 2 && data.displayName.size() <= 120 &&
-        data.role in ['admin', 'approver', 'gso_head', 'gso_dispenser', 'department_head', 'requester', 'auditor'] &&
+        data.role in ['admin', 'approver', 'gso_head', 'gso_dispenser', 'department_head', 'requester', 'pmc_staff', 'auditor'] &&
         data.department is string && data.department.size() >= 2 && data.department.size() <= 120 &&
         (!('positionTitle' in data) || (data.positionTitle is string && data.positionTitle.size() <= 120)) &&
         (!('canEdit' in data) || data.canEdit is bool) &&
         (!('canDelete' in data) || data.canDelete is bool) &&
         (!('canSwitchToLive' in data) || data.canSwitchToLive is bool) &&
+        (!('canRequestSingleTrip' in data) || data.canRequestSingleTrip is bool) &&
+        (!('gsoVerificationCode' in data) || (data.role == 'gso_head' && data.gsoVerificationCode is string && data.gsoVerificationCode.size() >= 4 && data.gsoVerificationCode.size() <= 32 && data.gsoVerificationCode.matches('^[A-Z0-9\\-]{4,32}$'))) &&
         data.active is bool &&
         data.createdBy is string && data.createdBy.size() >= 1 && data.createdBy.size() <= 128 &&
         data.createdAt is string && data.createdAt.size() >= 10 && data.createdAt.size() <= 64;
@@ -288,20 +331,147 @@ service cloud.firestore {
 
     function isValidCredentialLogin(data) {
       return data.keys().hasAll(['id', 'uid', 'email', 'displayName', 'role', 'department', 'active', 'createdBy', 'createdAt', 'updatedAt']) &&
-        data.keys().hasOnly(['id', 'uid', 'username', 'email', 'displayName', 'role', 'department', 'positionTitle', 'canEdit', 'canDelete', 'canSwitchToLive', 'active', 'createdBy', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['id', 'uid', 'username', 'email', 'displayName', 'role', 'department', 'positionTitle', 'canEdit', 'canDelete', 'canSwitchToLive', 'canRequestSingleTrip', 'active', 'createdBy', 'createdAt', 'updatedAt']) &&
         isValidProofId(data.id) &&
         isValidId(data.uid) &&
         (!('username' in data) || (data.username is string && data.username.size() >= 2 && data.username.size() <= 64)) &&
         data.email is string && data.email.size() >= 3 && data.email.size() <= 254 &&
         data.displayName is string && data.displayName.size() >= 2 && data.displayName.size() <= 120 &&
-        data.role in ['admin', 'approver', 'gso_head', 'gso_dispenser', 'department_head', 'requester', 'auditor'] &&
+        data.role in ['admin', 'approver', 'gso_head', 'gso_dispenser', 'department_head', 'requester', 'pmc_staff', 'auditor'] &&
         data.department is string && data.department.size() >= 2 && data.department.size() <= 120 &&
         (!('positionTitle' in data) || (data.positionTitle is string && data.positionTitle.size() <= 120)) &&
         (!('canEdit' in data) || data.canEdit is bool) &&
         (!('canDelete' in data) || data.canDelete is bool) &&
         (!('canSwitchToLive' in data) || data.canSwitchToLive is bool) &&
+        (!('canRequestSingleTrip' in data) || data.canRequestSingleTrip is bool) &&
         data.active is bool &&
         data.createdBy is string && data.createdBy.size() >= 1 && data.createdBy.size() <= 128 &&
+        data.createdAt is string && data.createdAt.size() >= 10 && data.createdAt.size() <= 64 &&
+        data.updatedAt is string && data.updatedAt.size() >= 10 && data.updatedAt.size() <= 64;
+    }
+
+    function isValidReportFieldList(arr) {
+      return arr is list && arr.size() >= 1 && arr.size() <= 24 &&
+        arr[0] is map &&
+        arr[0].keys().hasAll(['key', 'enabled']) &&
+        arr[0].keys().hasOnly(['key', 'enabled']) &&
+        arr[0].key is string && arr[0].key.size() >= 1 && arr[0].key.size() <= 64 &&
+        arr[0].enabled is bool;
+    }
+
+    function isValidReportUtilitiesSetting(data) {
+      return data.keys().hasAll([
+          'id',
+          'workplans_preview',
+          'workplans_full_review',
+          'workplans_review_tickets',
+          'approvals_preview',
+          'dispensing_approved_preview',
+          'dispensing_dispensed_preview',
+          'reports_full_preview',
+          'reports_dept_table',
+          'updatedBy',
+          'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'id',
+          'workplans_preview',
+          'workplans_full_review',
+          'workplans_review_tickets',
+          'workplans_monitoring_review',
+          'workplans_monitoring_tickets',
+          'approvals_preview',
+          'dispensing_approved_preview',
+          'dispensing_dispensed_preview',
+          'reports_full_preview',
+          'reports_dept_table',
+          'updatedBy',
+          'updatedAt'
+        ]) &&
+        data.id == 'report_utilities' &&
+        isValidReportFieldList(data.workplans_preview) &&
+        isValidReportFieldList(data.workplans_full_review) &&
+        isValidReportFieldList(data.workplans_review_tickets) &&
+        (!('workplans_monitoring_review' in data) || isValidReportFieldList(data.workplans_monitoring_review)) &&
+        (!('workplans_monitoring_tickets' in data) || isValidReportFieldList(data.workplans_monitoring_tickets)) &&
+        isValidReportFieldList(data.approvals_preview) &&
+        isValidReportFieldList(data.dispensing_approved_preview) &&
+        isValidReportFieldList(data.dispensing_dispensed_preview) &&
+        isValidReportFieldList(data.reports_full_preview) &&
+        isValidReportFieldList(data.reports_dept_table) &&
+        data.updatedBy is string && data.updatedBy.size() >= 1 && data.updatedBy.size() <= 128 &&
+        data.updatedAt is string && data.updatedAt.size() >= 10 && data.updatedAt.size() <= 64;
+    }
+
+    function isValidPmcProject(data) {
+      return data.keys().hasAll(['id', 'department', 'approvalYear', 'projectName', 'aipCode', 'dieselFuelComponentPhp', 'gasolineFuelComponentPhp', 'fuelComponentAmountPhp', 'ownerId', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['id', 'department', 'approvalYear', 'projectName', 'aipCode', 'dieselFuelComponentPhp', 'gasolineFuelComponentPhp', 'fuelComponentAmountPhp', 'ownerId', 'createdAt', 'updatedAt']) &&
+        isValidId(data.id) &&
+        data.department is string && data.department.size() >= 2 && data.department.size() <= 120 &&
+        data.approvalYear is int && data.approvalYear >= 2000 && data.approvalYear <= 2100 &&
+        data.projectName is string && data.projectName.size() >= 3 && data.projectName.size() <= 200 &&
+        data.aipCode is string && data.aipCode.size() >= 2 && data.aipCode.size() <= 64 &&
+        data.dieselFuelComponentPhp is number && data.dieselFuelComponentPhp >= 0 && data.dieselFuelComponentPhp <= 1000000000 &&
+        data.gasolineFuelComponentPhp is number && data.gasolineFuelComponentPhp >= 0 && data.gasolineFuelComponentPhp <= 1000000000 &&
+        data.fuelComponentAmountPhp is number && data.fuelComponentAmountPhp >= 0 && data.fuelComponentAmountPhp <= 1000000000 &&
+        data.ownerId is string && data.ownerId.size() >= 1 && data.ownerId.size() <= 128 &&
+        data.createdAt is string && data.createdAt.size() >= 10 && data.createdAt.size() <= 64 &&
+        data.updatedAt is string && data.updatedAt.size() >= 10 && data.updatedAt.size() <= 64;
+    }
+
+    function isValidStorageTank(data) {
+      return data.keys().hasAll([
+          'id', 'depotId', 'tankCode', 'name', 'locationZone', 'installationType', 'material',
+          'fuelProduct', 'mappedFuelType', 'connectedDispensers', 'geometry',
+          'diameterCm', 'lengthCm', 'riserOffsetCm', 'tiltAngleDegrees',
+          'overfillBufferPct', 'deadstockClearanceCm', 'lowStockAlertLiters',
+          'grossCapacityLiters', 'safeFillCapacityLiters', 'deadstockVolumeLiters', 'netWorkingVolumeLiters',
+          'openingDipLiters', 'currentBookVolumeLiters', 'ownerId', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'id', 'depotId', 'tankCode', 'name', 'locationZone', 'manholeTag', 'installationType', 'material',
+          'fuelProduct', 'mappedFuelType', 'connectedDispensers', 'geometry',
+          'diameterCm', 'lengthCm', 'widthCm', 'heightCm', 'riserOffsetCm', 'tiltAngleDegrees',
+          'overfillBufferPct', 'deadstockClearanceCm', 'lowStockAlertLiters',
+          'grossCapacityLiters', 'safeFillCapacityLiters', 'deadstockVolumeLiters', 'netWorkingVolumeLiters',
+          'calibrationCertificateNo', 'calibrationExpiryDate', 'customStrappingPoints',
+          'openingDipLiters', 'currentBookVolumeLiters', 'currentWacPhp', 'lastDipVolumeLiters', 'lastDipAt',
+          'ownerId', 'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(data.id) &&
+        isValidId(data.depotId) &&
+        data.tankCode is string && data.tankCode.size() >= 2 && data.tankCode.size() <= 40 &&
+        data.name is string && data.name.size() >= 2 && data.name.size() <= 120 &&
+        data.locationZone is string && data.locationZone.size() >= 2 && data.locationZone.size() <= 120 &&
+        (!('manholeTag' in data) || (data.manholeTag is string && data.manholeTag.size() <= 80)) &&
+        data.installationType in ['underground_ust', 'aboveground_ast'] &&
+        data.material in ['double_wall_fiberglass', 'double_wall_steel', 'single_wall_steel'] &&
+        data.fuelProduct in ['diesel', 'regular_91', 'mid_grade', 'premium_95', 'kerosene', 'bio_diesel'] &&
+        data.mappedFuelType in ['gasoline', 'diesel'] &&
+        data.connectedDispensers is list && data.connectedDispensers.size() <= 32 &&
+        data.geometry in ['horizontal_cylinder_flat', 'horizontal_cylinder_dished', 'vertical_cylinder', 'rectangular_box'] &&
+        data.diameterCm is number && data.diameterCm >= 10 && data.diameterCm <= 2000 &&
+        data.lengthCm is number && data.lengthCm >= 10 && data.lengthCm <= 5000 &&
+        (!('widthCm' in data) || (data.widthCm is number && data.widthCm >= 10 && data.widthCm <= 2000)) &&
+        (!('heightCm' in data) || (data.heightCm is number && data.heightCm >= 10 && data.heightCm <= 2000)) &&
+        data.riserOffsetCm is number && data.riserOffsetCm >= 0 && data.riserOffsetCm <= 500 &&
+        data.tiltAngleDegrees is number && data.tiltAngleDegrees >= -15 && data.tiltAngleDegrees <= 15 &&
+        data.overfillBufferPct is number && data.overfillBufferPct >= 0 && data.overfillBufferPct <= 30 &&
+        data.deadstockClearanceCm is number && data.deadstockClearanceCm >= 0 && data.deadstockClearanceCm <= 100 &&
+        data.lowStockAlertLiters is number && data.lowStockAlertLiters >= 0 && data.lowStockAlertLiters <= 500000 &&
+        data.grossCapacityLiters is number && data.grossCapacityLiters > 0 && data.grossCapacityLiters <= 1000000 &&
+        data.safeFillCapacityLiters is number && data.safeFillCapacityLiters > 0 && data.safeFillCapacityLiters <= data.grossCapacityLiters &&
+        data.deadstockVolumeLiters is number && data.deadstockVolumeLiters >= 0 && data.deadstockVolumeLiters <= data.grossCapacityLiters &&
+        data.netWorkingVolumeLiters is number && data.netWorkingVolumeLiters >= 0 && data.netWorkingVolumeLiters <= data.grossCapacityLiters &&
+        (!('calibrationCertificateNo' in data) || (data.calibrationCertificateNo is string && data.calibrationCertificateNo.size() <= 64)) &&
+        (!('calibrationExpiryDate' in data) || (data.calibrationExpiryDate is string && data.calibrationExpiryDate.size() <= 20)) &&
+        (!('customStrappingPoints' in data) || (data.customStrappingPoints is list && data.customStrappingPoints.size() <= 400)) &&
+        data.openingDipLiters is number && data.openingDipLiters >= 0 && data.openingDipLiters <= 1000000 &&
+        data.currentBookVolumeLiters is number && data.currentBookVolumeLiters >= 0 && data.currentBookVolumeLiters <= 1000000 &&
+        (!('currentWacPhp' in data) || (data.currentWacPhp is number && data.currentWacPhp >= 0 && data.currentWacPhp <= 10000)) &&
+        (!('lastDipVolumeLiters' in data) || (data.lastDipVolumeLiters is number && data.lastDipVolumeLiters >= 0 && data.lastDipVolumeLiters <= 1000000)) &&
+        (!('lastDipAt' in data) || (data.lastDipAt is string && data.lastDipAt.size() <= 64)) &&
+        data.ownerId is string && data.ownerId.size() >= 1 && data.ownerId.size() <= 128 &&
         data.createdAt is string && data.createdAt.size() >= 10 && data.createdAt.size() <= 64 &&
         data.updatedAt is string && data.updatedAt.size() >= 10 && data.updatedAt.size() <= 64;
     }
@@ -319,7 +489,11 @@ service cloud.firestore {
         ((!('canDelete' in sourceData) && (!('canDelete' in incomingData) || incomingData.canDelete == false)) ||
          ('canDelete' in sourceData && 'canDelete' in incomingData && incomingData.canDelete == sourceData.canDelete)) &&
         ((!('canSwitchToLive' in sourceData) && (!('canSwitchToLive' in incomingData) || incomingData.canSwitchToLive == false)) ||
-         ('canSwitchToLive' in sourceData && 'canSwitchToLive' in incomingData && incomingData.canSwitchToLive == sourceData.canSwitchToLive));
+         ('canSwitchToLive' in sourceData && 'canSwitchToLive' in incomingData && incomingData.canSwitchToLive == sourceData.canSwitchToLive)) &&
+        ((!('canRequestSingleTrip' in sourceData) && (!('canRequestSingleTrip' in incomingData) || incomingData.canRequestSingleTrip == false)) ||
+         ('canRequestSingleTrip' in sourceData && 'canRequestSingleTrip' in incomingData && incomingData.canRequestSingleTrip == sourceData.canRequestSingleTrip)) &&
+        ((!('gsoVerificationCode' in sourceData) && !('gsoVerificationCode' in incomingData)) ||
+         ('gsoVerificationCode' in sourceData && 'gsoVerificationCode' in incomingData && incomingData.gsoVerificationCode == sourceData.gsoVerificationCode));
     }
 
     function isClaimingValidInvite(data) {
@@ -350,7 +524,9 @@ service cloud.firestore {
         data.active == true &&
         (!('canEdit' in data) || data.canEdit == false) &&
         (!('canDelete' in data) || data.canDelete == false) &&
-        (!('canSwitchToLive' in data) || data.canSwitchToLive == false);
+        (!('canSwitchToLive' in data) || data.canSwitchToLive == false) &&
+        (!('canRequestSingleTrip' in data) || data.canRequestSingleTrip == false) &&
+        !('gsoVerificationCode' in data);
     }
 
     // Admins Registry
@@ -427,7 +603,7 @@ service cloud.firestore {
         allow create: if isValidId(vehicleId) && isValidEnv(envId) && isVerified() &&
           isValidFleetVehicle(incoming()) && incoming().id == vehicleId &&
           incoming().ownerId == request.auth.uid &&
-          (isAdmin() || envId == 'sandbox');
+          (isGsoHead() || envId == 'sandbox');
         allow update: if isValidId(vehicleId) && isValidEnv(envId) && isVerified() &&
           isValidFleetVehicle(incoming()) &&
           incoming().id == existing().id && incoming().ownerId == existing().ownerId && incoming().createdAt == existing().createdAt &&
@@ -445,8 +621,9 @@ service cloud.firestore {
         allow update: if isValidId(depotId) && isValidEnv(envId) && isVerified() &&
           isValidFuelDepot(incoming()) && incoming().id == existing().id && (
             isAdmin() ||
-            (isGsoPersonnel() && incoming().diff(existing()).affectedKeys().hasOnly(['gasolineCurrentLiters', 'dieselCurrentLiters', 'lastDipVerifiedAt', 'lastDipVerifiedBy', 'updatedAt'])) ||
-            (envId == 'sandbox' && incoming().diff(existing()).affectedKeys().hasOnly(['gasolineCurrentLiters', 'dieselCurrentLiters', 'lastDipVerifiedAt', 'lastDipVerifiedBy', 'updatedAt']))
+            isGsoHead() ||
+            (isGsoPersonnel() && incoming().diff(existing()).affectedKeys().hasOnly(['gasolineCurrentLiters', 'dieselCurrentLiters', 'gasolinePricePerLiter', 'dieselPricePerLiter', 'lastDipVerifiedAt', 'lastDipVerifiedBy', 'updatedAt'])) ||
+            envId == 'sandbox'
           );
         allow delete: if isValidId(depotId) && isValidEnv(envId) && isVerified() && (isAdmin() || envId == 'sandbox');
       }
@@ -459,7 +636,8 @@ service cloud.firestore {
           (isCityWideOversight() || existing().ownerId == request.auth.uid || existing().department == userDepartment() || envId == 'sandbox');
         allow create: if isValidId(workPlanId) && isValidEnv(envId) && isVerified() &&
           isValidWorkPlan(incoming()) && incoming().id == workPlanId &&
-          incoming().ownerId == request.auth.uid && (
+          incoming().ownerId == request.auth.uid &&
+          (!('requestType' in incoming()) || incoming().requestType != 'single_trip' || hasSingleTripPerm() || envId == 'sandbox') && (
             isAdmin() || (
               incoming().status == 'pending_approval' &&
               incoming().totalDispensedLiters == 0 &&
@@ -469,7 +647,7 @@ service cloud.firestore {
         allow update: if isValidId(workPlanId) && isValidEnv(envId) && isVerified() &&
           isValidWorkPlan(incoming()) &&
           incoming().id == existing().id && incoming().ownerId == existing().ownerId && incoming().createdAt == existing().createdAt && (
-            hasEditPerm() ||
+            (hasEditPerm() && (!('requestType' in existing()) || existing().requestType != 'single_trip' || hasSingleTripPerm() || envId == 'sandbox')) ||
             // Action: Tabletop Approval / Reduction
             ((isApprover() || envId == 'sandbox') && existing().status == 'pending_approval' &&
               incoming().diff(existing()).affectedKeys().hasOnly(['status', 'totalApprovedLiters', 'approverNote', 'approvedBy', 'updatedAt'])) ||
@@ -512,17 +690,17 @@ service cloud.firestore {
               incoming().pumpReadingPhotoDataUrl is string &&
               incoming().pumpReadingPhotoDataUrl.size() >= 20 &&
               incoming().pumpReadingPhotoDataUrl.matches('^data:image/.*') &&
-              incoming().diff(existing()).affectedKeys().hasOnly(['dispensedLiters', 'forfeitedLiters', 'unitPriceAtDispense', 'servedOnce', 'dispensedAt', 'dispensedBy', 'pumpReadingPhotoDataUrl', 'pumpReadingPhotoName', 'status', 'updatedAt']))
+              incoming().diff(existing()).affectedKeys().hasOnly(['gsoTransactionCode', 'dispensedLiters', 'forfeitedLiters', 'unitPriceAtDispense', 'servedOnce', 'dispensedAt', 'dispensedBy', 'pumpReadingPhotoDataUrl', 'pumpReadingPhotoName', 'status', 'updatedAt']))
           );
         allow delete: if isValidId(ticketId) && isValidEnv(envId) && isVerified() && (hasDeletePerm() || envId == 'sandbox');
       }
 
-      // Inventory Logs (Deliveries, Dispensing, Pre-Fill Shrinkage/Overage Adjustments)
+      // Inventory Logs (Deliveries, Dispensing, Pre-Fill Shrinkage/Overage Adjustments, and WAC Cost History)
       match /inventoryLogs/{logId} {
         allow get: if isValidId(logId) && isValidEnv(envId) && isVerified() &&
-          (isCityWideOversight() || existing().ownerId == request.auth.uid || envId == 'sandbox');
+          (isCityWideOversight() || hasActiveProfile() || existing().ownerId == request.auth.uid || envId == 'sandbox');
         allow list: if isValidEnv(envId) && isVerified() &&
-          (isCityWideOversight() || existing().ownerId == request.auth.uid || envId == 'sandbox');
+          (isCityWideOversight() || (hasActiveProfile() && existing().depotId is string) || existing().ownerId == request.auth.uid || envId == 'sandbox');
         allow create: if isValidId(logId) && isValidEnv(envId) && isVerified() &&
           isValidInventoryLog(incoming()) && incoming().id == logId &&
           incoming().ownerId == request.auth.uid &&
@@ -531,24 +709,81 @@ service cloud.firestore {
           isValidInventoryLog(incoming()) &&
           incoming().id == existing().id && incoming().ownerId == existing().ownerId && incoming().createdAt == existing().createdAt && (
             isAdmin() ||
-            ((isGsoPersonnel() || envId == 'sandbox') && existing().approvalStatus == 'pending_gso_approval' &&
-              incoming().diff(existing()).affectedKeys().hasOnly(['approvalStatus', 'gsoApproverName', 'digitalVerificationCode', 'verifiedAt']) &&
+            ((isGsoHead() || envId == 'sandbox') && existing().approvalStatus == 'pending_gso_approval' &&
+              incoming().diff(existing()).affectedKeys().hasOnly(['approvalStatus', 'gsoApproverName', 'digitalVerificationCode', 'verifiedAt', 'balanceBefore', 'balanceAfter', 'weightedAverageCostBefore', 'weightedAverageCostAfter', 'prevailingWeightedAverageCostPhp']) &&
               incoming().digitalVerificationCode is string && incoming().digitalVerificationCode.size() >= 4)
           );
         allow delete: if isValidId(logId) && isValidEnv(envId) && isVerified() && (isAdmin() || envId == 'sandbox');
       }
 
-      // Audit Logs (Immutable in Live; Purgeable in Sandbox)
+      // Audit Logs (Admin-Only Full Inspection; Append-Only Immutable in Live; Admin-Purgeable in Sandbox)
       match /auditLogs/{logId} {
-        allow get: if isValidId(logId) && isValidEnv(envId) && isVerified() &&
-          (isAdmin() || userRole() == 'auditor' || existing().actorUid == request.auth.uid || envId == 'sandbox');
-        allow list: if isValidEnv(envId) && isVerified() &&
-          (isAdmin() || userRole() == 'auditor' || existing().actorUid == request.auth.uid || envId == 'sandbox');
+        allow get: if isValidId(logId) && isValidEnv(envId) && isAdmin();
+        allow list: if isValidEnv(envId) && isAdmin();
         allow create: if isValidId(logId) && isValidEnv(envId) && isVerified() &&
           isValidAuditLog(incoming()) && incoming().id == logId &&
           incoming().actorUid == request.auth.uid;
         allow update: if false;
-        allow delete: if isValidId(logId) && isValidEnv(envId) && isVerified() && envId == 'sandbox';
+        allow delete: if isValidId(logId) && isValidEnv(envId) && isAdmin() && envId == 'sandbox';
+      }
+
+      // Report Utilities Settings (System-wide preview & full report layout — Admin write, verified read)
+      match /settings/{settingId} {
+        allow get: if settingId == 'report_utilities' && isValidEnv(envId) && isVerified() &&
+          (isAdmin() || hasActiveProfile() || envId == 'sandbox');
+        allow list: if isValidEnv(envId) && isVerified() && (isAdmin() || envId == 'sandbox');
+        allow create: if settingId == 'report_utilities' && isValidEnv(envId) && isVerified() &&
+          isValidReportUtilitiesSetting(incoming()) && incoming().id == settingId &&
+          (isAdmin() || envId == 'sandbox');
+        allow update: if settingId == 'report_utilities' && isValidEnv(envId) && isVerified() &&
+          isValidReportUtilitiesSetting(incoming()) && incoming().id == existing().id &&
+          (isAdmin() || envId == 'sandbox');
+        allow delete: if settingId == 'report_utilities' && isValidEnv(envId) && isVerified() &&
+          (isAdmin() || envId == 'sandbox');
+      }
+
+      // PMC Project Registry (Department Office, Year of Approval, Name of Project, AIP Code, Diesel/Gasoline POW Fuel Components)
+      match /pmcProjects/{projectId} {
+        allow get: if isValidId(projectId) && isValidEnv(envId) && isVerified() &&
+          (isPmcPersonnel() || hasActiveProfile() || envId == 'sandbox');
+        allow list: if isValidEnv(envId) && isVerified() &&
+          (isPmcPersonnel() || (hasActiveProfile() && existing().aipCode is string) || envId == 'sandbox');
+        allow create: if isValidId(projectId) && isValidEnv(envId) && isVerified() &&
+          isValidPmcProject(incoming()) && incoming().id == projectId &&
+          incoming().ownerId == request.auth.uid &&
+          (isPmcPersonnel() || envId == 'sandbox');
+        allow update: if isValidId(projectId) && isValidEnv(envId) && isVerified() &&
+          isValidPmcProject(incoming()) &&
+          incoming().id == existing().id && incoming().ownerId == existing().ownerId && incoming().createdAt == existing().createdAt &&
+          (
+            isAdmin() ||
+            (((isPmcPersonnel() && hasEditPerm()) || envId == 'sandbox') &&
+              incoming().diff(existing()).affectedKeys().hasOnly(['department', 'approvalYear', 'projectName', 'aipCode', 'dieselFuelComponentPhp', 'gasolineFuelComponentPhp', 'fuelComponentAmountPhp', 'updatedAt']))
+          );
+        allow delete: if isValidId(projectId) && isValidEnv(envId) && isVerified() &&
+          (isAdmin() || (isPmcPersonnel() && hasDeletePerm()) || envId == 'sandbox');
+      }
+
+      // Fuel Depot & UST/AST Storage Tank Master Registry
+      match /storageTanks/{tankId} {
+        allow get: if isValidId(tankId) && isValidEnv(envId) && isVerified() &&
+          (isCityWideOversight() || hasActiveProfile() || envId == 'sandbox');
+        allow list: if isValidEnv(envId) && isVerified() &&
+          (isCityWideOversight() || (hasActiveProfile() && existing().depotId is string) || envId == 'sandbox');
+        allow create: if isValidId(tankId) && isValidEnv(envId) && isVerified() &&
+          isValidStorageTank(incoming()) && incoming().id == tankId &&
+          incoming().ownerId == request.auth.uid &&
+          exists(/databases/$(database)/documents/environments/$(envId)/depots/$(incoming().depotId)) &&
+          (isGsoHead() || envId == 'sandbox');
+        allow update: if isValidId(tankId) && isValidEnv(envId) && isVerified() &&
+          isValidStorageTank(incoming()) &&
+          incoming().id == existing().id && incoming().ownerId == existing().ownerId && incoming().createdAt == existing().createdAt && (
+            isGsoHead() ||
+            (isGsoPersonnel() && incoming().diff(existing()).affectedKeys().hasOnly(['currentBookVolumeLiters', 'lastDipVolumeLiters', 'lastDipAt', 'updatedAt'])) ||
+            envId == 'sandbox'
+          );
+        allow delete: if isValidId(tankId) && isValidEnv(envId) && isVerified() &&
+          (isGsoHead() || envId == 'sandbox');
       }
     }
   }

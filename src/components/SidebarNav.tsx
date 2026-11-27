@@ -3,18 +3,17 @@ import {
   ClipboardCheck,
   Database,
   FileSpreadsheet,
+  FolderKanban,
   Fuel,
   History,
   LayoutDashboard,
   LogOut,
   ShieldCheck,
   Trash2,
-  Truck,
   Users,
   X,
 } from 'lucide-react';
 import {
-  BAIS_DEPARTMENTS,
   EnvironmentMode,
   NavSection,
   ROLE_LABELS,
@@ -34,7 +33,11 @@ interface SidebarNavProps {
   sandboxRole: UserRole;
   onChangeSandboxRole: (role: UserRole) => void;
   sandboxDepartment: string;
+  sandboxDepartmentOptions: string[];
   onChangeSandboxDepartment: (dept: string) => void;
+  sandboxMatchingUsers: UserAccount[];
+  selectedSandboxUserUid: string | null;
+  onChangeSelectedSandboxUserUid: (uid: string | null) => void;
   onRequestPurgeSandbox: () => void;
   onSignOut: () => void;
   pendingApprovalCount: number;
@@ -53,7 +56,11 @@ export function SidebarNav({
   sandboxRole,
   onChangeSandboxRole,
   sandboxDepartment,
+  sandboxDepartmentOptions,
   onChangeSandboxDepartment,
+  sandboxMatchingUsers,
+  selectedSandboxUserUid,
+  onChangeSelectedSandboxUserUid,
   onRequestPurgeSandbox,
   onSignOut,
   pendingApprovalCount,
@@ -77,10 +84,10 @@ export function SidebarNav({
       visible: canAccessNavSection(currentUser.role, 'dashboard'),
     },
     {
-      id: 'fleet',
-      label: 'Fleet Registry',
-      icon: Truck,
-      visible: canAccessNavSection(currentUser.role, 'fleet'),
+      id: 'registries',
+      label: 'Master Registries',
+      icon: FolderKanban,
+      visible: canAccessNavSection(currentUser.role, 'registries'),
     },
     {
       id: 'work_plans',
@@ -231,15 +238,64 @@ export function SidebarNav({
           <select
             id="sandbox-dept-select"
             value={sandboxDepartment}
+            disabled={sandboxDepartmentOptions.length <= 1}
             onChange={(e) => onChangeSandboxDepartment(e.target.value)}
-            className="w-full rounded border border-[#243B5E] bg-[#13294B] px-2.5 py-1.5 text-xs text-slate-200 focus:outline-none"
+            className="w-full rounded border border-[#243B5E] bg-[#13294B] px-2.5 py-1.5 text-xs text-slate-200 focus:outline-none disabled:opacity-80 disabled:cursor-not-allowed"
           >
-            {BAIS_DEPARTMENTS.map((d) => (
+            {sandboxDepartmentOptions.map((d) => (
               <option key={d} value={d}>
                 {d}
               </option>
             ))}
           </select>
+          {sandboxRole !== 'admin' && sandboxMatchingUsers.length > 1 && (
+            <>
+              <label htmlFor="sandbox-user-select" className="sr-only">
+                Preview RBAC User
+              </label>
+              <select
+                id="sandbox-user-select"
+                value={selectedSandboxUserUid || sandboxMatchingUsers[0]?.uid || ''}
+                onChange={(e) => onChangeSelectedSandboxUserUid(e.target.value || null)}
+                className="w-full rounded border border-[#243B5E] bg-[#13294B] px-2.5 py-1.5 text-[11px] text-slate-200 focus:outline-none"
+              >
+                {sandboxMatchingUsers.map((u) => (
+                  <option key={u.uid} value={u.uid}>
+                    @{u.username || u.email.split('@')[0]} — {u.displayName}
+                  </option>
+                ))}
+              </select>
+            </>
+          )}
+          {sandboxRole !== 'admin' && (() => {
+            const matchedAccount =
+              sandboxMatchingUsers.find((u) => u.uid === currentUser.uid) ??
+              sandboxMatchingUsers[0] ??
+              null;
+            const activePerms = [
+              currentUser.canEdit && 'Edit',
+              currentUser.canDelete && 'Del',
+              currentUser.canRequestSingleTrip && 'Single',
+              currentUser.canSwitchToLive && 'Live',
+            ].filter(Boolean) as string[];
+            return (
+              <div
+                data-testid="sandbox-rbac-summary"
+                className="rounded border border-[#1E3557] bg-[#0D1E36] px-2 py-1 text-[10px] font-mono text-slate-300 truncate"
+                title={
+                  matchedAccount
+                    ? `RBAC Account: ${matchedAccount.displayName} (@${matchedAccount.username || matchedAccount.email.split('@')[0]})`
+                    : 'No active RBAC account assigned to this role & office (defaults to Read-Only)'
+                }
+              >
+                {matchedAccount
+                  ? `@${matchedAccount.username || matchedAccount.email.split('@')[0]} · ${
+                      activePerms.length > 0 ? activePerms.join(' · ') : 'Read-Only'
+                    }`
+                  : 'No RBAC user · Read-Only'}
+              </div>
+            );
+          })()}
         </div>
       )}
 

@@ -4,16 +4,15 @@ import {
   LogOut,
   Menu,
   Plus,
-  RefreshCw,
+  SlidersHorizontal,
   Trash2,
 } from 'lucide-react';
-import { User as FirebaseUser } from 'firebase/auth';
 import { EnvironmentMode } from '../types/fuel';
 import { NavSection } from './SidebarNav';
 
 const SECTION_TITLES: Record<NavSection, string> = {
   dashboard: 'Dashboard',
-  fleet: 'Fleet Registry',
+  registries: 'Master Registries',
   work_plans: 'Department Request',
   approvals: 'Fuel Request Approval',
   dispensing: 'GSO Fuel Dispensing',
@@ -31,15 +30,13 @@ interface TopHeaderProps {
   isOnline: boolean;
   simulatedOffline: boolean;
   onToggleSimulatedOffline: () => void;
-  syncQueueCount: number;
-  onFlushSyncQueue: () => void;
   isActualAdmin: boolean;
+  canManageReportUtilities: boolean;
   canCreateWorkPlan: boolean;
-  firebaseUser: FirebaseUser | null;
-  onSignIn: () => void;
   onSignOut: () => void;
   onOpenMobileNav: () => void;
   onOpenNewWorkPlan: () => void;
+  onOpenReportUtilities: () => void;
   onRequestPurgeSandbox: () => void;
 }
 
@@ -51,13 +48,13 @@ export function TopHeader({
   isOnline,
   simulatedOffline,
   onToggleSimulatedOffline,
-  syncQueueCount,
-  onFlushSyncQueue,
   isActualAdmin,
+  canManageReportUtilities,
   canCreateWorkPlan,
   onSignOut,
   onOpenMobileNav,
   onOpenNewWorkPlan,
+  onOpenReportUtilities,
   onRequestPurgeSandbox,
 }: TopHeaderProps) {
   return (
@@ -113,6 +110,20 @@ export function TopHeader({
             </div>
           )}
 
+          {/* Report Utilities Button (System Administrator only) */}
+          {canManageReportUtilities && (
+            <button
+              type="button"
+              data-testid="open-report-utilities-btn"
+              onClick={onOpenReportUtilities}
+              title="Arrange and pre-select Preview & Full Report fields"
+              className="inline-flex items-center gap-1.5 rounded-md border border-[#1B3B6F] bg-white px-2.5 py-1.5 text-xs font-semibold text-[#1B3B6F] hover:bg-[#EEF2F8] transition-colors whitespace-nowrap shrink-0"
+            >
+              <SlidersHorizontal className="h-3.5 w-3.5" />
+              <span className="hidden md:inline">Report Utilities</span>
+            </button>
+          )}
+
           {/* Sandbox Purge Button (Admin Desktop/Tablet) */}
           {envMode === 'sandbox' && isActualAdmin && (
             <button
@@ -148,17 +159,6 @@ export function TopHeader({
             )}
             <span className="hidden md:inline">{isOnline ? 'Online' : 'Offline'}</span>
           </button>
-
-          {syncQueueCount > 0 && (
-            <button
-              type="button"
-              onClick={onFlushSyncQueue}
-              className="inline-flex items-center gap-1.5 rounded-md border border-[#1B3B6F] bg-[#EEF2F8] px-2.5 py-1.5 text-xs font-semibold text-[#1B3B6F] hover:bg-[#E1E8F2] whitespace-nowrap shrink-0"
-            >
-              <RefreshCw className="h-3.5 w-3.5" />
-              <span className="font-mono tabular-nums">Sync ({syncQueueCount})</span>
-            </button>
-          )}
 
           {/* Sign Out */}
           <button

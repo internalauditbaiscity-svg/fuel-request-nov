@@ -1,19 +1,31 @@
 import { useState } from 'react';
-import { CheckCircle2, Edit3, LogIn, ShieldAlert, Trash2, UserPlus, X } from 'lucide-react';
+import { Edit3, KeyRound, RefreshCw, ShieldAlert, Trash2, UserPlus } from 'lucide-react';
 import {
   BAIS_DEPARTMENTS,
+  FleetVehicle,
   ROLE_LABELS,
   UserAccount,
   UserRole,
 } from '../types/fuel';
-import { canManageUsers } from '../utils/fuelEngine';
+import { useEscapeClose } from '../hooks/useEscapeClose';
+import {
+  canManageUsers,
+  generateDistinctGsoVerificationCode,
+  getDepartmentMnemonic,
+  getLocalIsoDate,
+  GSO_OFFICE_DEPARTMENT,
+  normalizeGsoVerificationCode,
+  PMC_OFFICE_DEPARTMENT,
+  TABLETOP_APPROVER_DEPARTMENT,
+  USER_OFFICE_DEPARTMENT,
+} from '../utils/fuelEngine';
 import { RecordsPreviewGate } from './RecordsPreviewGate';
 
 interface UsersAdminViewProps {
   users: UserAccount[];
+  vehicles?: FleetVehicle[];
   currentUser: UserAccount;
   firebaseUser?: { email?: string | null } | null;
-  onConnectGoogleForSync?: () => Promise<void>;
   onCreateUser: (input: {
     username: string;
     password: string;
@@ -25,6 +37,8 @@ interface UsersAdminViewProps {
     canEdit: boolean;
     canDelete: boolean;
     canSwitchToLive: boolean;
+    canRequestSingleTrip: boolean;
+    gsoVerificationCode?: string;
   }) => Promise<void>;
   onUpdateUser: (
     uid: string,
@@ -39,6 +53,8 @@ interface UsersAdminViewProps {
       canEdit: boolean;
       canDelete: boolean;
       canSwitchToLive: boolean;
+      canRequestSingleTrip: boolean;
+      gsoVerificationCode?: string;
     }
   ) => Promise<void>;
   onDeleteUser: (user: UserAccount) => Promise<void>;
@@ -47,9 +63,9 @@ interface UsersAdminViewProps {
 
 export function UsersAdminView({
   users,
+  vehicles = [],
   currentUser,
   firebaseUser,
-  onConnectGoogleForSync,
   onCreateUser,
   onUpdateUser,
   onDeleteUser,
@@ -69,6 +85,8 @@ export function UsersAdminView({
   const [canEdit, setCanEdit] = useState(false);
   const [canDelete, setCanDelete] = useState(false);
   const [canSwitchToLive, setCanSwitchToLive] = useState(false);
+  const [canRequestSingleTrip, setCanRequestSingleTrip] = useState(false);
+  const [gsoVerificationCode, setGsoVerificationCode] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
   const [actionNotice, setActionNotice] = useState<string | null>(null);
@@ -85,8 +103,20 @@ export function UsersAdminView({
   const [editCanEdit, setEditCanEdit] = useState(false);
   const [editCanDelete, setEditCanDelete] = useState(false);
   const [editCanSwitchToLive, setEditCanSwitchToLive] = useState(false);
+  const [editCanRequestSingleTrip, setEditCanRequestSingleTrip] = useState(false);
+  const [editGsoVerificationCode, setEditGsoVerificationCode] = useState('');
   const [editError, setEditError] = useState<string | null>(null);
   const [editSubmitting, setEditSubmitting] = useState(false);
+
+  useEscapeClose(
+    Boolean(editingUser),
+    () => {
+      setEditingUser(null);
+      setEditPassword('');
+      setEditError(null);
+    },
+    3
+  );
 
   if (!isAdmin) {
     return (
@@ -99,12 +129,114 @@ export function UsersAdminView({
     );
   }
 
+  const getLockedDepartmentForRole = (targetRole: UserRole): string | null => {
+    if (targetRole === 'admin' || targetRole === 'auditor') return USER_OFFICE_DEPARTMENT;
+    if (targetRole === 'approver') return TABLETOP_APPROVER_DEPARTMENT;
+    return null;
+  };
+
+  const handleCreateRoleChange = (nextRole: UserRole) => {
+    setRole(nextRole);
+    if (nextRole === 'gso_head') {
+      if (!gsoVerificationCode.trim()) {
+        setGsoVerificationCode(generateDistinctGsoVerificationCode(users));
+      }
+    } else {
+      setGsoVerificationCode('');
+    }
+    const locked = getLockedDepartmentForRole(nextRole);
+    if (locked) {
+      setDepartment(locked);
+      return;
+    }
+    if (nextRole === 'gso_head' || nextRole === 'gso_dispenser') {
+      if (
+        !department.trim() ||
+        department.trim().toLowerCase() === USER_OFFICE_DEPARTMENT.toLowerCase() ||
+        department.trim().toLowerCase() === TABLETOP_APPROVER_DEPARTMENT.toLowerCase() ||
+        department.trim().toLowerCase() === PMC_OFFICE_DEPARTMENT.toLowerCase()
+      ) {
+        setDepartment(GSO_OFFICE_DEPARTMENT);
+      }
+      return;
+    }
+    if (nextRole === 'pmc_staff') {
+      if (
+        !department.trim() ||
+        department.trim().toLowerCase() === USER_OFFICE_DEPARTMENT.toLowerCase() ||
+        department.trim().toLowerCase() === TABLETOP_APPROVER_DEPARTMENT.toLowerCase() ||
+        department.trim().toLowerCase() === GSO_OFFICE_DEPARTMENT.toLowerCase()
+      ) {
+        setDepartment(PMC_OFFICE_DEPARTMENT);
+      }
+      return;
+    }
+    if (department.trim().toLowerCase() === USER_OFFICE_DEPARTMENT.toLowerCase()) {
+      setDepartment('');
+    }
+  };
+
+  const handleEditRoleChange = (nextRole: UserRole) => {
+    setEditRole(nextRole);
+    if (nextRole === 'gso_head') {
+      if (!editGsoVerificationCode.trim()) {
+        setEditGsoVerificationCode(
+          editingUser?.gsoVerificationCode || generateDistinctGsoVerificationCode(users)
+        );
+      }
+    } else {
+      setEditGsoVerificationCode('');
+    }
+    const locked = getLockedDepartmentForRole(nextRole);
+    if (locked) {
+      setEditDepartment(locked);
+      return;
+    }
+    if (nextRole === 'gso_head' || nextRole === 'gso_dispenser') {
+      if (
+        !editDepartment.trim() ||
+        editDepartment.trim().toLowerCase() === USER_OFFICE_DEPARTMENT.toLowerCase() ||
+        editDepartment.trim().toLowerCase() === TABLETOP_APPROVER_DEPARTMENT.toLowerCase() ||
+        editDepartment.trim().toLowerCase() === PMC_OFFICE_DEPARTMENT.toLowerCase()
+      ) {
+        setEditDepartment(GSO_OFFICE_DEPARTMENT);
+      }
+      return;
+    }
+    if (nextRole === 'pmc_staff') {
+      if (
+        !editDepartment.trim() ||
+        editDepartment.trim().toLowerCase() === USER_OFFICE_DEPARTMENT.toLowerCase() ||
+        editDepartment.trim().toLowerCase() === TABLETOP_APPROVER_DEPARTMENT.toLowerCase() ||
+        editDepartment.trim().toLowerCase() === GSO_OFFICE_DEPARTMENT.toLowerCase()
+      ) {
+        setEditDepartment(PMC_OFFICE_DEPARTMENT);
+      }
+      return;
+    }
+    if (editDepartment.trim().toLowerCase() === USER_OFFICE_DEPARTMENT.toLowerCase()) {
+      setEditDepartment('');
+    }
+  };
+
+  const departmentSuggestions = Array.from(
+    new Set([
+      ...BAIS_DEPARTMENTS,
+      ...users.map((u) => u.department.trim()).filter(Boolean),
+      ...vehicles.map((v) => v.office.trim()).filter(Boolean),
+    ])
+  ).filter((dept) => dept.trim().toLowerCase() !== USER_OFFICE_DEPARTMENT.toLowerCase());
+
+  const createLockedDepartment = getLockedDepartmentForRole(role);
+  const editLockedDepartment = getLockedDepartmentForRole(editRole);
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setFormError(null);
     setActionNotice(null);
     const cleanUsername = username.trim().replace(/^@+/, '');
-    if (!cleanUsername || !password.trim() || !displayName.trim() || !department.trim()) return;
+    const resolvedDepartment = (createLockedDepartment ?? department).trim();
+    if (!cleanUsername || !password.trim() || !displayName.trim() || !resolvedDepartment) return;
     setSubmitting(true);
     try {
       await onCreateUser({
@@ -113,26 +245,31 @@ export function UsersAdminView({
         email: email.trim() || `${cleanUsername.toLowerCase()}@baiscity.gov.ph`,
         displayName: displayName.trim(),
         role,
-        department: department.trim(),
+        department: resolvedDepartment,
         positionTitle: positionTitle.trim() || ROLE_LABELS[role],
         canEdit: role === 'admin' ? true : canEdit,
         canDelete: role === 'admin' ? true : canDelete,
         canSwitchToLive: role === 'admin' ? true : canSwitchToLive,
+        canRequestSingleTrip: role === 'admin' ? true : canRequestSingleTrip,
+        gsoVerificationCode:
+          role === 'gso_head' ? normalizeGsoVerificationCode(gsoVerificationCode) : undefined,
       });
       setActionNotice(
         firebaseUser
-          ? `User account "${cleanUsername.toLowerCase()}" provisioned and synced to Cloud for cross-device sign-in.`
-          : `User account "${cleanUsername.toLowerCase()}" created on this browser. Click "Sign In with Google to Sync" so it can log in on other browsers or devices.`
+          ? `User account "${cleanUsername.toLowerCase()}" provisioned and synced to Cloud.`
+          : `User account "${cleanUsername.toLowerCase()}" created.`
       );
       setUsername('');
       setPassword('');
       setEmail('');
       setDisplayName('');
-      setDepartment('');
+      setDepartment(createLockedDepartment ?? '');
       setPositionTitle('');
       setCanEdit(false);
       setCanDelete(false);
       setCanSwitchToLive(false);
+      setCanRequestSingleTrip(false);
+      setGsoVerificationCode(role === 'gso_head' ? generateDistinctGsoVerificationCode(users) : '');
     } catch (err) {
       setFormError(err instanceof Error ? err.message : 'Unable to create user account.');
     } finally {
@@ -148,11 +285,13 @@ export function UsersAdminView({
     setEditEmail(u.email);
     setEditDisplayName(u.displayName);
     setEditRole(u.role);
-    setEditDepartment(u.department);
+    setEditDepartment(getLockedDepartmentForRole(u.role) ?? u.department);
     setEditPositionTitle(u.positionTitle || '');
     setEditCanEdit(u.role === 'admin' ? true : Boolean(u.canEdit));
     setEditCanDelete(u.role === 'admin' ? true : Boolean(u.canDelete));
     setEditCanSwitchToLive(u.role === 'admin' ? true : Boolean(u.canSwitchToLive));
+    setEditCanRequestSingleTrip(u.role === 'admin' ? true : Boolean(u.canRequestSingleTrip));
+    setEditGsoVerificationCode(u.role === 'gso_head' ? u.gsoVerificationCode || '' : '');
   };
 
   const closeEditModal = () => {
@@ -167,11 +306,14 @@ export function UsersAdminView({
     setEditCanEdit(false);
     setEditCanDelete(false);
     setEditCanSwitchToLive(false);
+    setEditCanRequestSingleTrip(false);
+    setEditGsoVerificationCode('');
   };
 
   const handleSaveEdit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!editingUser || !editUsername.trim() || !editDisplayName.trim() || !editDepartment.trim()) {
+    const resolvedEditDept = (editLockedDepartment ?? editDepartment).trim();
+    if (!editingUser || !editUsername.trim() || !editDisplayName.trim() || !resolvedEditDept) {
       return;
     }
     setEditError(null);
@@ -184,16 +326,21 @@ export function UsersAdminView({
         email: editEmail.trim(),
         displayName: editDisplayName.trim(),
         role: editRole,
-        department: editDepartment.trim(),
+        department: resolvedEditDept,
         positionTitle: editPositionTitle.trim() || ROLE_LABELS[editRole],
         canEdit: editRole === 'admin' ? true : editCanEdit,
         canDelete: editRole === 'admin' ? true : editCanDelete,
         canSwitchToLive: editRole === 'admin' ? true : editCanSwitchToLive,
+        canRequestSingleTrip: editRole === 'admin' ? true : editCanRequestSingleTrip,
+        gsoVerificationCode:
+          editRole === 'gso_head'
+            ? normalizeGsoVerificationCode(editGsoVerificationCode)
+            : undefined,
       });
       setActionNotice(
         firebaseUser
           ? `Updated "${cleanEditUsername.toLowerCase()}" and synced credentials to Cloud.`
-          : `Updated "${cleanEditUsername.toLowerCase()}" locally. Click "Sign In with Google to Sync" to push changes to other devices.`
+          : `Updated "${cleanEditUsername.toLowerCase()}".`
       );
       closeEditModal();
     } catch (err) {
@@ -214,33 +361,7 @@ export function UsersAdminView({
               Create Departmental User, Credentials & RBAC Permissions
             </h2>
           </div>
-          {firebaseUser ? (
-            <span className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-emerald-800">
-              <CheckCircle2 className="h-3.5 w-3.5" />
-              <span>Cloud Credential Sync Active</span>
-            </span>
-          ) : (
-            onConnectGoogleForSync && (
-              <button
-                type="button"
-                onClick={onConnectGoogleForSync}
-                className="inline-flex items-center gap-1.5 rounded border border-[#1B3B6F] bg-[#EEF2F8] px-3 py-1 text-[11px] font-semibold text-[#0B192C] hover:bg-[#DCE4F0]"
-              >
-                <LogIn className="h-3 w-3 text-[#1B3B6F]" />
-                <span>Sign In with Google to Sync Cross-Device</span>
-              </button>
-            )
-          )}
         </div>
-
-        {!firebaseUser && (
-          <div
-            role="status"
-            className="rounded-md border border-amber-300 bg-amber-50 px-3.5 py-2.5 text-xs text-amber-950"
-          >
-            <strong>Local Browser Mode:</strong> Credentials created while signed in locally work immediately on this browser, and synchronize across other browsers or devices once you click <strong>Sign In with Google to Sync</strong>.
-          </div>
-        )}
 
         {formError && (
           <div
@@ -262,6 +383,20 @@ export function UsersAdminView({
 
         <form onSubmit={handleSubmit} autoComplete="off" className="space-y-4">
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+            <div>
+              <label htmlFor="usr-prep-date" className="block text-[11px] font-semibold text-[#334E73] mb-1">
+                Preparation Date (Pre-Assigned)
+              </label>
+              <input
+                id="usr-prep-date"
+                data-testid="users-preparation-date"
+                type="date"
+                readOnly
+                value={getLocalIsoDate()}
+                className="w-full rounded border border-[#D5DCE6] bg-[#F3F5F8] px-3 py-2 font-mono text-xs font-bold text-[#1B3B6F]"
+              />
+            </div>
+
             <div>
               <label htmlFor="usr-name" className="block text-[11px] font-semibold text-[#334E73] mb-1">
                 Full Name *
@@ -312,20 +447,23 @@ export function UsersAdminView({
 
             <div>
               <label htmlFor="usr-dept" className="block text-[11px] font-semibold text-[#334E73] mb-1">
-                Department Concerned (Enter Value) *
+                Department Concerned *
               </label>
               <input
                 id="usr-dept"
                 type="text"
                 list="bais-dept-suggestions"
                 required
+                readOnly={Boolean(createLockedDepartment)}
                 placeholder="Enter office or department name"
-                value={department}
+                value={createLockedDepartment ?? department}
                 onChange={(e) => setDepartment(e.target.value)}
-                className="w-full rounded border border-[#D5DCE6] px-3 py-2 text-xs text-[#0B192C]"
+                className={`w-full rounded border border-[#D5DCE6] px-3 py-2 text-xs text-[#0B192C] ${
+                  createLockedDepartment ? 'bg-[#F3F5F8] font-semibold text-[#1B3B6F]' : ''
+                }`}
               />
               <datalist id="bais-dept-suggestions">
-                {BAIS_DEPARTMENTS.map((d) => (
+                {departmentSuggestions.map((d) => (
                   <option key={d} value={d} />
                 ))}
               </datalist>
@@ -352,7 +490,7 @@ export function UsersAdminView({
               <select
                 id="usr-role"
                 value={role}
-                onChange={(e) => setRole(e.target.value as UserRole)}
+                onChange={(e) => handleCreateRoleChange(e.target.value as UserRole)}
                 className="w-full rounded border border-[#D5DCE6] px-3 py-2 text-xs text-[#0B192C]"
               >
                 {(Object.keys(ROLE_LABELS) as UserRole[]).map((r) => (
@@ -376,6 +514,48 @@ export function UsersAdminView({
                 className="w-full rounded border border-[#D5DCE6] px-3 py-2 text-xs text-[#0B192C]"
               />
             </div>
+
+            {role === 'gso_head' && (
+              <div
+                data-testid="create-gso-code-section"
+                className="sm:col-span-2 lg:col-span-2 rounded border border-[#93C5FD] bg-[#EFF6FF] p-2.5 space-y-1.5"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <label
+                    htmlFor="usr-gso-code"
+                    className="inline-flex items-center gap-1.5 text-[11px] font-bold text-[#1E3A5F]"
+                  >
+                    <KeyRound className="h-3.5 w-3.5 text-[#1B3B6F]" />
+                    <span>GSO Head Distinct Verification Code *</span>
+                  </label>
+                  <button
+                    type="button"
+                    data-testid="generate-create-gso-code-btn"
+                    onClick={() => setGsoVerificationCode(generateDistinctGsoVerificationCode(users))}
+                    className="inline-flex items-center gap-1 rounded border border-[#93C5FD] bg-white px-2 py-0.5 text-[10px] font-bold text-[#1B3B6F] hover:bg-[#DBEAFE]"
+                  >
+                    <RefreshCw className="h-3 w-3" />
+                    <span>Generate</span>
+                  </button>
+                </div>
+                <input
+                  id="usr-gso-code"
+                  data-testid="create-gso-verification-code"
+                  type="text"
+                  required
+                  autoComplete="off"
+                  minLength={4}
+                  maxLength={32}
+                  placeholder="e.g. GSO-HD-9045"
+                  value={gsoVerificationCode}
+                  onChange={(e) => setGsoVerificationCode(e.target.value.toUpperCase())}
+                  className="w-full rounded border border-[#93C5FD] bg-white px-3 py-2 font-mono text-xs font-bold uppercase text-[#0B192C]"
+                />
+                <p className="text-[10px] text-[#334E73]">
+                  Unique to this GSO Head RBAC account (4–32 letters, numbers, or hyphens). Required for GSO Ledger verifications.
+                </p>
+              </div>
+            )}
 
             <div className="flex flex-col justify-center gap-1.5 rounded border border-[#E6EBF2] bg-[#F9FAFC] px-3 py-2">
               <span className="text-[11px] font-semibold text-[#334E73]">Record & Environment Permissions</span>
@@ -411,6 +591,17 @@ export function UsersAdminView({
                   />
                   <span>Switch to Live</span>
                 </label>
+                <label className="inline-flex items-center gap-1.5 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    data-testid="create-user-can-single-trip"
+                    checked={role === 'admin' ? true : canRequestSingleTrip}
+                    disabled={role === 'admin'}
+                    onChange={(e) => setCanRequestSingleTrip(e.target.checked)}
+                    className="accent-[#0B192C]"
+                  />
+                  <span>Single Trip Ticket</span>
+                </label>
               </div>
             </div>
           </div>
@@ -429,88 +620,114 @@ export function UsersAdminView({
 
       {/* Preview-Gated Registered Users Table */}
       <RecordsPreviewGate
-        title="Authorized Users & RBAC Registry"
-        description="Provisioned user accounts, assigned departments, and Edit/Delete permission grants remain hidden until Preview is pressed."
+        title="Authorized Users & RBAC"
+        description="Provisioned accounts, department scope, and RBAC permission flags."
         recordCount={users.length}
         previewOpen={previewOpen}
         onTogglePreview={setPreviewOpen}
-        buttonLabel="Preview User Accounts"
+        buttonLabel="Preview Users"
       >
         <section className="rounded-lg border border-[#D5DCE6] bg-white overflow-hidden">
-          <div className="border-b border-[#D5DCE6] px-5 py-3.5">
-            <h3 className="font-display text-sm font-bold text-[#0B192C]">
-              Authorized Users & Departmental Scope ({users.length})
-            </h3>
-          </div>
           <div className="overflow-x-auto">
-            <table className="w-full text-left text-xs">
-              <thead className="border-b border-[#D5DCE6] bg-[#F3F5F8] text-[#334E73]">
+            <table className="w-full text-left text-[11px] sm:text-xs">
+              <thead className="border-b border-[#CBD5E1] bg-[#EEF2F8] text-[#1E3A5F]">
                 <tr>
-                  <th className="px-4 py-2.5 font-semibold">User & Account Name</th>
-                  <th className="px-4 py-2.5 font-semibold">Role</th>
-                  <th className="px-4 py-2.5 font-semibold">Department Concerned</th>
-                  <th className="px-4 py-2.5 font-semibold">Edit / Delete / Live Perms</th>
-                  <th className="px-4 py-2.5 font-semibold">Status</th>
-                  <th className="px-4 py-2.5 font-semibold text-right">Admin Actions</th>
+                  <th className="px-1.5 py-1.5 sm:px-2.5 sm:py-2 text-center align-middle text-[10px] sm:text-[11px] font-bold tracking-wide leading-tight whitespace-nowrap">
+                    User
+                  </th>
+                  <th className="px-1.5 py-1.5 sm:px-2.5 sm:py-2 text-center align-middle text-[10px] sm:text-[11px] font-bold tracking-wide leading-tight whitespace-nowrap">
+                    Role
+                  </th>
+                  <th className="px-1.5 py-1.5 sm:px-2.5 sm:py-2 text-center align-middle text-[10px] sm:text-[11px] font-bold tracking-wide leading-tight whitespace-nowrap">
+                    Dept
+                  </th>
+                  <th className="px-1.5 py-1.5 sm:px-2.5 sm:py-2 text-center align-middle text-[10px] sm:text-[11px] font-bold tracking-wide leading-tight whitespace-nowrap">
+                    Perms
+                  </th>
+                  <th className="px-1.5 py-1.5 sm:px-2.5 sm:py-2 text-center align-middle text-[10px] sm:text-[11px] font-bold tracking-wide leading-tight whitespace-nowrap">
+                    Status
+                  </th>
+                  <th className="px-1.5 py-1.5 sm:px-2.5 sm:py-2 text-center align-middle text-[10px] sm:text-[11px] font-bold tracking-wide leading-tight whitespace-nowrap">
+                    Act
+                  </th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-[#E6EBF2]">
-                {users.map((u) => (
-                  <tr key={u.uid} className="hover:bg-[#F9FAFC]">
-                    <td className="px-4 py-2.5">
-                      <div className="font-semibold text-[#0B192C]">{u.displayName}</div>
-                      <div className="font-mono text-[11px] text-[#1B3B6F]">
-                        @{u.username || u.email.split('@')[0]}
-                      </div>
-                      <div className="font-mono text-[10px] text-[#5A6F8C]">{u.email}</div>
-                    </td>
-                    <td className="px-4 py-2.5 font-medium text-[#1B3B6F]">
-                      {ROLE_LABELS[u.role]}
-                    </td>
-                    <td className="px-4 py-2.5 text-[#334E73]">{u.department}</td>
-                    <td className="px-4 py-2.5 font-mono text-[11px] text-[#334E73]">
-                      {u.role === 'admin' || u.canEdit ? 'Edit: Yes' : 'Edit: No'} ·{' '}
-                      {u.role === 'admin' || u.canDelete ? 'Delete: Yes' : 'Delete: No'} ·{' '}
-                      {u.role === 'admin' || u.canSwitchToLive ? 'Live: Yes' : 'Live: No'}
-                    </td>
-                    <td className="px-4 py-2.5">
-                      <span
-                        className={`font-semibold ${
-                          u.active ? 'text-emerald-800' : 'text-red-700'
-                        }`}
+                {users.map((u) => {
+                  const grantedFlags = [
+                    (u.role === 'admin' || u.canEdit) && 'Edit',
+                    (u.role === 'admin' || u.canDelete) && 'Del',
+                    (u.role === 'admin' || u.canRequestSingleTrip) && 'Single',
+                    (u.role === 'admin' || u.canSwitchToLive) && 'Live',
+                  ].filter(Boolean) as string[];
+                  return (
+                    <tr key={u.uid} className="hover:bg-[#F9FAFC]">
+                      <td className="px-1.5 py-1.5 sm:px-2.5">
+                        <div className="font-semibold text-[#0B192C] leading-tight">{u.displayName}</div>
+                        <div className="font-mono text-[10px] text-[#1B3B6F]">
+                          @{u.username || u.email.split('@')[0]}
+                        </div>
+                      </td>
+                      <td className="px-1.5 py-1.5 sm:px-2.5 font-medium text-[#1B3B6F] whitespace-nowrap">
+                        <div>{ROLE_LABELS[u.role]}</div>
+                        {u.role === 'gso_head' && u.gsoVerificationCode && (
+                          <div
+                            data-testid={`user-gso-code-${u.uid}`}
+                            className="mt-0.5 inline-flex items-center gap-1 font-mono text-[10px] font-bold text-[#0F172A]"
+                          >
+                            <KeyRound className="h-2.5 w-2.5 text-[#1B3B6F] shrink-0" />
+                            <span>{u.gsoVerificationCode}</span>
+                          </div>
+                        )}
+                      </td>
+                      <td
+                        className="px-1.5 py-1.5 sm:px-2.5 text-center font-mono font-bold text-[#0B192C] whitespace-nowrap"
+                        title={u.department}
                       >
-                        {u.active ? 'Active' : 'Suspended'}
-                      </span>
-                    </td>
-                    <td className="px-4 py-2.5 text-right whitespace-nowrap">
-                      <button
-                        type="button"
-                        onClick={() => openEditModal(u)}
-                        aria-label={`Edit user ${u.username || u.displayName}`}
-                        className="mr-1 rounded border border-[#D5DCE6] bg-white p-1.5 text-[#334E73] hover:bg-[#F3F5F8]"
-                      >
-                        <Edit3 className="h-3.5 w-3.5" />
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => onToggleActive(u)}
-                        className="mr-1 rounded border border-[#D5DCE6] bg-white px-2.5 py-1 text-xs font-semibold text-[#334E73] hover:bg-[#F3F5F8]"
-                      >
-                        {u.active ? 'Suspend' : 'Activate'}
-                      </button>
-                      {u.uid !== currentUser.uid && (
+                        {getDepartmentMnemonic(u.department, vehicles)}
+                      </td>
+                      <td className="px-1.5 py-1.5 sm:px-2.5 font-mono text-[10px] text-[#334E73] whitespace-nowrap">
+                        {grantedFlags.length > 0 ? grantedFlags.join(' · ') : 'Read-Only'}
+                      </td>
+                      <td className="px-1.5 py-1.5 sm:px-2.5 whitespace-nowrap">
+                        <span
+                          className={`font-semibold text-[11px] ${
+                            u.active ? 'text-emerald-800' : 'text-red-700'
+                          }`}
+                        >
+                          {u.active ? 'Active' : 'Suspended'}
+                        </span>
+                      </td>
+                      <td className="px-1.5 py-1.5 sm:px-2.5 text-right whitespace-nowrap">
                         <button
                           type="button"
-                          onClick={() => onDeleteUser(u)}
-                          aria-label={`Delete user ${u.username || u.displayName}`}
-                          className="rounded border border-[#D5DCE6] bg-white p-1.5 text-red-700 hover:bg-red-50"
+                          onClick={() => openEditModal(u)}
+                          aria-label={`Edit user ${u.username || u.displayName}`}
+                          className="mr-1 rounded border border-[#D5DCE6] bg-white p-1 text-[#334E73] hover:bg-[#F3F5F8]"
                         >
-                          <Trash2 className="h-3.5 w-3.5" />
+                          <Edit3 className="h-3.5 w-3.5" />
                         </button>
-                      )}
-                    </td>
-                  </tr>
-                ))}
+                        <button
+                          type="button"
+                          onClick={() => onToggleActive(u)}
+                          className="mr-1 rounded border border-[#D5DCE6] bg-white px-2 py-0.5 text-[11px] font-semibold text-[#334E73] hover:bg-[#F3F5F8]"
+                        >
+                          {u.active ? 'Suspend' : 'Activate'}
+                        </button>
+                        {u.uid !== currentUser.uid && (
+                          <button
+                            type="button"
+                            onClick={() => onDeleteUser(u)}
+                            aria-label={`Delete user ${u.username || u.displayName}`}
+                            className="rounded border border-[#D5DCE6] bg-white p-1 text-red-700 hover:bg-red-50"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </button>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -529,16 +746,17 @@ export function UsersAdminView({
             onSubmit={handleSaveEdit}
             className="w-full max-w-lg rounded-lg border border-[#D5DCE6] bg-white overflow-hidden"
           >
-            <div className="flex items-center justify-between bg-[#0B192C] px-5 py-3.5 text-white">
+            <div className="flex items-start justify-between gap-4 bg-[#0B192C] px-5 py-3.5 text-white">
               <h2 className="font-display text-base font-bold">
                 Edit User Account ({editingUser.username || editingUser.displayName})
               </h2>
               <button
                 type="button"
                 onClick={closeEditModal}
-                className="rounded p-1 text-slate-300 hover:bg-[#13294B]"
+                aria-label="Close edit user dialog"
+                className="inline-flex items-center justify-center rounded-md bg-[#334E73] px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-[#1B3B6F] transition-colors whitespace-nowrap shrink-0"
               >
-                <X className="h-4 w-4" />
+                Close
               </button>
             </div>
             <div className="p-5 grid grid-cols-1 gap-3 sm:grid-cols-2 text-xs">
@@ -550,6 +768,18 @@ export function UsersAdminView({
                   {editError}
                 </div>
               )}
+              <div className="sm:col-span-2">
+                <label htmlFor="edit-usr-prep-date" className="block font-semibold text-[#334E73] mb-1">
+                  Preparation Date (Pre-Assigned)
+                </label>
+                <input
+                  id="edit-usr-prep-date"
+                  type="date"
+                  readOnly
+                  value={getLocalIsoDate()}
+                  className="w-full rounded border border-[#D5DCE6] bg-[#F3F5F8] px-2.5 py-2 font-mono font-bold text-[#1B3B6F]"
+                />
+              </div>
               <div>
                 <label className="block font-semibold text-[#334E73] mb-1">Full Name *</label>
                 <input
@@ -602,16 +832,19 @@ export function UsersAdminView({
                   type="text"
                   list="bais-dept-suggestions"
                   required
-                  value={editDepartment}
+                  readOnly={Boolean(editLockedDepartment)}
+                  value={editLockedDepartment ?? editDepartment}
                   onChange={(e) => setEditDepartment(e.target.value)}
-                  className="w-full rounded border border-[#D5DCE6] px-2.5 py-2"
+                  className={`w-full rounded border border-[#D5DCE6] px-2.5 py-2 ${
+                    editLockedDepartment ? 'bg-[#F3F5F8] font-semibold text-[#1B3B6F]' : ''
+                  }`}
                 />
               </div>
               <div>
                 <label className="block font-semibold text-[#334E73] mb-1">System Role *</label>
                 <select
                   value={editRole}
-                  onChange={(e) => setEditRole(e.target.value as UserRole)}
+                  onChange={(e) => handleEditRoleChange(e.target.value as UserRole)}
                   className="w-full rounded border border-[#D5DCE6] px-2.5 py-2"
                 >
                   {(Object.keys(ROLE_LABELS) as UserRole[]).map((r) => (
@@ -630,6 +863,49 @@ export function UsersAdminView({
                   className="w-full rounded border border-[#D5DCE6] px-2.5 py-2"
                 />
               </div>
+              {editRole === 'gso_head' && (
+                <div
+                  data-testid="edit-gso-code-section"
+                  className="sm:col-span-2 rounded border border-[#93C5FD] bg-[#EFF6FF] p-3 space-y-1.5"
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <label
+                      htmlFor="edit-usr-gso-code"
+                      className="inline-flex items-center gap-1.5 font-bold text-[#1E3A5F]"
+                    >
+                      <KeyRound className="h-3.5 w-3.5 text-[#1B3B6F]" />
+                      <span>GSO Head Distinct Verification Code *</span>
+                    </label>
+                    <button
+                      type="button"
+                      data-testid="generate-edit-gso-code-btn"
+                      onClick={() =>
+                        setEditGsoVerificationCode(generateDistinctGsoVerificationCode(users))
+                      }
+                      className="inline-flex items-center gap-1 rounded border border-[#93C5FD] bg-white px-2 py-0.5 text-[11px] font-bold text-[#1B3B6F] hover:bg-[#DBEAFE]"
+                    >
+                      <RefreshCw className="h-3 w-3" />
+                      <span>Generate Distinct</span>
+                    </button>
+                  </div>
+                  <input
+                    id="edit-usr-gso-code"
+                    data-testid="edit-gso-verification-code"
+                    type="text"
+                    required
+                    autoComplete="off"
+                    minLength={4}
+                    maxLength={32}
+                    placeholder="e.g. GSO-HD-9012"
+                    value={editGsoVerificationCode}
+                    onChange={(e) => setEditGsoVerificationCode(e.target.value.toUpperCase())}
+                    className="w-full rounded border border-[#93C5FD] bg-white px-2.5 py-2 font-mono font-bold uppercase text-[#0B192C]"
+                  />
+                  <p className="text-[11px] text-[#334E73]">
+                    Unique to GSO Head RBAC only. Changing the role away from GSO Head automatically revokes this verification code.
+                  </p>
+                </div>
+              )}
               <div className="sm:col-span-2 flex flex-wrap items-center gap-x-5 gap-y-2 rounded border border-[#E6EBF2] bg-[#F9FAFC] px-3 py-2.5">
                 <span className="font-semibold text-[#334E73]">Access Permissions:</span>
                 <label className="inline-flex items-center gap-1.5 cursor-pointer">
@@ -662,6 +938,17 @@ export function UsersAdminView({
                     className="accent-[#0B192C]"
                   />
                   <span>Can Switch to Live Data</span>
+                </label>
+                <label className="inline-flex items-center gap-1.5 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    data-testid="edit-user-can-single-trip"
+                    checked={editRole === 'admin' ? true : editCanRequestSingleTrip}
+                    disabled={editRole === 'admin'}
+                    onChange={(e) => setEditCanRequestSingleTrip(e.target.checked)}
+                    className="accent-[#0B192C]"
+                  />
+                  <span>Single Trip Ticket</span>
                 </label>
               </div>
             </div>

@@ -5,11 +5,12 @@ export type UserRole =
   | 'gso_dispenser'
   | 'department_head'
   | 'requester'
+  | 'pmc_staff'
   | 'auditor';
 
 export type NavSection =
   | 'dashboard'
-  | 'fleet'
+  | 'registries'
   | 'work_plans'
   | 'approvals'
   | 'dispensing'
@@ -17,6 +18,8 @@ export type NavSection =
   | 'users'
   | 'reports'
   | 'audit';
+
+export type RegistrySubTab = 'fleet' | 'pmc_projects' | 'depot';
 
 export type EnvironmentMode = 'sandbox' | 'live';
 
@@ -76,6 +79,8 @@ export interface UserAccount {
   canEdit?: boolean;
   canDelete?: boolean;
   canSwitchToLive?: boolean;
+  canRequestSingleTrip?: boolean;
+  gsoVerificationCode?: string;
   active: boolean;
   createdBy: string;
   createdAt: string;
@@ -85,6 +90,7 @@ export interface UserAccount {
 export interface FleetVehicle {
   id: string;
   office: string;
+  officeMnemonic?: string;
   plateNumber: string;
   chassisNumber: string;
   makeModel: string;
@@ -104,10 +110,71 @@ export interface FleetVehicle {
   updatedAt: string;
 }
 
+export interface PmcProject {
+  id: string;
+  department: string;
+  approvalYear: number;
+  projectName: string;
+  aipCode: string;
+  dieselFuelComponentPhp: number;
+  gasolineFuelComponentPhp: number;
+  fuelComponentAmountPhp: number;
+  ownerId: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type TankFuelProduct =
+  | 'diesel'
+  | 'regular_91'
+  | 'mid_grade'
+  | 'premium_95'
+  | 'kerosene'
+  | 'bio_diesel';
+
+export type TankInstallationType = 'underground_ust' | 'aboveground_ast';
+
+export type TankMaterialType =
+  | 'double_wall_fiberglass'
+  | 'double_wall_steel'
+  | 'single_wall_steel';
+
+export type TankGeometryType =
+  | 'horizontal_cylinder_flat'
+  | 'horizontal_cylinder_dished'
+  | 'vertical_cylinder'
+  | 'rectangular_box';
+
+export type CalibrationHealthStatus = 'active' | 'expiring_soon' | 'calibration_due';
+
+export interface StrappingPoint {
+  heightCm: number;
+  volumeLiters: number;
+}
+
+export interface StrappingCurve {
+  mode: 'formula' | 'custom_csv';
+  sourceName?: string;
+  points: StrappingPoint[];
+}
+
+export interface DispenserMapping {
+  pumpId: string;
+  nozzleLabel: string;
+  tankId: string;
+  depotId: string;
+  fuelProduct: TankFuelProduct;
+}
+
 export interface FuelDepot {
   id: string;
+  siteCode?: string;
   name: string;
   location: string;
+  coordinates?: string;
+  permitNumber?: string;
+  calibrationExpiryDate?: string;
+  stationManager?: string;
   gasolineCapacityLiters: number;
   gasolineCurrentLiters: number;
   gasolinePricePerLiter: number;
@@ -120,9 +187,50 @@ export interface FuelDepot {
   updatedAt: string;
 }
 
+export interface StorageTank {
+  id: string;
+  depotId: string;
+  tankCode: string;
+  name: string;
+  locationZone: string;
+  manholeTag?: string;
+  installationType: TankInstallationType;
+  material: TankMaterialType;
+  fuelProduct: TankFuelProduct;
+  mappedFuelType: FuelType;
+  connectedDispensers: string[];
+  geometry: TankGeometryType;
+  diameterCm: number;
+  lengthCm: number;
+  widthCm?: number;
+  heightCm?: number;
+  riserOffsetCm: number;
+  tiltAngleDegrees: number;
+  overfillBufferPct: number;
+  deadstockClearanceCm: number;
+  lowStockAlertLiters: number;
+  grossCapacityLiters: number;
+  safeFillCapacityLiters: number;
+  deadstockVolumeLiters: number;
+  netWorkingVolumeLiters: number;
+  calibrationCertificateNo?: string;
+  calibrationExpiryDate?: string;
+  customStrappingPoints?: StrappingPoint[];
+  openingDipLiters: number;
+  currentBookVolumeLiters: number;
+  currentWacPhp?: number;
+  lastDipVolumeLiters?: number;
+  lastDipAt?: string;
+  ownerId: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface WorkPlan {
   id: string;
   controlNumber: string;
+  requestType?: 'weekly_work_plan' | 'single_trip';
+  preparationDate?: string;
   department: string;
   projectTitle: string;
   projectCode: string;
@@ -151,9 +259,12 @@ export interface TripTicket {
   id: string;
   workPlanId: string;
   ticketNumber: string;
+  gsoTransactionCode?: string;
   department: string;
   projectTitle: string;
   purposeOrProject?: string;
+  projectAip?: string;
+  pmcProjectId?: string;
   vehicleId: string;
   plateNumber: string;
   vehicleLabel?: string;
@@ -186,13 +297,25 @@ export interface InventoryLog {
   id: string;
   depotId: string;
   depotName: string;
+  tankId?: string;
+  pumpId?: string;
   fuelType: FuelType;
   transactionType: InventoryTransactionType;
   litersDelta: number;
   balanceBefore: number;
   balanceAfter: number;
+  deliveryUnitCostPhp?: number;
+  deliveryTotalAmountPhp?: number;
+  weightedAverageCostBefore?: number;
+  weightedAverageCostAfter?: number;
+  prevailingWeightedAverageCostPhp?: number;
   physicalDipLiters?: number;
+  gsoTransactionCode?: string;
+  tripTicketNumber?: string;
   referenceNumber: string;
+  purchaseOrderRef?: string;
+  supplierName?: string;
+  deliveryDate?: string;
   notes?: string;
   approvalStatus: InventoryApprovalStatus;
   gsoApproverName?: string;
@@ -202,17 +325,75 @@ export interface InventoryLog {
   createdAt: string;
 }
 
+export type AuditLogCategory = 'credential' | 'transaction' | 'registry' | 'system';
+
 export interface AuditLog {
   id: string;
   actorUid: string;
   actorEmail: string;
+  actorName?: string;
   actorRole: string;
   department?: string;
+  category?: AuditLogCategory;
+  environment?: EnvironmentMode;
   action: string;
   entityType: string;
   entityId: string;
   summary: string;
+  details?: string;
   createdAt: string;
+}
+
+export type FuelClassLedgerMovement = 'in' | 'out' | 'adjustment';
+
+export interface FuelClassLedgerRow {
+  log: InventoryLog;
+  movementKind: FuelClassLedgerMovement;
+  movementLabel: string;
+  timestamp: string;
+  txCode: string;
+  referenceText: string;
+  tripTicketNumber: string;
+  tankId?: string;
+  tankCode?: string;
+  tankName?: string;
+  pumpId?: string;
+  inLiters: number | null;
+  outLiters: number | null;
+  adjustmentLiters: number | null;
+  runningVolumeLiters: number;
+  effectedWacPhp: number;
+  transactionCostPhp: number;
+  runningCostPhp: number;
+  isVerified: boolean;
+}
+
+export interface TankLedgerWacSnapshot {
+  tankId: string;
+  tankCode: string;
+  tankName: string;
+  depotId: string;
+  depotName: string;
+  runningVolumeLiters: number;
+  currentWacPhp: number;
+  runningCostPhp: number;
+}
+
+export interface FuelClassLedgerSummary {
+  fuelType: FuelType;
+  openingVolumeLiters: number;
+  totalInLiters: number;
+  totalOutLiters: number;
+  netAdjustmentLiters: number;
+  closingVolumeLiters: number;
+  currentEffectedWacPhp: number;
+  closingInventoryCostPhp: number;
+  totalInCostPhp: number;
+  totalOutCostPhp: number;
+  netAdjustmentCostPhp: number;
+  verifiedCount: number;
+  pendingCount: number;
+  tankBreakdown?: TankLedgerWacSnapshot[];
 }
 
 export interface DiscrepancyAlert {
@@ -253,10 +434,55 @@ export interface DailyReconciliationSummary {
   alerts: DiscrepancyAlert[];
 }
 
+export type WorkPlanReportLayoutVariant = 'for_approval' | 'post_approval_monitoring';
+
+export type ReportUtilitiesTargetKey =
+  | 'workplans_preview'
+  | 'workplans_full_review'
+  | 'workplans_review_tickets'
+  | 'workplans_monitoring_review'
+  | 'workplans_monitoring_tickets'
+  | 'approvals_preview'
+  | 'dispensing_approved_preview'
+  | 'dispensing_dispensed_preview'
+  | 'reports_full_preview'
+  | 'reports_dept_table';
+
+export interface ReportFieldConfigItem {
+  key: string;
+  enabled: boolean;
+}
+
+export interface ReportUtilitiesConfig {
+  id: 'report_utilities';
+  workplans_preview: ReportFieldConfigItem[];
+  workplans_full_review: ReportFieldConfigItem[];
+  workplans_review_tickets: ReportFieldConfigItem[];
+  workplans_monitoring_review: ReportFieldConfigItem[];
+  workplans_monitoring_tickets: ReportFieldConfigItem[];
+  approvals_preview: ReportFieldConfigItem[];
+  dispensing_approved_preview: ReportFieldConfigItem[];
+  dispensing_dispensed_preview: ReportFieldConfigItem[];
+  reports_full_preview: ReportFieldConfigItem[];
+  reports_dept_table: ReportFieldConfigItem[];
+  updatedBy: string;
+  updatedAt: string;
+}
+
 export interface SyncQueueItem {
   id: string;
   envMode?: EnvironmentMode;
-  collection: 'workPlans' | 'tripTickets' | 'vehicles' | 'depots' | 'inventoryLogs' | 'auditLogs' | 'users';
+  collection:
+    | 'workPlans'
+    | 'tripTickets'
+    | 'vehicles'
+    | 'pmcProjects'
+    | 'depots'
+    | 'storageTanks'
+    | 'inventoryLogs'
+    | 'auditLogs'
+    | 'users'
+    | 'settings';
   docId: string;
   operation: 'set' | 'update' | 'delete';
   payload?: Record<string, unknown>;
@@ -270,9 +496,22 @@ export const BAIS_DEPARTMENTS = [
   'City Disaster Risk Reduction & Management Office (CDRRMO)',
   'City Health Office',
   'City Environment & Natural Resources Office (CENRO)',
+  'Project Monitoring Committee (PMC)',
   'City Mayor\'s Office',
   'Internal Audit Service',
 ] as const;
+
+export const BAIS_DEPARTMENT_MNEMONICS: Record<(typeof BAIS_DEPARTMENTS)[number], string> = {
+  'City Engineering Office': 'CEO',
+  'General Services Office (GSO)': 'GSO',
+  'City Agriculture Office': 'CAGRO',
+  'City Disaster Risk Reduction & Management Office (CDRRMO)': 'DRRMO',
+  'City Health Office': 'CHO',
+  'City Environment & Natural Resources Office (CENRO)': 'CENRO',
+  'Project Monitoring Committee (PMC)': 'PMC',
+  "City Mayor's Office": 'CMO',
+  'Internal Audit Service': 'IAS',
+};
 
 export const EQUIPMENT_CLASS_SPECS: Record<
   EquipmentClass,
@@ -335,5 +574,6 @@ export const ROLE_LABELS: Record<UserRole, string> = {
   gso_dispenser: 'GSO Depot Dispenser',
   department_head: 'Department Head',
   requester: 'Department Requester',
+  pmc_staff: 'PMC Staff',
   auditor: 'Internal Auditor',
 };

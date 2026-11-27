@@ -5,7 +5,6 @@ import {
   Plus,
   Search,
   Trash2,
-  X,
 } from 'lucide-react';
 import {
   BAIS_DEPARTMENTS,
@@ -18,10 +17,15 @@ import {
   VehicleStatus,
 } from '../types/fuel';
 import {
-  canManageUsers,
+  canRegisterFleetUnit,
   canUserDeleteRecords,
   canUserEditRecords,
+  checkDepartmentMnemonicCollision,
+  getDepartmentMnemonic,
+  getLocalIsoDate,
+  validateDepartmentMnemonic,
 } from '../utils/fuelEngine';
+import { useEscapeClose } from '../hooks/useEscapeClose';
 import { RecordsPreviewGate } from './RecordsPreviewGate';
 
 interface FleetRegistryViewProps {
@@ -40,7 +44,7 @@ export function FleetRegistryView({
   onSaveVehicle,
   onDeleteVehicle,
 }: FleetRegistryViewProps) {
-  const canCreate = canManageUsers(currentUser.role) || canUserEditRecords(currentUser);
+  const canCreate = canRegisterFleetUnit(currentUser.role);
   const canEdit = canUserEditRecords(currentUser);
   const canDelete = canUserDeleteRecords(currentUser);
 
@@ -49,8 +53,14 @@ export function FleetRegistryView({
   const [modalOpen, setModalOpen] = useState(false);
   const [editingId, setEditingId] = useState<string | undefined>(undefined);
 
+  useEscapeClose(modalOpen, () => setModalOpen(false), 3);
+
   // Form fields (No assigned driver during registration for operational flexibility)
   const [office, setOffice] = useState<string>(BAIS_DEPARTMENTS[0]);
+  const [officeMnemonic, setOfficeMnemonic] = useState<string>(() =>
+    getDepartmentMnemonic(BAIS_DEPARTMENTS[0], vehicles)
+  );
+  const [mnemonicError, setMnemonicError] = useState<string | null>(null);
   const [plateNumber, setPlateNumber] = useState('');
   const [chassisNumber, setChassisNumber] = useState('');
   const [makeModel, setMakeModel] = useState('');
@@ -66,19 +76,32 @@ export function FleetRegistryView({
 
   const filteredVehicles = useMemo(() => {
     const q = search.trim().toLowerCase();
-    return vehicles.filter(
-      (v) =>
+    return vehicles.filter((v) => {
+      const mnemonic = getDepartmentMnemonic(v.office, vehicles).toLowerCase();
+      return (
         !q ||
         v.plateNumber.toLowerCase().includes(q) ||
         v.chassisNumber.toLowerCase().includes(q) ||
         v.makeModel.toLowerCase().includes(q) ||
-        v.office.toLowerCase().includes(q)
-    );
+        v.office.toLowerCase().includes(q) ||
+        mnemonic.includes(q)
+      );
+    });
   }, [vehicles, search]);
+
+  const handleOfficeChange = (nextOffice: string) => {
+    setOffice(nextOffice);
+    const derived = getDepartmentMnemonic(nextOffice, vehicles);
+    setOfficeMnemonic(derived);
+    setMnemonicError(null);
+  };
 
   const openCreateModal = () => {
     setEditingId(undefined);
-    setOffice(BAIS_DEPARTMENTS[0]);
+    const defaultOffice = BAIS_DEPARTMENTS[0];
+    setOffice(defaultOffice);
+    setOfficeMnemonic(getDepartmentMnemonic(defaultOffice, vehicles));
+    setMnemonicError(null);
     setPlateNumber('');
     setChassisNumber('');
     setMakeModel('');
@@ -97,6 +120,8 @@ export function FleetRegistryView({
   const openEditModal = (v: FleetVehicle) => {
     setEditingId(v.id);
     setOffice(v.office);
+    setOfficeMnemonic(v.officeMnemonic || getDepartmentMnemonic(v.office, vehicles));
+    setMnemonicError(null);
     setPlateNumber(v.plateNumber);
     setChassisNumber(v.chassisNumber);
     setMakeModel(v.makeModel);
@@ -125,9 +150,27 @@ export function FleetRegistryView({
     if (!plateNumber.trim() || !chassisNumber.trim() || !makeModel.trim() || !office.trim()) {
       return;
     }
+    const validation = validateDepartmentMnemonic(officeMnemonic);
+    if (!validation.valid) {
+      setMnemonicError(validation.error || 'Mnemonic must be 3–5 uppercase letters.');
+      return;
+    }
+    const collisionOffice = checkDepartmentMnemonicCollision(
+      validation.normalized,
+      office,
+      vehicles
+    );
+    if (collisionOffice) {
+      setMnemonicError(
+        `Mnemonic "${validation.normalized}" is already assigned to ${collisionOffice}. Choose a unique 3–5 letter code.`
+      );
+      return;
+    }
+    setMnemonicError(null);
     await onSaveVehicle(
       {
         office: office.trim(),
+        officeMnemonic: validation.normalized,
         plateNumber: plateNumber.trim().toUpperCase(),
         chassisNumber: chassisNumber.trim().toUpperCase(),
         makeModel: makeModel.trim(),
@@ -156,7 +199,7 @@ export function FleetRegistryView({
   return (
     <div className="space-y-5">
       {/* Toolbar */}
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between rounded-lg border border-[#D5DCE6] bg-white p-4">
+      <div className="flex flex-col gap-2.5 sm:flex-row sm:items-center sm:justify-between rounded-lg border border-[#D5DCE6] bg-white p-3">
         <div className="relative flex-1 max-w-md">
           <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[#5A6F8C]" />
           <input
@@ -165,7 +208,7 @@ export function FleetRegistryView({
             onChange={(e) => setSearch(e.target.value)}
             placeholder="Search plate, chassis, make/model, or office..."
             aria-label="Search fleet registry"
-            className="w-full rounded-md border border-[#D5DCE6] bg-[#F3F5F8] py-2 pl-9 pr-3 text-sm text-[#0B192C]"
+            className="w-full rounded-md border border-[#D5DCE6] bg-[#F3F5F8] py-1.5 pl-9 pr-3 text-xs sm:text-sm text-[#0B192C]"
           />
         </div>
 
@@ -173,9 +216,9 @@ export function FleetRegistryView({
           <button
             type="button"
             onClick={openCreateModal}
-            className="inline-flex items-center gap-1.5 rounded-md bg-[#0B192C] px-3.5 py-2 text-xs font-semibold text-white hover:bg-[#1B3B6F] whitespace-nowrap"
+            className="inline-flex items-center gap-1.5 rounded-md bg-[#0B192C] px-3 py-1.5 text-xs font-semibold text-white hover:bg-[#1B3B6F] whitespace-nowrap"
           >
-            <Plus className="h-4 w-4" />
+            <Plus className="h-3.5 w-3.5" />
             <span>Register Fleet Unit</span>
           </button>
         )}
@@ -183,94 +226,114 @@ export function FleetRegistryView({
 
       {/* Preview-Gated Fleet Table */}
       <RecordsPreviewGate
-        title="Registered Fleet & Equipment Records"
-        description="Registered fleet units remain hidden until Preview is pressed. Drivers are assigned flexibly per Trip Ticket during Department Request creation."
+        title="Fleet & Equipment Records"
+        description="Registered fleet units and department mnemonics."
         recordCount={filteredVehicles.length}
         previewOpen={previewOpen}
         onTogglePreview={setPreviewOpen}
-        buttonLabel="Preview Fleet Records"
+        buttonLabel="Preview Fleet"
       >
         <div className="rounded-lg border border-[#D5DCE6] bg-white overflow-hidden">
           <div className="overflow-x-auto">
-            <table className="w-full text-left text-xs">
-              <thead className="border-b border-[#D5DCE6] bg-[#F3F5F8] text-[#334E73]">
+            <table className="w-full text-left text-[11px] sm:text-xs" data-testid="fleet-preview-table">
+              <thead className="border-b border-[#CBD5E1] bg-[#EEF2F8] text-[#1E3A5F]">
                 <tr>
-                  <th className="px-4 py-2.5 font-semibold">Plate & Chassis</th>
-                  <th className="px-4 py-2.5 font-semibold">Make, Model & Year</th>
-                  <th className="px-4 py-2.5 font-semibold">Assigned Office</th>
-                  <th className="px-4 py-2.5 font-semibold">Class & Consumption Limit</th>
-                  <th className="px-4 py-2.5 font-semibold">Status & Maintenance</th>
+                  <th className="px-1.5 py-1.5 sm:px-2 sm:py-2 text-center align-middle text-[10px] sm:text-[11px] font-bold tracking-wide leading-tight whitespace-nowrap">
+                    Plate
+                  </th>
+                  <th className="px-1.5 py-1.5 sm:px-2 sm:py-2 text-center align-middle text-[10px] sm:text-[11px] font-bold tracking-wide leading-tight whitespace-nowrap">
+                    Dept
+                  </th>
+                  <th className="px-1.5 py-1.5 sm:px-2 sm:py-2 text-center align-middle text-[10px] sm:text-[11px] font-bold tracking-wide leading-tight">
+                    Unit
+                  </th>
+                  <th className="px-1.5 py-1.5 sm:px-2 sm:py-2 text-center align-middle text-[10px] sm:text-[11px] font-bold tracking-wide leading-tight">
+                    Class / Cap
+                  </th>
+                  <th className="px-1.5 py-1.5 sm:px-2 sm:py-2 text-center align-middle text-[10px] sm:text-[11px] font-bold tracking-wide leading-tight whitespace-nowrap">
+                    Status
+                  </th>
                   {(canEdit || canDelete) && (
-                    <th className="px-4 py-2.5 font-semibold text-right">Actions</th>
+                    <th className="px-1.5 py-1.5 sm:px-2 sm:py-2 text-center align-middle text-[10px] sm:text-[11px] font-bold tracking-wide leading-tight whitespace-nowrap">
+                      Act
+                    </th>
                   )}
                 </tr>
               </thead>
               <tbody className="divide-y divide-[#E6EBF2]">
                 {filteredVehicles.length === 0 ? (
                   <tr>
-                    <td colSpan={canEdit || canDelete ? 6 : 5} className="px-4 py-8 text-center text-[#5A6F8C]">
+                    <td colSpan={canEdit || canDelete ? 6 : 5} className="px-3 py-4 text-center text-[#5A6F8C]">
                       No fleet units match your filter.
                     </td>
                   </tr>
                 ) : (
-                  filteredVehicles.map((v) => (
-                    <tr key={v.id} className="hover:bg-[#F9FAFC]">
-                      <td className="px-4 py-3">
-                        <div className="font-mono font-bold text-[#0B192C]">{v.plateNumber}</div>
-                        <div className="font-mono text-[11px] text-[#5A6F8C]">{v.chassisNumber}</div>
-                      </td>
-                      <td className="px-4 py-3">
-                        <div className="font-semibold text-[#0B192C]">{v.makeModel}</div>
-                        <div className="font-mono text-[11px] text-[#5A6F8C]">
-                          Acquired {v.yearAcquired} · {v.fuelType.toUpperCase()}
-                        </div>
-                      </td>
-                      <td className="px-4 py-3 text-[#334E73]">{v.office}</td>
-                      <td className="px-4 py-3">
-                        <div className="text-[#0B192C]">
-                          {EQUIPMENT_CLASS_SPECS[v.equipmentClass].label}
-                        </div>
-                        <div className="font-mono text-[11px] text-[#1B3B6F]">
-                          {v.efficiencyRate}{' '}
-                          {v.efficiencyUnit === 'km_per_liter' ? 'km/L' : 'L/hr'} · Cap{' '}
-                          {v.maxWeeklyLiters} L/wk
-                        </div>
-                      </td>
-                      <td className="px-4 py-3">
-                        <div className={`font-semibold uppercase text-[11px] ${statusTextClass(v.status)}`}>
-                          {v.status}
-                        </div>
-                        <div className="flex items-center gap-1 font-mono text-[11px] text-[#5A6F8C]">
-                          <CalendarClock className="h-3 w-3" />
-                          <span>Maint: {v.nextMaintenanceDate || 'Unscheduled'}</span>
-                        </div>
-                      </td>
-                      {(canEdit || canDelete) && (
-                        <td className="px-4 py-3 text-right whitespace-nowrap">
-                          {canEdit && (
-                            <button
-                              type="button"
-                              onClick={() => openEditModal(v)}
-                              aria-label={`Edit ${v.plateNumber}`}
-                              className="mr-1 rounded border border-[#D5DCE6] p-1.5 text-[#334E73] hover:bg-[#F3F5F8]"
-                            >
-                              <Edit3 className="h-3.5 w-3.5" />
-                            </button>
-                          )}
-                          {canDelete && (
-                            <button
-                              type="button"
-                              onClick={() => onDeleteVehicle(v)}
-                              aria-label={`Delete ${v.plateNumber}`}
-                              className="rounded border border-[#D5DCE6] p-1.5 text-red-700 hover:bg-red-50"
-                            >
-                              <Trash2 className="h-3.5 w-3.5" />
-                            </button>
-                          )}
+                  filteredVehicles.map((v) => {
+                    const deptCode = getDepartmentMnemonic(v.office, vehicles);
+                    return (
+                      <tr key={v.id} className="hover:bg-[#F9FAFC]">
+                        <td className="px-1.5 py-1.5 sm:px-2.5 sm:py-2 whitespace-nowrap">
+                          <div className="font-mono font-bold text-[#0B192C]">{v.plateNumber}</div>
+                          <div className="font-mono text-[10px] text-[#5A6F8C]">{v.chassisNumber}</div>
                         </td>
-                      )}
-                    </tr>
-                  ))
+                        <td
+                          className="px-1.5 py-1.5 sm:px-2.5 sm:py-2 text-center font-mono font-bold text-[#1B3B6F] whitespace-nowrap"
+                          title={v.office}
+                          data-testid={`fleet-dept-mnemonic-${v.plateNumber}`}
+                        >
+                          {deptCode}
+                        </td>
+                        <td className="px-1.5 py-1.5 sm:px-2.5 sm:py-2">
+                          <div className="font-semibold text-[#0B192C]">{v.makeModel}</div>
+                          <div className="font-mono text-[10px] text-[#5A6F8C]">
+                            {v.yearAcquired} · {v.fuelType.toUpperCase()}
+                          </div>
+                        </td>
+                        <td className="px-1.5 py-1.5 sm:px-2.5 sm:py-2">
+                          <div className="text-[#0B192C]">
+                            {EQUIPMENT_CLASS_SPECS[v.equipmentClass].label}
+                          </div>
+                          <div className="font-mono text-[10px] text-[#1B3B6F]">
+                            {v.efficiencyRate}{' '}
+                            {v.efficiencyUnit === 'km_per_liter' ? 'km/L' : 'L/hr'} · {v.maxWeeklyLiters} L/wk
+                          </div>
+                        </td>
+                        <td className="px-1.5 py-1.5 sm:px-2.5 sm:py-2 whitespace-nowrap">
+                          <div className={`font-semibold uppercase text-[10px] ${statusTextClass(v.status)}`}>
+                            {v.status}
+                          </div>
+                          <div className="flex items-center gap-1 font-mono text-[10px] text-[#5A6F8C]">
+                            <CalendarClock className="h-3 w-3 shrink-0" />
+                            <span>{v.nextMaintenanceDate || 'None'}</span>
+                          </div>
+                        </td>
+                        {(canEdit || canDelete) && (
+                          <td className="px-1.5 py-1.5 sm:px-2.5 sm:py-2 text-right whitespace-nowrap">
+                            {canEdit && (
+                              <button
+                                type="button"
+                                onClick={() => openEditModal(v)}
+                                aria-label={`Edit ${v.plateNumber}`}
+                                className="mr-1 rounded border border-[#D5DCE6] p-1 text-[#334E73] hover:bg-[#F3F5F8]"
+                              >
+                                <Edit3 className="h-3.5 w-3.5" />
+                              </button>
+                            )}
+                            {canDelete && (
+                              <button
+                                type="button"
+                                onClick={() => onDeleteVehicle(v)}
+                                aria-label={`Delete ${v.plateNumber}`}
+                                className="rounded border border-[#D5DCE6] p-1 text-red-700 hover:bg-red-50"
+                              >
+                                <Trash2 className="h-3.5 w-3.5" />
+                              </button>
+                            )}
+                          </td>
+                        )}
+                      </tr>
+                    );
+                  })
                 )}
               </tbody>
             </table>
@@ -288,9 +351,9 @@ export function FleetRegistryView({
         >
           <form
             onSubmit={handleSubmit}
-            className="w-full max-w-2xl rounded-lg border border-[#D5DCE6] bg-white overflow-hidden"
+            className="max-h-[90vh] w-full max-w-2xl overflow-y-auto rounded-lg border border-[#D5DCE6] bg-white"
           >
-            <div className="flex items-center justify-between bg-[#0B192C] px-5 py-3.5 text-white">
+            <div className="flex items-start justify-between gap-4 bg-[#0B192C] px-5 py-3.5 text-white">
               <div>
                 <h2 className="font-display text-base font-bold">
                   {editingId ? 'Edit Fleet Unit' : 'Register New Fleet Unit / Equipment'}
@@ -302,20 +365,38 @@ export function FleetRegistryView({
               <button
                 type="button"
                 onClick={() => setModalOpen(false)}
-                className="rounded p-1 text-slate-300 hover:bg-[#13294B]"
+                aria-label="Close fleet unit dialog"
+                className="inline-flex items-center justify-center rounded-md bg-[#334E73] px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-[#1B3B6F] transition-colors whitespace-nowrap shrink-0"
               >
-                <X className="h-4 w-4" />
+                Close
               </button>
             </div>
             <div className="p-5 grid grid-cols-1 gap-3 sm:grid-cols-2 text-xs">
-              <div>
-                <label className="block font-semibold text-[#334E73] mb-1">Office / Department *</label>
+              <div className="sm:col-span-2">
+                <label htmlFor="fleet-prep-date" className="block font-semibold text-[#334E73] mb-1">
+                  Preparation Date (Pre-Assigned)
+                </label>
                 <input
+                  id="fleet-prep-date"
+                  data-testid="fleet-preparation-date"
+                  type="date"
+                  readOnly
+                  value={getLocalIsoDate()}
+                  className="w-full rounded border border-[#D5DCE6] bg-[#F3F5F8] px-2.5 py-2 font-mono font-bold text-[#1B3B6F]"
+                />
+              </div>
+              <div>
+                <label htmlFor="fleet-office-input" className="block font-semibold text-[#334E73] mb-1">
+                  Office / Department *
+                </label>
+                <input
+                  id="fleet-office-input"
+                  data-testid="fleet-office-input"
                   type="text"
                   list="fleet-dept-list"
                   required
                   value={office}
-                  onChange={(e) => setOffice(e.target.value)}
+                  onChange={(e) => handleOfficeChange(e.target.value)}
                   className="w-full rounded border border-[#D5DCE6] px-2.5 py-2"
                 />
                 <datalist id="fleet-dept-list">
@@ -323,6 +404,44 @@ export function FleetRegistryView({
                     <option key={d} value={d} />
                   ))}
                 </datalist>
+              </div>
+              <div>
+                <label htmlFor="fleet-mnemonic-input" className="block font-semibold text-[#334E73] mb-1">
+                  Dept Mnemonic (3–5 Letters) *
+                </label>
+                <input
+                  id="fleet-mnemonic-input"
+                  data-testid="fleet-office-mnemonic-input"
+                  type="text"
+                  required
+                  minLength={3}
+                  maxLength={5}
+                  value={officeMnemonic}
+                  onChange={(e) => {
+                    const cleaned = e.target.value.toUpperCase().replace(/[^A-Z]/g, '').slice(0, 5);
+                    setOfficeMnemonic(cleaned);
+                    if (cleaned.length >= 3) {
+                      const collisionOffice = checkDepartmentMnemonicCollision(cleaned, office, vehicles);
+                      if (collisionOffice) {
+                        setMnemonicError(
+                          `Mnemonic "${cleaned}" is already assigned to ${collisionOffice}. Choose a unique 3–5 letter code.`
+                        );
+                        return;
+                      }
+                    }
+                    setMnemonicError(null);
+                  }}
+                  placeholder="e.g. CEO, CAGRO"
+                  className="w-full rounded border border-[#D5DCE6] bg-[#F8FAFC] px-2.5 py-2 font-mono font-bold uppercase tracking-wider text-[#1B3B6F]"
+                />
+                <p className="mt-0.5 text-[10px] text-[#5A6F8C]">
+                  Used as the department label across previews &amp; reports.
+                </p>
+                {mnemonicError && (
+                  <p role="alert" data-testid="fleet-mnemonic-error" className="mt-1 text-[11px] font-semibold text-red-700">
+                    {mnemonicError}
+                  </p>
+                )}
               </div>
               <div>
                 <label className="block font-semibold text-[#334E73] mb-1">Plate / Asset Number *</label>
